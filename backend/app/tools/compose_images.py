@@ -23,6 +23,10 @@ class ComposeImagesTool(BaseTool):
             "prompt": {"type": "string", "description": "组合描述提示词（可选）"},
             "x": {"type": "number", "description": "新图放置位置 x"},
             "y": {"type": "number", "description": "新图放置位置 y"},
+            "size": {
+                "type": "string",
+                "description": "生成尺寸：'1K'/'2K'/'4K'，或 '宽x高' 具体像素（如 2048x1152）",
+            },
         },
         "required": ["node_ids"],
     }
@@ -33,6 +37,7 @@ class ComposeImagesTool(BaseTool):
     def run(self, state: CanvasState, **kwargs) -> ToolResult:
         node_ids: list[str] = kwargs.get("node_ids", [])
         prompt = kwargs.get("prompt", "")
+        size = str(kwargs.get("size", "2K"))
 
         sources = [state.get_node(nid) for nid in node_ids]
         sources = [n for n in sources if n is not None and n.image_url]
@@ -66,6 +71,7 @@ class ComposeImagesTool(BaseTool):
             prompt=prompt,
             width=width,
             height=height,
+            size=size,
         )
 
         node = CanvasNode(

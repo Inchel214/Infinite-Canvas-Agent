@@ -50,7 +50,13 @@ class MockImageGenerator(BaseImageGenerator):
     不同 prompt / seed 会产生不同背景色，便于在画布上区分。
     """
 
-    def generate(self, prompt: str, width: int = 300, height: int = 300) -> ImageResult:
+    def generate(
+        self,
+        prompt: str,
+        width: int = 300,
+        height: int = 300,
+        size: str = "2K",
+    ) -> ImageResult:
         seed = f"gen:{prompt}"
         url = _svg_data_url(prompt, "[文生图]", width, height, seed)
         return ImageResult(image_url=url, width=width, height=height, prompt=prompt)
@@ -61,6 +67,7 @@ class MockImageGenerator(BaseImageGenerator):
         prompt: str,
         width: int = 512,
         height: int = 512,
+        size: str = "2K",
     ) -> ImageResult:
         seed = f"var:{prompt}:{source_image_url[:32]}"
         url = _svg_data_url(prompt, "[图生图·变体]", width, height, seed)
@@ -73,6 +80,7 @@ class MockImageGenerator(BaseImageGenerator):
         mask: str | None = None,
         width: int = 512,
         height: int = 512,
+        size: str = "2K",
     ) -> ImageResult:
         seed = f"edit:{prompt}:{source_image_url[:32]}"
         tag = "[局部编辑]" if mask else "[重绘]"
@@ -85,6 +93,7 @@ class MockImageGenerator(BaseImageGenerator):
         prompt: str = "",
         width: int = 512,
         height: int = 512,
+        size: str = "2K",
     ) -> ImageResult:
         seed = f"comp:{prompt}:{len(image_urls)}"
         label = prompt or f"{len(image_urls)} 图组合"

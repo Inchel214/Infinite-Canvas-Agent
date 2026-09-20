@@ -23,8 +23,14 @@ class BaseImageGenerator(ABC):
     """
 
     @abstractmethod
-    def generate(self, prompt: str, width: int = 300, height: int = 300) -> ImageResult:
-        """文生图：根据文字提示生成图片"""
+    def generate(
+        self,
+        prompt: str,
+        width: int = 300,
+        height: int = 300,
+        size: str = "2K",
+    ) -> ImageResult:
+        """文生图：根据文字提示生成图片。size 支持 "1K"/"2K"/"4K" 或 "宽x高"（如 2048x1152）"""
         ...
 
     @abstractmethod
@@ -34,6 +40,7 @@ class BaseImageGenerator(ABC):
         prompt: str,
         width: int = 300,
         height: int = 300,
+        size: str = "2K",
     ) -> ImageResult:
         """图生图：基于参考图 + 提示词生成变体"""
         ...
@@ -46,6 +53,7 @@ class BaseImageGenerator(ABC):
         mask: str | None = None,
         width: int = 300,
         height: int = 300,
+        size: str = "2K",
     ) -> ImageResult:
         """局部编辑：对图片进行 inpainting / outpainting"""
         ...
@@ -57,6 +65,7 @@ class BaseImageGenerator(ABC):
         prompt: str = "",
         width: int = 300,
         height: int = 300,
+        size: str = "2K",
     ) -> ImageResult:
         """多图组合：将多张图片拼接/合成为一张"""
         ...

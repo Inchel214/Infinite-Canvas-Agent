@@ -20,6 +20,10 @@ class EditImageTool(BaseTool):
             "mask": {"type": "string", "description": "蒙版描述（可选，如 左上角、背景 等）"},
             "x": {"type": "number", "description": "新图放置位置 x（默认在原图右侧）"},
             "y": {"type": "number", "description": "新图放置位置 y"},
+            "size": {
+                "type": "string",
+                "description": "生成尺寸：'1K'/'2K'/'4K'，或 '宽x高' 具体像素（如 2048x1152）",
+            },
         },
         "required": ["node_id", "prompt"],
     }
@@ -31,6 +35,7 @@ class EditImageTool(BaseTool):
         node_id = kwargs.get("node_id", "")
         prompt = kwargs.get("prompt", "")
         mask = kwargs.get("mask")
+        size = str(kwargs.get("size", "2K"))
 
         source = state.get_node(node_id)
         if not source:
@@ -58,6 +63,7 @@ class EditImageTool(BaseTool):
             mask=mask,
             width=source.width,
             height=source.height,
+            size=size,
         )
 
         node = CanvasNode(
@@ -69,6 +75,7 @@ class EditImageTool(BaseTool):
             height=result.height,
             content=prompt,
             image_url=result.image_url,
+            source_ids=[node_id],
         )
         state.add_node(node)
         return ToolResult(

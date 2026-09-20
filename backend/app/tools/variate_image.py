@@ -19,6 +19,10 @@ class VariateImageTool(BaseTool):
             "prompt": {"type": "string", "description": "变体描述提示词"},
             "x": {"type": "number", "description": "新图放置位置 x"},
             "y": {"type": "number", "description": "新图放置位置 y"},
+            "size": {
+                "type": "string",
+                "description": "生成尺寸：'1K'/'2K'/'4K'，或 '宽x高' 具体像素（如 2048x1152）",
+            },
         },
         "required": ["node_id", "prompt"],
     }
@@ -29,6 +33,7 @@ class VariateImageTool(BaseTool):
     def run(self, state: CanvasState, **kwargs) -> ToolResult:
         node_id = kwargs.get("node_id", "")
         prompt = kwargs.get("prompt", "")
+        size = str(kwargs.get("size", "2K"))
         x = float(kwargs.get("x", 100))
         y = float(kwargs.get("y", 100))
 
@@ -55,6 +60,7 @@ class VariateImageTool(BaseTool):
             prompt=prompt,
             width=source.width,
             height=source.height,
+            size=size,
         )
 
         node = CanvasNode(
@@ -66,6 +72,7 @@ class VariateImageTool(BaseTool):
             height=result.height,
             content=prompt,
             image_url=result.image_url,
+            source_ids=[node_id],
         )
         state.add_node(node)
         return ToolResult(
