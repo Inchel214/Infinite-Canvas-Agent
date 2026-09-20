@@ -17,11 +17,17 @@ from app.tools.variate_image import VariateImageTool
 # 单例组件
 store = InMemoryStore()
 
-# 图片生成服务：火山引擎方舟 Doubao Seedream 5.0 Pro 真实 API
-image_generator = VolcEngineImageGenerator(
-    api_key=os.getenv("ARK_API_KEY", ""),
-    model=os.getenv("ARK_IMAGE_MODEL", "doubao-seedream-5-0-pro-260628"),
-)
+# 图片生成服务：有 ARK_API_KEY 时用火山引擎真实 API，否则降级为 Mock（SVG 占位图）
+_ark_api_key = os.getenv("ARK_API_KEY", "")
+if _ark_api_key:
+    image_generator = VolcEngineImageGenerator(
+        api_key=_ark_api_key,
+        model=os.getenv("ARK_IMAGE_MODEL", "doubao-seedream-5-0-pro-260628"),
+    )
+else:
+    from app.image.mock_generator import MockImageGenerator
+
+    image_generator = MockImageGenerator()
 
 tool_manager = ToolManager()
 # 图片生成工具
@@ -34,8 +40,16 @@ tool_manager.register(MoveNodeTool())
 tool_manager.register(DeleteNodeTool())
 tool_manager.register(ListNodesTool())
 
-# MVP 用 MockLLM，后续可替换为真实模型
-llm = MockLLM()
+# Agent 大脑：有 ARK_API_KEY 时用方舟真实 LLM（function calling），否则降级为 Mock
+if _ark_api_key:
+    from app.agent.llm import ArkLLM
+
+    llm = ArkLLM(
+        api_key=_ark_api_key,
+        model=os.getenv("ARK_LLM_MODEL", "doubao-seed-2-1-pro-260915"),
+    )
+else:
+    llm = MockLLM()
 
 agent = ReActAgent(
     llm=llm,

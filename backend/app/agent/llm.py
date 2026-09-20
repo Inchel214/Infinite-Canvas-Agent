@@ -1,10 +1,13 @@
-"""LLM 抽象 + Mock 实现（预留真实模型扩展点）"""
+"""LLM 抽象 + Mock/Ark 实现"""
 from __future__ import annotations
 
 import json
+import os
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+
+import requests
 
 
 @dataclass
@@ -204,3 +207,127 @@ class MockLLM(BaseLLM):
         if "中间" in prompt or "中心" in prompt:
             return (300, 300)
         return (100, 100)
+
+
+class ArkLLM(BaseLLM):
+    """
+    火山引擎方舟 LLM，通过 OpenAI 兼容的 chat/completions 接口调用，
+    支持原生 function calling。
+    """
+
+    _API_URL = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        model: str = "doubao-seed-2-1-pro-260915",
+        temperature: float = 0.3,
+        timeout: int = 120,
+    ):
+        self.api_key = api_key or os.getenv("ARK_API_KEY", "")
+        if not self.api_key:
+            raise ValueError("ARK_API_KEY 未配置，请检查 .env 文件")
+        self.model = model
+        self.temperature = temperature
+        self.timeout = timeout
+        self._call_seq = 0
+
+    def chat(self, messages: list[dict], tools: list[dict] | None = None) -> LLMResponse:
+        body: dict = {
+            "model": self.model,
+            "messages": self._to_openai_messages(messages),
+            "temperature": self.temperature,
+        }
+        oai_tools = self._to_openai_tools(tools)
+        if oai_tools:
+            body["tools"] = oai_tools
+
+        # trust_env=False 绕过系统代理
+        session = requests.Session()
+        session.trust_env = False
+        resp = session.post(
+            self._API_URL,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json=body,
+            timeout=self.timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        choice = data["choices"][0]["message"]
+        content = choice.get("content") or ""
+
+        # 解析 function calling 结果
+        tool_calls: list[ToolCall] | None = None
+        raw_calls = choice.get("tool_calls")
+        if raw_calls:
+            tool_calls = []
+            for rc in raw_calls:
+                fn = rc["function"]
+                try:
+                    args = json.loads(rc["function"].get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    args = {"prompt": rc["function"].get("arguments", "")}
+                tool_calls.append(ToolCall(name=fn["name"], args=args))
+
+        return LLMResponse(content=content, tool_calls=tool_calls)
+
+    def _to_openai_tools(self, tools: list[dict] | None) -> list[dict] | None:
+        """把内部工具描述转换为 OpenAI function calling 格式"""
+        if not tools:
+            return None
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": t["name"],
+                    "description": t["description"],
+                    "parameters": t["args_schema"],
+                },
+            }
+            for t in tools
+        ]
+
+    def _to_openai_messages(self, messages: list[dict]) -> list[dict]:
+        """把内部消息格式转换为 OpenAI 格式（补齐 tool_call_id）"""
+        result: list[dict] = []
+        pending_ids: list[str] = []
+        for m in messages:
+            role = m.get("role")
+            if role in ("system", "user"):
+                result.append({"role": role, "content": m["content"]})
+            elif role == "assistant":
+                calls = m.get("tool_calls")
+                if calls:
+                    oai_calls = []
+                    pending_ids = []
+                    for tc in calls:
+                        self._call_seq += 1
+                        call_id = f"call_{self._call_seq}"
+                        oai_calls.append({
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": json.dumps(tc.args, ensure_ascii=False),
+                            },
+                        })
+                        pending_ids.append(call_id)
+                    result.append({
+                        "role": "assistant",
+                        "content": m.get("content") or "",
+                        "tool_calls": oai_calls,
+                    })
+                else:
+                    result.append({"role": "assistant", "content": m.get("content") or ""})
+            elif role == "tool":
+                call_id = pending_ids.pop(0) if pending_ids else "call_0"
+                result.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": m["content"],
+                })
+        return result

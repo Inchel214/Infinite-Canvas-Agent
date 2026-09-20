@@ -1,8 +1,18 @@
 import { useEffect, useState, useCallback } from "react";
-import { Canvas } from "./components/Canvas";
+import { Canvas, type CanvasAction } from "./components/Canvas";
 import { PromptBar } from "./components/PromptBar";
 import { HistoryPanel, type HistoryItem } from "./components/HistoryPanel";
-import { chatWithAgent, createCanvas, getCanvas, updateNodePosition } from "./api/agent";
+import {
+  chatWithAgent,
+  createCanvas,
+  getCanvas,
+  updateNodePosition,
+  composeImages,
+  variateImage,
+  editImage,
+  deleteNode,
+  generateImage,
+} from "./api/agent";
 import type { CanvasState } from "./types/canvas";
 
 const TOOL_LABELS: Record<string, string> = {
@@ -99,6 +109,57 @@ function App() {
     }
   }, [canvasId]);
 
+  // 右键菜单/图片容器直接操作（不走 Agent），返回是否成功（容器据此决定是否移除自己）
+  const handleAction = useCallback(async (action: CanvasAction): Promise<boolean> => {
+    if (!canvasId) return false;
+    setLoading(true);
+
+    try {
+      if (action.type === "compose") {
+        setStatusMsg(`正在组合 ${action.nodeIds.length} 张图片...`);
+        const res = await composeImages(canvasId, action.nodeIds, action.prompt, action.size, action.x, action.y);
+        setCanvasState(res.canvas);
+        setStatusMsg(res.message);
+        return res.success;
+      } else if (action.type === "variate") {
+        setStatusMsg("正在生成变体...");
+        const res = await variateImage(canvasId, action.nodeId, action.prompt, action.size, action.x, action.y);
+        setCanvasState(res.canvas);
+        setStatusMsg(res.message);
+        return res.success;
+      } else if (action.type === "edit") {
+        setStatusMsg("正在编辑图片...");
+        const res = await editImage(canvasId, action.nodeId, action.prompt, action.size);
+        setCanvasState(res.canvas);
+        setStatusMsg(res.message);
+        return res.success;
+      } else if (action.type === "generate") {
+        setStatusMsg("正在生成图片...");
+        const res = await generateImage(canvasId, action.prompt, action.size, action.x, action.y);
+        setCanvasState(res.canvas);
+        setStatusMsg(res.message);
+        return res.success;
+      } else if (action.type === "delete") {
+        setStatusMsg("正在删除...");
+        let last: Awaited<ReturnType<typeof deleteNode>> | null = null;
+        for (const nid of action.nodeIds) {
+          last = await deleteNode(canvasId, nid);
+          setCanvasState(last.canvas);
+        }
+        setStatusMsg(
+          last ? `已删除 ${action.nodeIds.length} 张图片` : "删除失败"
+        );
+        return !!last;
+      }
+      return false;
+    } catch (e) {
+      setStatusMsg("操作失败：" + (e as Error).message);
+      return false;
+    } finally {
+      setLoading(false);
+    }
+  }, [canvasId]);
+
   return (
     <>
       <Canvas
@@ -113,6 +174,8 @@ function App() {
             // 静默失败，不影响用户操作
           }
         }}
+        onAction={handleAction}
+        onCanvasUpdate={setCanvasState}
       />
 
       {/* 执行状态提示 */}
