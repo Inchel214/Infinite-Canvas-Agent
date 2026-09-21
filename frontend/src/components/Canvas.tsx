@@ -1,6 +1,6 @@
 import { useEffect, useRef, useCallback, useState } from "react";
 import type { CanvasState, CanvasNode } from "../types/canvas";
-import { generateImageStream, uploadImageNode } from "../api/agent";
+import { generateImageStream, uploadImageNode, undoCanvas } from "../api/agent";
 
 // 右键菜单可触发的操作类型
 export type CanvasAction =
@@ -146,7 +146,8 @@ interface CanvasProps {
 /**
  * 轻量无限画布：零依赖，CSS transform 实现 pan/zoom
  * 支持：滚轮缩放、拖拽平移、图片拖拽移动、自动适配
- * 多选：单击/Ctrl+Shift+点选、Shift+空白拖动框选、右键菜单直接生成
+ * 多选：单击/Ctrl+Shift+点选、空白直接拖动框选、右键菜单直接生成
+ * 平移：空格+拖动 / Shift+拖动 / 鼠标中键拖动
  */
 export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onCanvasUpdate }: CanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -184,6 +185,9 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
   const dragStartPosRef = useRef<{ x: number; y: number } | null>(null);
   const backgroundDownRef = useRef<{ x: number; y: number } | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+  // 空格键按下时切换为平移模式（避免破坏现有 Shift 框选习惯）
+  const isSpacePressedRef = useRef(false);
+  const [spacePressed, setSpacePressed] = useState(false);
 
   const rawNodes = canvasState ? Object.values(canvasState.nodes) : [];
 
@@ -217,6 +221,29 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
 
+      // 空格键：切换平移模式
+      if (e.code === "Space") {
+        if (!isSpacePressedRef.current) {
+          isSpacePressedRef.current = true;
+          setSpacePressed(true);
+        }
+        e.preventDefault();
+        return;
+      }
+
+      // Ctrl/Cmd+Z → 撤销
+      if ((e.ctrlKey || e.metaKey) && (e.key === "z" || e.key === "Z") && canvasId) {
+        e.preventDefault();
+        undoCanvas(canvasId)
+          .then((res) => {
+            if (res.success) onCanvasUpdate?.(res.canvas);
+          })
+          .catch(() => {
+            // 网络错误静默忽略
+          });
+        return;
+      }
+
       // Delete / Backspace → 删除选中
       if ((e.key === "Delete" || e.key === "Backspace") && selectedIds.size > 0) {
         e.preventDefault();
@@ -244,7 +271,21 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [selectedIds, nodes, onAction]);
+  }, [selectedIds, nodes, onAction, canvasId, onCanvasUpdate]);
+
+  // 空格键抬起：清除平移模式
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.code === "Space") {
+        if (isSpacePressedRef.current) {
+          isSpacePressedRef.current = false;
+          setSpacePressed(false);
+        }
+      }
+    };
+    window.addEventListener("keyup", handler);
+    return () => window.removeEventListener("keyup", handler);
+  }, []);
 
   // 屏幕坐标（相对画布容器）→ 世界坐标
   const screenToWorld = useCallback(
@@ -442,16 +483,26 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
     setZoom(newZoom);
   }, [zoom, pan]);
 
-  // 背景鼠标按下：Shift+拖 = 框选，普通拖 = 平移
+  // 背景鼠标按下：直接拖=框选，Shift/空格/中键拖=平移
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
+    // 中键拖动 = 平移（任意位置）
+    if (e.button === 1) {
+      e.preventDefault();
+      setIsPanning(true);
+      backgroundDownRef.current = { x: e.clientX, y: e.clientY };
+      panStart.current = {
+        x: e.clientX,
+        y: e.clientY,
+        panX: pan.x,
+        panY: pan.y,
+      };
+      return;
+    }
     if (e.button !== 0) return;
     // 只在点击背景时启动
     if (e.target === e.currentTarget || (e.target as HTMLElement).dataset.role === "world") {
-      if (e.shiftKey) {
-        // 框选
-        marqueeStartRef.current = { x: e.clientX, y: e.clientY };
-        setMarquee({ x1: e.clientX, y1: e.clientY, x2: e.clientX, y2: e.clientY });
-      } else {
+      if (e.shiftKey || isSpacePressedRef.current) {
+        // 平移
         setIsPanning(true);
         backgroundDownRef.current = { x: e.clientX, y: e.clientY };
         panStart.current = {
@@ -460,6 +511,10 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
           panX: pan.x,
           panY: pan.y,
         };
+      } else {
+        // 直接拖动 = 框选
+        marqueeStartRef.current = { x: e.clientX, y: e.clientY };
+        setMarquee({ x1: e.clientX, y1: e.clientY, x2: e.clientX, y2: e.clientY });
       }
     }
   }, [pan]);
@@ -854,7 +909,9 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
               ? "grabbing"
               : draggingNode || draggingContainer
                 ? "move"
-                : "grab",
+                : spacePressed
+                  ? "grab"
+                  : "default",
       }}
     >
       {/* 全局动画 keyframes：图片入场淡入缩放 */}

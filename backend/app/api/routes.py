@@ -201,6 +201,19 @@ def delete_node(canvas_id: str, node_id: str):
     }
 
 
+@router.post("/canvas/{canvas_id}/undo", summary="撤销最近一次操作")
+def undo_canvas(canvas_id: str):
+    try:
+        prev = deps.store.undo(canvas_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    if prev is None:
+        # 无历史可撤销：返回当前状态，前端可据此提示
+        current = deps.store.get_canvas(canvas_id)
+        return {"success": False, "message": "无可撤销操作", "canvas": current.to_dict()}
+    return {"success": True, "message": "已撤销", "canvas": prev.to_dict()}
+
+
 @router.post("/canvas/{canvas_id}/generate", summary="文生图（直接执行，不走 Agent）")
 def generate_image(canvas_id: str, req: GenerateRequest):
     try:
