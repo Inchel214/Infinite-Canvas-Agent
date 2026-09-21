@@ -7,6 +7,14 @@
 set -e
 cd "$(dirname "$0")"
 
+# Prefer the project-local Node runtime when present. This avoids relying on an
+# older system Node and keeps npm's cache out of a potentially unwritable home cache.
+LOCAL_NODE_DIR="$PWD/.runtime/node-v22.20.0-darwin-x64/bin"
+if [[ -x "$LOCAL_NODE_DIR/node" ]]; then
+  export PATH="$LOCAL_NODE_DIR:$PATH"
+fi
+export npm_config_cache="$PWD/.npm-cache"
+
 # 终端颜色
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -136,7 +144,9 @@ for i in $(seq 1 30); do
   sleep 1
 done
 sleep 2
-open http://localhost:5173
+if ! open http://localhost:5173; then
+  warn "无法自动打开默认浏览器，请手动访问 http://localhost:5173"
+fi
 
 echo ""
 ok "=========================================="

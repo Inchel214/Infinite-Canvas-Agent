@@ -218,3 +218,14 @@ export async function deleteNode(
   }
   return res.json();
 }
+
+// 撤销最近一次操作，无历史可撤销时后端返回 success:false
+export async function undoCanvas(canvasId: string): Promise<DirectResponse> {
+  const res = await fetch(`${API_BASE}/canvas/${canvasId}/undo`, {
+    method: "POST",
+  });
+  if (!res.ok) {
+    throw new Error(`${res.status}`);
+  }
+  return res.json();
+}
