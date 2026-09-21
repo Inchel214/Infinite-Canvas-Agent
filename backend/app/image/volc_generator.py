@@ -12,24 +12,23 @@ import requests
 from app.image.base import BaseImageGenerator, ImageResult
 
 _API_URL = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
-_DEFAULT_MODEL = "doubao-seedream-5-0-pro-260628"
-# 支持流式输出的模型（Ark 文档：仅 5.0-lite / 4.5 / 4.0 支持 SSE 流式）
-_STREAM_DEFAULT_MODEL = "doubao-seedream-5-0-lite-260128"
+_DEFAULT_MODEL = "doubao-seedream-4-0-20260415"
+# 4.0 同时支持非流式与 SSE 流式
+_STREAM_DEFAULT_MODEL = "doubao-seedream-4-0-20260415"
 
 # 画布节点显示尺寸：图片最长边缩放到该值
 _DISPLAY_MAX = 400
 
 
-def _png_size(data_url: str) -> tuple[int, int] | None:
-    """从 PNG data URL 解析真实宽高（IHDR 头），失败返回 None"""
+def _image_size(data_url: str) -> tuple[int, int] | None:
+    """从 data URL 解析真实宽高（支持 PNG/JPEG/WEBP 等），失败返回 None"""
     try:
+        from PIL import Image
+        import io
         b64 = data_url.split(",", 1)[1] if data_url.startswith("data:") else data_url
-        # PNG: 8 字节签名 + 4 长度 + 4 "IHDR" + 4 宽 + 4 高
-        head = base64.b64decode(b64[:44])  # 解码出的前 33 字节足够覆盖 IHDR
-        if head[12:16] != b"IHDR":
-            return None
-        w, h = struct.unpack(">II", head[16:24])
-        return (int(w), int(h))
+        raw = base64.b64decode(b64)
+        with Image.open(io.BytesIO(raw)) as im:
+            return (int(im.width), int(im.height))
     except Exception:
         return None
 
@@ -86,7 +85,6 @@ class VolcEngineImageGenerator(BaseImageGenerator):
             "model": self.model,
             "prompt": prompt,
             "size": size,
-            "output_format": "png",
             "response_format": "url",
             "watermark": False,
         }
@@ -116,13 +114,14 @@ class VolcEngineImageGenerator(BaseImageGenerator):
 
         # 如果已经是 base64，直接拼 data URL
         if not url.startswith("http") and not url.startswith("data:"):
-            return f"data:image/png;base64,{url}"
+            return f"data:image/jpeg;base64,{url}"
 
         # 如果是 HTTP URL，后端下载后转 base64 data URL（避免浏览器 CORS）
         img_resp = session.get(url, timeout=60, proxies={"http": None, "https": None})
         img_resp.raise_for_status()
+        mime = img_resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
         b64 = base64.b64encode(img_resp.content).decode("ascii")
-        return f"data:image/png;base64,{b64}"
+        return f"data:{mime};base64,{b64}"
 
     def _call_stream(
         self,
@@ -146,7 +145,6 @@ class VolcEngineImageGenerator(BaseImageGenerator):
             "model": self.stream_model,
             "prompt": prompt,
             "size": size,
-            "output_format": "png",
             "response_format": "url",
             "watermark": False,
             "stream": True,
@@ -203,8 +201,9 @@ class VolcEngineImageGenerator(BaseImageGenerator):
         else:
             img_resp = session.get(last_url, timeout=60, proxies={"http": None, "https": None})
             img_resp.raise_for_status()
+            mime = img_resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
             b64 = base64.b64encode(img_resp.content).decode("ascii")
-            final_url = f"data:image/png;base64,{b64}"
+            final_url = f"data:{mime};base64,{b64}"
         yield {"type": "final", "url": final_url, "progress": 100}
 
     def generate_stream(
@@ -218,7 +217,7 @@ class VolcEngineImageGenerator(BaseImageGenerator):
         """流式生成（文生图/图生图/多图组合统一入口），yield 预览 + 最终 ImageResult"""
         for evt in self._call_stream(prompt, image_urls=image_urls, size=size):
             if evt["type"] == "final":
-                w, h = _display_size(_png_size(evt["url"]), (width, height))
+                w, h = _display_size(_image_size(evt["url"]), (width, height))
                 yield {
                     "type": "final",
                     "result": ImageResult(
@@ -236,7 +235,7 @@ class VolcEngineImageGenerator(BaseImageGenerator):
         size: str = "2K",
     ) -> ImageResult:
         url = self._call(prompt, size=size)
-        w, h = _display_size(_png_size(url), (width, height))
+        w, h = _display_size(_image_size(url), (width, height))
         return ImageResult(image_url=url, width=w, height=h, prompt=prompt)
 
     def variate(
@@ -248,7 +247,7 @@ class VolcEngineImageGenerator(BaseImageGenerator):
         size: str = "2K",
     ) -> ImageResult:
         url = self._call(prompt, image_urls=[source_image_url], size=size)
-        w, h = _display_size(_png_size(url), (width, height))
+        w, h = _display_size(_image_size(url), (width, height))
         return ImageResult(image_url=url, width=w, height=h, prompt=prompt)
 
     def edit(
@@ -261,7 +260,7 @@ class VolcEngineImageGenerator(BaseImageGenerator):
         size: str = "2K",
     ) -> ImageResult:
         url = self._call(prompt, image_urls=[source_image_url], size=size)
-        w, h = _display_size(_png_size(url), (width, height))
+        w, h = _display_size(_image_size(url), (width, height))
         return ImageResult(image_url=url, width=w, height=h, prompt=prompt)
 
     def compose(
@@ -273,5 +272,5 @@ class VolcEngineImageGenerator(BaseImageGenerator):
         size: str = "2K",
     ) -> ImageResult:
         url = self._call(prompt, image_urls=image_urls, size=size)
-        w, h = _display_size(_png_size(url), (width, height))
+        w, h = _display_size(_image_size(url), (width, height))
         return ImageResult(image_url=url, width=w, height=h, prompt=prompt)

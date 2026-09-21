@@ -3,7 +3,7 @@ import os
 
 from app.agent.llm import MockLLM
 from app.agent.react_loop import ReActAgent
-from app.canvas.store import InMemoryStore
+from app.canvas.store import FileStore
 from app.image.volc_generator import VolcEngineImageGenerator
 from app.tools.base import ToolManager
 from app.tools.compose_images import ComposeImagesTool
@@ -14,8 +14,8 @@ from app.tools.list_nodes import ListNodesTool
 from app.tools.move_node import MoveNodeTool
 from app.tools.variate_image import VariateImageTool
 
-# 单例组件
-store = InMemoryStore()
+# 单例组件：文件持久化存储，刷新/重启后画布状态不丢
+store = FileStore()
 
 # 图片生成服务：有 ARK_API_KEY 时用火山引擎真实 API，否则降级为 Mock（SVG 占位图）
 _ark_api_key = os.getenv("ARK_API_KEY", "")

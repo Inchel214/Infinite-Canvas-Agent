@@ -21,6 +21,7 @@ export type PendingContainer = {
   refIds: string[];     // 连线进来的参考图节点 ID
   error?: string;       // 生成失败提示
   previewUrl?: string;  // 流式生成的中间预览图
+  exiting?: boolean;    // 生成完成后正在退场（淡出中）
 };
 
 // 宽高比预设（长边 = 分辨率档位）
@@ -56,6 +57,77 @@ function calcSize(ratioKey: string, res: string): string {
   return `${w}x${h}`;
 }
 
+// 矩形（节点或容器）的边界框
+type BBox = { x: number; y: number; width: number; height: number };
+
+/**
+ * 根据源节点和目标节点的相对位置，自动选择最佳连接端口，
+ * 并返回贝塞尔曲线的起点、终点和两个控制点。
+ *
+ * 规则：比较两节点中心连线的 dx/dy，取绝对值较大的轴为主轴：
+ *   - 水平主轴：源右→目标左（目标在右）或 源左→目标右（目标在左）
+ *   - 垂直主轴：源下→目标上（目标在下）或 源上→目标下（目标在上）
+ * 控制点沿主轴方向延伸，保证曲线自然不回折。
+ */
+function getConnectionEndpoints(src: BBox, tgt: BBox) {
+  const srcCx = src.x + src.width / 2;
+  const srcCy = src.y + src.height / 2;
+  const tgtCx = tgt.x + tgt.width / 2;
+  const tgtCy = tgt.y + tgt.height / 2;
+
+  const dx = tgtCx - srcCx;
+  const dy = tgtCy - srcCy;
+
+  const horizontal = Math.abs(dx) >= Math.abs(dy);
+
+  let x1: number, y1: number, x2: number, y2: number;
+  let cx1: number, cy1: number, cx2: number, cy2: number;
+
+  if (horizontal) {
+    if (dx >= 0) {
+      // 目标在右侧：源右边 → 目标左边
+      x1 = src.x + src.width;
+      y1 = srcCy;
+      x2 = tgt.x;
+      y2 = tgtCy;
+    } else {
+      // 目标在左侧：源左边 → 目标右边
+      x1 = src.x;
+      y1 = srcCy;
+      x2 = tgt.x + tgt.width;
+      y2 = tgtCy;
+    }
+    const offset = Math.max(40, Math.abs(dx) / 2);
+    const dir = dx >= 0 ? 1 : -1;
+    cx1 = x1 + dir * offset;
+    cy1 = y1;
+    cx2 = x2 - dir * offset;
+    cy2 = y2;
+  } else {
+    if (dy >= 0) {
+      // 目标在下：源下边 → 目标上边
+      x1 = srcCx;
+      y1 = src.y + src.height;
+      x2 = tgtCx;
+      y2 = tgt.y;
+    } else {
+      // 目标在上：源上边 → 目标下边
+      x1 = srcCx;
+      y1 = src.y;
+      x2 = tgtCx;
+      y2 = tgt.y + tgt.height;
+    }
+    const offset = Math.max(40, Math.abs(dy) / 2);
+    const dir = dy >= 0 ? 1 : -1;
+    cx1 = x1;
+    cy1 = y1 + dir * offset;
+    cx2 = x2;
+    cy2 = y2 - dir * offset;
+  }
+
+  return { x1, y1, x2, y2, cx1, cy1, cx2, cy2 };
+}
+
 type MenuState = {
   x: number;
   y: number;
@@ -65,6 +137,7 @@ type MenuState = {
 interface CanvasProps {
   canvasState: CanvasState | null;
   canvasId: string | null;
+  busy?: boolean;
   onNodeMoved?: (nodeId: string, x: number, y: number) => void;
   onAction?: (action: CanvasAction) => boolean | void | Promise<boolean | void>;
   onCanvasUpdate?: (state: CanvasState) => void;
@@ -75,7 +148,7 @@ interface CanvasProps {
  * 支持：滚轮缩放、拖拽平移、图片拖拽移动、自动适配
  * 多选：单击/Ctrl+Shift+点选、Shift+空白拖动框选、右键菜单直接生成
  */
-export function Canvas({ canvasState, canvasId, onNodeMoved, onAction, onCanvasUpdate }: CanvasProps) {
+export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onCanvasUpdate }: CanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [zoom, setZoom] = useState(0.5);
@@ -101,7 +174,7 @@ export function Canvas({ canvasState, canvasId, onNodeMoved, onAction, onCanvasU
 
   // ===== 待生成图片容器 + 连线 =====
   const [containers, setContainers] = useState<PendingContainer[]>([]);
-  const [connecting, setConnecting] = useState<{ fromId: string; x: number; y: number } | null>(null);
+  const [connecting, setConnecting] = useState<{ fromId: string; x: number; y: number; sx: number; sy: number } | null>(null);
   const [draggingContainer, setDraggingContainer] = useState<{ id: string; offsetX: number; offsetY: number } | null>(null);
   const [generatingContainerId, setGeneratingContainerId] = useState<string | null>(null);
   const [genProgress, setGenProgress] = useState(0);
@@ -181,11 +254,21 @@ export function Canvas({ canvasState, canvasId, onNodeMoved, onAction, onCanvasU
 
   // 从图片边缘连接点开始拖线
   const handlePortMouseDown = useCallback(
-    (e: React.MouseEvent, node: CanvasNode) => {
+    (e: React.MouseEvent, node: CanvasNode, portIdx: number) => {
       if (e.button !== 0) return;
       e.stopPropagation();
       e.preventDefault();
-      setConnecting({ fromId: node.id, x: e.clientX, y: e.clientY });
+      // 与 ImageNode 中 ports 数组保持一致的端口定义
+      const portOffsets = [
+        { x: node.width / 2, y: 0 },
+        { x: node.width, y: node.height / 2 },
+        { x: node.width / 2, y: node.height },
+        { x: 0, y: node.height / 2 },
+      ];
+      const p = portOffsets[portIdx] ?? portOffsets[1];
+      const sx = node.x + p.x;
+      const sy = node.y + p.y;
+      setConnecting({ fromId: node.id, x: e.clientX, y: e.clientY, sx, sy });
     },
     []
   );
@@ -520,16 +603,20 @@ export function Canvas({ canvasState, canvasId, onNodeMoved, onAction, onCanvasU
         c.refIds.length === 0 ? "generate" : c.refIds.length === 1 ? "variate" : "compose";
 
       setGeneratingContainerId(c.id);
-      setGenProgress(3);
+      setGenProgress(5);
       // 估算进度：流式模式下收到真实 preview 事件后自动停用
       let estimating = true;
       const start = Date.now();
       const timer = window.setInterval(() => {
         if (estimating) {
           const t = (Date.now() - start) / 1000;
-          setGenProgress(Math.min(95, 95 * (1 - Math.exp(-t / 5))));
+          // 更陡峭的曲线：1s→33%, 2s→55%, 3s→70%, 5s→86%
+          setGenProgress((p) => Math.min(92, Math.max(p, 92 * (1 - Math.exp(-t / 2.5)))));
+        } else {
+          // 收到预览后，缓慢爬升到 95% 等待最终结果
+          setGenProgress((p) => Math.min(95, p + 0.6));
         }
-      }, 150);
+      }, 120);
 
       const ref = {
         done: null as { success: boolean; message: string; canvas: CanvasState } | null,
@@ -553,7 +640,7 @@ export function Canvas({ canvasState, canvasId, onNodeMoved, onAction, onCanvasU
             onPreview: (url, progress) => {
               estimating = false;
               updateContainer(c.id, { previewUrl: url });
-              setGenProgress(Math.max(20, progress));
+              setGenProgress((p) => Math.max(p, Math.max(40, progress)));
             },
             onDone: (d) => {
               ref.done = d;
@@ -563,9 +650,14 @@ export function Canvas({ canvasState, canvasId, onNodeMoved, onAction, onCanvasU
 
         window.clearInterval(timer);
         if (ref.done && ref.done.success) {
-          onCanvasUpdate?.(ref.done.canvas);
+          // 1) 进度到 100%，短暂停留让用户看到"完成"
           setGenProgress(100);
-          await new Promise((r) => setTimeout(r, 450));
+          await new Promise((r) => setTimeout(r, 160));
+          // 2) 图片入场（淡入缩放 0.35s）与容器退场（淡出缩小 0.32s）交叉进行
+          onCanvasUpdate?.(ref.done.canvas);
+          updateContainer(c.id, { exiting: true });
+          // 3) 等待退场动画完成后再移除容器节点
+          await new Promise((r) => setTimeout(r, 380));
           removeContainer(c.id);
         } else {
           setGenProgress(0);
@@ -613,6 +705,13 @@ export function Canvas({ canvasState, canvasId, onNodeMoved, onAction, onCanvasU
                 : "grab",
       }}
     >
+      {/* 全局动画 keyframes：图片入场淡入缩放 */}
+      <style>{`
+        @keyframes ica-img-in {
+          from { opacity: 0; transform: scale(0.92); }
+          to   { opacity: 1; transform: scale(1); }
+        }
+      `}</style>
       {/* 网格背景 */}
       <div
         data-role="grid"
@@ -651,12 +750,8 @@ export function Canvas({ canvasState, canvasId, onNodeMoved, onAction, onCanvasU
               (target.source_ids || []).map((sid) => {
                 const src = nodes.find((n) => n.id === sid);
                 if (!src) return null;
-                const x1 = src.x + src.width;
-                const y1 = src.y + src.height / 2;
-                const x2 = target.x;
-                const y2 = target.y + target.height / 2;
-                const dx = Math.max(40, (x2 - x1) / 2);
-                const path = `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`;
+                const ep = getConnectionEndpoints(src, target);
+                const path = `M ${ep.x1} ${ep.y1} C ${ep.cx1} ${ep.cy1}, ${ep.cx2} ${ep.cy2}, ${ep.x2} ${ep.y2}`;
                 return (
                   <g key={`${sid}-${target.id}`}>
                     <path
@@ -666,8 +761,8 @@ export function Canvas({ canvasState, canvasId, onNodeMoved, onAction, onCanvasU
                       strokeWidth={3}
                       strokeLinecap="round"
                     />
-                    <circle cx={x1} cy={y1} r={5} fill="#6366f1" />
-                    <circle cx={x2} cy={y2} r={5} fill="#6366f1" />
+                    <circle cx={ep.x1} cy={ep.y1} r={5} fill="#6366f1" />
+                    <circle cx={ep.x2} cy={ep.y2} r={5} fill="#6366f1" />
                   </g>
                 );
               })
@@ -676,15 +771,12 @@ export function Canvas({ canvasState, canvasId, onNodeMoved, onAction, onCanvasU
           {/* 容器的待生成参考连线（虚线） */}
           {containers.map((c) => {
             const size = containerDisplaySize(c.aspect);
+            const tgtRect: BBox = { x: c.x, y: c.y, width: size.w, height: size.h };
             return c.refIds.map((rid) => {
               const src = nodes.find((n) => n.id === rid);
               if (!src) return null;
-              const x1 = src.x + src.width;
-              const y1 = src.y + src.height / 2;
-              const x2 = c.x;
-              const y2 = c.y + size.h / 2;
-              const dx = Math.max(40, (x2 - x1) / 2);
-              const path = `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`;
+              const ep = getConnectionEndpoints(src, tgtRect);
+              const path = `M ${ep.x1} ${ep.y1} C ${ep.cx1} ${ep.cy1}, ${ep.cx2} ${ep.cy2}, ${ep.x2} ${ep.y2}`;
               return (
                 <g key={`${rid}-${c.id}`}>
                   <path
@@ -695,7 +787,7 @@ export function Canvas({ canvasState, canvasId, onNodeMoved, onAction, onCanvasU
                     strokeDasharray="8 6"
                     strokeLinecap="round"
                   />
-                  <circle cx={x1} cy={y1} r={4} fill="#a78bfa" />
+                  <circle cx={ep.x1} cy={ep.y1} r={4} fill="#a78bfa" />
                 </g>
               );
             });
@@ -707,10 +799,31 @@ export function Canvas({ canvasState, canvasId, onNodeMoved, onAction, onCanvasU
               const src = nodes.find((n) => n.id === connecting.fromId);
               if (!src) return null;
               const w = screenToWorld(connecting.x, connecting.y);
-              const x1 = src.x + src.width;
-              const y1 = src.y + src.height / 2;
-              const dx = Math.max(40, (w.x - x1) / 2);
-              const path = `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${w.x - dx} ${w.y}, ${w.x} ${w.y}`;
+              // 使用用户实际点击的端口作为起点
+              const x1 = connecting.sx;
+              const y1 = connecting.sy;
+              const x2 = w.x;
+              const y2 = w.y;
+              const dx = x2 - x1;
+              const dy = y2 - y1;
+              const horizontal = Math.abs(dx) >= Math.abs(dy);
+              let cx1: number, cy1: number, cx2: number, cy2: number;
+              if (horizontal) {
+                const offset = Math.max(40, Math.abs(dx) / 2);
+                const dir = dx >= 0 ? 1 : -1;
+                cx1 = x1 + dir * offset;
+                cy1 = y1;
+                cx2 = x2 - dir * offset;
+                cy2 = y2;
+              } else {
+                const offset = Math.max(40, Math.abs(dy) / 2);
+                const dir = dy >= 0 ? 1 : -1;
+                cx1 = x1;
+                cy1 = y1 + dir * offset;
+                cx2 = x2;
+                cy2 = y2 - dir * offset;
+              }
+              const path = `M ${x1} ${y1} C ${cx1} ${cy1}, ${cx2} ${cy2}, ${x2} ${y2}`;
               return (
                 <g>
                   <path
@@ -736,7 +849,7 @@ export function Canvas({ canvasState, canvasId, onNodeMoved, onAction, onCanvasU
             isLinked={!!(node.source_ids && node.source_ids.length > 0)}
             isSelected={selectedIds.has(node.id)}
             showPorts={hoveredNode === node.id || (connecting?.fromId === node.id)}
-            onPortMouseDown={(e) => handlePortMouseDown(e, node)}
+            onPortMouseDown={(e, portIdx) => handlePortMouseDown(e, node, portIdx)}
             onMouseDown={(e) => handleNodeMouseDown(e, node)}
             onMouseEnter={() => setHoveredNode(node.id)}
             onMouseLeave={() => setHoveredNode(null)}
@@ -811,7 +924,7 @@ export function Canvas({ canvasState, canvasId, onNodeMoved, onAction, onCanvasU
       )}
 
       {/* 选中数量提示 */}
-      {selectedCount > 0 && !menu && !connecting && (
+      {selectedCount > 0 && !menu && !connecting && !busy && (
         <div
           style={{
             position: "absolute",
@@ -1150,12 +1263,13 @@ function ImageNode({
   isLinked: boolean;
   isSelected: boolean;
   showPorts: boolean;
-  onPortMouseDown: (e: React.MouseEvent) => void;
+  onPortMouseDown: (e: React.MouseEvent, portIdx: number) => void;
   onMouseDown: (e: React.MouseEvent) => void;
   onMouseEnter: () => void;
   onMouseLeave: () => void;
   onContextMenu: (e: React.MouseEvent) => void;
 }) {
+  const [hoveredPortIdx, setHoveredPortIdx] = useState<number | null>(null);
   if (node.type === "image" && node.image_url) {
     // 四边中点连接点（相对 wrapper 的坐标）
     const ports = showPorts
@@ -1177,6 +1291,8 @@ function ImageNode({
           width: node.width,
           height: node.height,
           cursor: isDragging ? "move" : "pointer",
+          // 入场动画：淡入 + 轻微缩放，仅首次挂载播放一次
+          animation: "ica-img-in 0.35s cubic-bezier(0.22, 1, 0.36, 1) both",
         }}
         onMouseDown={onMouseDown}
         onMouseEnter={onMouseEnter}
@@ -1212,26 +1328,45 @@ function ImageNode({
             transition: isDragging ? "none" : "box-shadow 0.2s, outline 0.2s",
           }}
         />
-        {ports.map((p, i) => (
-          <div
-            key={i}
-            onMouseDown={onPortMouseDown}
-            title="按住拖到图片容器（或空白处）建立参考连线"
-            style={{
-              position: "absolute",
-              left: p.x - 7,
-              top: p.y - 7,
-              width: 14,
-              height: 14,
-              borderRadius: "50%",
-              background: "#a78bfa",
-              border: "2px solid #fff",
-              boxShadow: "0 0 10px rgba(167,139,250,0.9)",
-              cursor: "crosshair",
-              zIndex: 10,
-            }}
-          />
-        ))}
+        {ports.map((p, i) => {
+          const isHovered = hoveredPortIdx === i;
+          return (
+            <div
+              key={i}
+              onMouseDown={(e) => onPortMouseDown(e, i)}
+              onMouseEnter={() => setHoveredPortIdx(i)}
+              onMouseLeave={() => setHoveredPortIdx(null)}
+              title="按住拖到图片容器（或空白处）建立参考连线"
+              style={{
+                position: "absolute",
+                left: p.x - 16,
+                top: p.y - 16,
+                width: 32,
+                height: 32,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                cursor: "crosshair",
+                zIndex: 10,
+              }}
+            >
+              <div
+                style={{
+                  width: isHovered ? 18 : 14,
+                  height: isHovered ? 18 : 14,
+                  borderRadius: "50%",
+                  background: "#a78bfa",
+                  border: "2px solid #fff",
+                  boxShadow: isHovered
+                    ? "0 0 18px rgba(167,139,250,1)"
+                    : "0 0 10px rgba(167,139,250,0.9)",
+                  transition: "width 0.15s ease, height 0.15s ease, box-shadow 0.15s ease",
+                  pointerEvents: "none",
+                }}
+              />
+            </div>
+          );
+        })}
         {isLinked && (
           <div
             style={{
@@ -1357,6 +1492,12 @@ function PendingContainerNode({
         padding: 12,
         zIndex: 20,
         backdropFilter: "blur(2px)",
+        // 退场：淡出 + 轻微缩小，与图片入场动画重叠
+        opacity: container.exiting ? 0 : 1,
+        transform: container.exiting ? "scale(0.95)" : "scale(1)",
+        transformOrigin: "center center",
+        transition: "opacity 0.32s ease, transform 0.32s ease",
+        pointerEvents: container.exiting ? "none" : "auto",
       }}
       onMouseDown={(e) => e.stopPropagation()}
       onContextMenu={(e) => e.preventDefault()}
@@ -1376,19 +1517,36 @@ function PendingContainerNode({
         <span style={{ fontSize: 11, fontWeight: 600, color: "#c4b5fd" }}>
           📦 图片容器 · {modeLabel}
         </span>
-        <span
+        <button
           onClick={onRemove}
+          onMouseDown={(e) => e.stopPropagation()}
+          title="删除容器"
           style={{
+            width: 28,
+            height: 28,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            border: "none",
+            background: "transparent",
+            borderRadius: 6,
             cursor: "pointer",
             color: "rgba(255,255,255,0.5)",
-            fontSize: 14,
+            fontSize: 16,
             lineHeight: 1,
-            padding: "0 4px",
+            transition: "background 0.15s ease, color 0.15s ease",
           }}
-          title="删除容器"
+          onMouseEnter={(e) => {
+            e.currentTarget.style.background = "rgba(248,113,113,0.2)";
+            e.currentTarget.style.color = "#f87171";
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.background = "transparent";
+            e.currentTarget.style.color = "rgba(255,255,255,0.5)";
+          }}
         >
           ×
-        </span>
+        </button>
       </div>
 
       {/* 尺寸预览框（按宽高比）：生成时显示进度/流式预览图 */}
@@ -1510,27 +1668,42 @@ function PendingContainerNode({
                   border: "1px solid rgba(167,139,250,0.6)",
                 }}
               />
-              <span
+              <button
                 onClick={() => onRemoveRef(n.id)}
+                onMouseDown={(e) => e.stopPropagation()}
                 title="断开此参考图"
                 style={{
                   position: "absolute",
-                  top: -6,
-                  right: -6,
-                  width: 14,
-                  height: 14,
+                  top: -8,
+                  right: -8,
+                  width: 22,
+                  height: 22,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  border: "none",
+                  padding: 0,
                   borderRadius: "50%",
                   background: "#f87171",
                   color: "white",
-                  fontSize: 10,
-                  lineHeight: "14px",
-                  textAlign: "center",
+                  fontSize: 12,
+                  lineHeight: 1,
                   cursor: "pointer",
                   fontWeight: 700,
+                  boxShadow: "0 1px 4px rgba(0,0,0,0.4)",
+                  transition: "transform 0.12s ease, box-shadow 0.12s ease",
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.transform = "scale(1.15)";
+                  e.currentTarget.style.boxShadow = "0 2px 8px rgba(248,113,113,0.6)";
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.transform = "scale(1)";
+                  e.currentTarget.style.boxShadow = "0 1px 4px rgba(0,0,0,0.4)";
                 }}
               >
                 ×
-              </span>
+              </button>
             </div>
           ))}
         </div>
@@ -1572,6 +1745,12 @@ function PendingContainerNode({
       <textarea
         value={container.prompt}
         onChange={(e) => onChange({ prompt: e.target.value, error: undefined })}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && !e.shiftKey) {
+            e.preventDefault();
+            onGenerate();
+          }
+        }}
         placeholder={
           refNodes.length === 0
             ? "图片描述（必填）"
