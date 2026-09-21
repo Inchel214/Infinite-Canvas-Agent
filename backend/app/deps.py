@@ -18,7 +18,8 @@ from app.tools.variate_image import VariateImageTool
 store = FileStore()
 
 # 图片生成服务：有 ARK_API_KEY 时用火山引擎真实 API，否则降级为 Mock（SVG 占位图）
-_ark_api_key = os.getenv("ARK_API_KEY", "")
+_ark_api_key = os.getenv("ARK_API_KEY", "").strip()
+print(f"[deps] ARK_API_KEY loaded: {bool(_ark_api_key)} (len={len(_ark_api_key)})", flush=True)
 if _ark_api_key:
     image_generator = VolcEngineImageGenerator(
         api_key=_ark_api_key,

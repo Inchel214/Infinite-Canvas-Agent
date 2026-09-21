@@ -85,9 +85,17 @@ if [[ ! -f backend/.env ]]; then
   echo ""
   printf "请输入 ARK_API_KEY（可留空跳过）: "
   read -r api_key
+  # 去除前后空白（粘贴时常见带空格/换行）
+  api_key="$(echo -n "$api_key" | xargs)"
   if [[ -n "$api_key" ]]; then
     echo "ARK_API_KEY=$api_key" > backend/.env
     ok "API Key 已保存到 backend/.env"
+    # 验证写入
+    if grep -q "ARK_API_KEY=" backend/.env; then
+      ok "配置验证通过，将使用真实生图 API"
+    else
+      warn "配置文件写入异常，将使用演示模式"
+    fi
   else
     warn "已跳过，使用演示模式"
   fi
