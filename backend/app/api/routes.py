@@ -223,6 +223,43 @@ def generate_image(canvas_id: str, req: GenerateRequest):
     }
 
 
+class UploadImageRequest(BaseModel):
+    image_url: str  # data URL（前端 FileReader 读取）
+    x: float = 100
+    y: float = 100
+    width: int = 300
+    height: int = 300
+    content: str = ""
+
+
+@router.post("/canvas/{canvas_id}/upload_image", summary="上传本地图片为画布节点")
+def upload_image(canvas_id: str, req: UploadImageRequest):
+    try:
+        state = deps.store.get_canvas(canvas_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    if not req.image_url.startswith("data:image/"):
+        raise HTTPException(status_code=400, detail="仅支持 data URL 格式图片")
+    node = CanvasNode(
+        id=str(uuid.uuid4()),
+        type="image",
+        x=req.x,
+        y=req.y,
+        width=req.width,
+        height=req.height,
+        content=req.content or "本地图片",
+        image_url=req.image_url,
+        source_ids=[],
+    )
+    state.add_node(node)
+    deps.store.save_canvas(state)
+    return {
+        "success": True,
+        "message": "已添加图片",
+        "canvas": state.to_dict(),
+    }
+
+
 @router.post("/canvas/{canvas_id}/generate_stream", summary="图片容器流式生成（SSE）")
 def generate_image_stream(canvas_id: str, req: StreamGenRequest):
     try:

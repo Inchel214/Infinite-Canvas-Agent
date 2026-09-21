@@ -1,6 +1,6 @@
 import { useEffect, useRef, useCallback, useState } from "react";
 import type { CanvasState, CanvasNode } from "../types/canvas";
-import { generateImageStream } from "../api/agent";
+import { generateImageStream, uploadImageNode } from "../api/agent";
 
 // 右键菜单可触发的操作类型
 export type CanvasAction =
@@ -203,17 +203,48 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
   }, [canvasState]);
 
   // Esc：关闭菜单 / 清空选择 / 取消连线
+  // Delete/Backspace：删除选中节点
+  // Ctrl+C / Cmd+C：复制选中图片到系统剪贴板（可在文件管理器粘贴为 PNG）
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         setMenu(null);
         setSelectedIds(new Set());
         setConnecting(null);
+        return;
+      }
+      // 输入框聚焦时不拦截快捷键（保留正常打字/复制文本）
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+
+      // Delete / Backspace → 删除选中
+      if ((e.key === "Delete" || e.key === "Backspace") && selectedIds.size > 0) {
+        e.preventDefault();
+        onAction?.({ type: "delete", nodeIds: [...selectedIds] });
+        setMenu(null);
+        return;
+      }
+      // Ctrl+C / Cmd+C → 复制选中图片（单选时）
+      if ((e.ctrlKey || e.metaKey) && (e.key === "c" || e.key === "C") && selectedIds.size === 1) {
+        const id = [...selectedIds][0];
+        const node = nodes.find((n) => n.id === id);
+        const url = node?.image_url;
+        if (url) {
+          e.preventDefault();
+          (async () => {
+            try {
+              const blob = await (await fetch(url)).blob();
+              await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
+            } catch {
+              // 静默失败（剪贴板权限或浏览器不支持）
+            }
+          })();
+        }
       }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, []);
+  }, [selectedIds, nodes, onAction]);
 
   // 屏幕坐标（相对画布容器）→ 世界坐标
   const screenToWorld = useCallback(
@@ -251,6 +282,81 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
   const removeContainer = useCallback((id: string) => {
     setContainers((prev) => prev.filter((c) => c.id !== id));
   }, []);
+
+  // ===== 拖拽/粘贴上传本地图片 =====
+  const uploadImages = useCallback(
+    async (files: File[], wx: number, wy: number) => {
+      if (!canvasId) return;
+      let ox = 0;
+      let oy = 0;
+      for (const file of files) {
+        if (!file.type.startsWith("image/")) continue;
+        try {
+          // 读取文件为 data URL
+          const dataUrl = await new Promise<string>((resolve, reject) => {
+            const r = new FileReader();
+            r.onload = () => resolve(r.result as string);
+            r.onerror = () => reject(new Error("读取文件失败"));
+            r.readAsDataURL(file);
+          });
+          // 获取图片真实宽高
+          const dim = await new Promise<{ w: number; h: number }>((resolve) => {
+            const img = new Image();
+            img.onload = () => resolve({ w: img.naturalWidth, h: img.naturalHeight });
+            img.onerror = () => resolve({ w: 300, h: 300 });
+            img.src = dataUrl;
+          });
+          // 显示尺寸：最长边 400，与生成图节点一致
+          const scale = 400 / Math.max(dim.w, dim.h);
+          const w = Math.max(1, Math.round(dim.w * scale));
+          const h = Math.max(1, Math.round(dim.h * scale));
+          const res = await uploadImageNode(canvasId, {
+            image_url: dataUrl,
+            x: wx + ox,
+            y: wy + oy,
+            width: w,
+            height: h,
+          });
+          if (res.success) onCanvasUpdate?.(res.canvas);
+          ox += w * 0.3; // 多张图片错开摆放
+          oy += h * 0.3;
+        } catch {
+          // 单张失败跳过，不影响其他
+        }
+      }
+    },
+    [canvasId, onCanvasUpdate]
+  );
+
+  // 拖拽文件进入/离开（高亮提示）
+  const [dragOver, setDragOver] = useState(false);
+
+  // Ctrl+V 粘贴图片（输入框聚焦时让位给正常文本粘贴）
+  useEffect(() => {
+    const handler = (e: ClipboardEvent) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+      const files: File[] = [];
+      for (const item of items) {
+        if (item.type.startsWith("image/")) {
+          const f = item.getAsFile();
+          if (f) files.push(f);
+        }
+      }
+      if (!files.length) return;
+      e.preventDefault();
+      // 粘贴位置：当前视图中心
+      const container = containerRef.current;
+      if (!container) return;
+      const rect = container.getBoundingClientRect();
+      const c = screenToWorld(rect.left + rect.width / 2, rect.top + rect.height / 2);
+      uploadImages(files, c.x, c.y);
+    };
+    window.addEventListener("paste", handler);
+    return () => window.removeEventListener("paste", handler);
+  }, [uploadImages, screenToWorld]);
 
   // 从图片边缘连接点开始拖线
   const handlePortMouseDown = useCallback(
@@ -572,6 +678,34 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
     setMenu(null);
   }, [onAction, selectedIds]);
 
+  // 复制选中图片到系统剪贴板（可在文件管理器 Ctrl+V 粘贴为 PNG 文件）
+  const handleCopyImage = useCallback(async () => {
+    const id = [...selectedIds][0];
+    const node = nodes.find((n) => n.id === id);
+    setMenu(null);
+    if (!node?.image_url) return;
+    try {
+      const blob = await (await fetch(node.image_url)).blob();
+      await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
+    } catch {
+      // 浏览器不支持或剪贴板被拒：静默失败
+    }
+  }, [selectedIds, nodes]);
+
+  // 另存为：触发浏览器下载
+  const handleSaveImage = useCallback(() => {
+    const id = [...selectedIds][0];
+    const node = nodes.find((n) => n.id === id);
+    setMenu(null);
+    if (!node?.image_url) return;
+    const a = document.createElement("a");
+    a.href = node.image_url;
+    a.download = `canvas-${node.id.slice(0, 8)}.png`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }, [selectedIds, nodes]);
+
   // 空白右键：打开「新建容器」菜单
   const handleBackgroundContextMenu = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -689,6 +823,24 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
       onMouseUp={handleMouseUp}
       onMouseLeave={handleMouseUp}
       onContextMenu={handleBackgroundContextMenu}
+      onDragOver={(e) => {
+        e.preventDefault(); // 允许放置（否则浏览器直接打开图片文件）
+      }}
+      onDragEnter={(e) => {
+        e.preventDefault();
+        if (e.dataTransfer?.types?.includes("Files")) setDragOver(true);
+      }}
+      onDragLeave={(e) => {
+        if (e.target === e.currentTarget) setDragOver(false);
+      }}
+      onDrop={(e) => {
+        e.preventDefault();
+        setDragOver(false);
+        const files = Array.from(e.dataTransfer?.files ?? []);
+        if (!files.length) return;
+        const w = screenToWorld(e.clientX, e.clientY);
+        uploadImages(files, w.x - 150, w.y - 150);
+      }}
       style={{
         position: "fixed",
         inset: 0,
@@ -901,6 +1053,29 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
         />
       )}
 
+      {/* 拖拽图片文件进入提示 */}
+      {dragOver && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 16,
+            borderRadius: 16,
+            border: "2px dashed #818cf8",
+            background: "rgba(99,102,241,0.12)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            fontSize: 18,
+            fontWeight: 600,
+            color: "#c7d2fe",
+            pointerEvents: "none",
+            zIndex: 900,
+          }}
+        >
+          松开鼠标，把图片放到画布上
+        </div>
+      )}
+
       {/* 右键菜单 */}
       {menu && (
         <ContextMenu
@@ -909,6 +1084,11 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
           y={menu.y}
           mode={menu.mode}
           selectedCount={selectedCount}
+          selectedNodeContent={
+            selectedCount === 1
+              ? nodes.find((n) => n.id === [...selectedIds][0])?.content ?? ""
+              : ""
+          }
           promptInput={promptInput}
           onPromptChange={setPromptInput}
           aspect={aspect}
@@ -918,6 +1098,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
           onMenuAction={handleMenuAction}
           onExecute={handleExecute}
           onDelete={handleDelete}
+          onCopyImage={handleCopyImage}
+          onSaveImage={handleSaveImage}
           onCreateContainer={handleCreateContainer}
           onClose={() => setMenu(null)}
         />
@@ -994,6 +1176,7 @@ const ContextMenu = ({
   y,
   mode,
   selectedCount,
+  selectedNodeContent,
   promptInput,
   onPromptChange,
   aspect,
@@ -1003,6 +1186,8 @@ const ContextMenu = ({
   onMenuAction,
   onExecute,
   onDelete,
+  onCopyImage,
+  onSaveImage,
   onCreateContainer,
   onClose,
 }: {
@@ -1011,6 +1196,7 @@ const ContextMenu = ({
   y: number;
   mode: "menu" | "compose" | "variate" | "edit" | "background";
   selectedCount: number;
+  selectedNodeContent: string;
   promptInput: string;
   onPromptChange: (v: string) => void;
   aspect: string;
@@ -1020,12 +1206,16 @@ const ContextMenu = ({
   onMenuAction: (mode: "compose" | "variate" | "edit") => void;
   onExecute: () => void;
   onDelete: () => void;
+  onCopyImage: () => void;
+  onSaveImage: () => void;
   onCreateContainer: () => void;
   onClose: () => void;
 }) => {
   const MENU_W = 260;
   const left = Math.min(x, window.innerWidth - MENU_W - 8);
-  const menuH = mode === "menu" ? 200 : 390;
+  const menuH = mode === "menu"
+    ? (selectedCount === 1 && selectedNodeContent ? 320 : 200)
+    : 390;
   const top = Math.min(y, window.innerHeight - menuH);
 
   const itemStyle: React.CSSProperties = {
@@ -1088,6 +1278,29 @@ const ContextMenu = ({
             : "描述（可选）"}
       </div>
 
+      {/* 选中图片的生成提示词（详情） */}
+      {mode === "menu" && selectedCount === 1 && selectedNodeContent && (
+        <div
+          style={{
+            padding: "8px 14px",
+            fontSize: 12,
+            color: "#c7d2fe",
+            background: "rgba(99,102,241,0.08)",
+            borderRadius: 6,
+            margin: "0 6px 6px",
+            lineHeight: 1.5,
+            maxHeight: 120,
+            overflowY: "auto",
+            wordBreak: "break-word",
+          }}
+        >
+          <div style={{ fontSize: 10, color: "rgba(255,255,255,0.4)", marginBottom: 4 }}>
+            生成提示词
+          </div>
+          {selectedNodeContent}
+        </div>
+      )}
+
       {mode === "background" ? (
         <div style={itemStyle} onMouseEnter={hoverBg} onMouseLeave={hoverOut} onClick={onCreateContainer}>
           <span>📦 新建图片容器</span>
@@ -1110,6 +1323,14 @@ const ContextMenu = ({
               <div style={itemStyle} onMouseEnter={hoverBg} onMouseLeave={hoverOut} onClick={() => onMenuAction("edit")}>
                 <span>✏️ 编辑图片</span>
                 <span style={{ fontSize: 11, color: "rgba(255,255,255,0.35)" }}>局部修改</span>
+              </div>
+              <div style={itemStyle} onMouseEnter={hoverBg} onMouseLeave={hoverOut} onClick={onCopyImage}>
+                <span>📋 复制图片</span>
+                <span style={{ fontSize: 11, color: "rgba(255,255,255,0.35)" }}>粘贴到电脑</span>
+              </div>
+              <div style={itemStyle} onMouseEnter={hoverBg} onMouseLeave={hoverOut} onClick={onSaveImage}>
+                <span>💾 另存为...</span>
+                <span style={{ fontSize: 11, color: "rgba(255,255,255,0.35)" }}>下载 PNG</span>
               </div>
             </>
           )}

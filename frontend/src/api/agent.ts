@@ -189,6 +189,22 @@ export async function editImage(
   return res.json();
 }
 
+// 上传本地图片（拖拽/粘贴）为画布节点
+export async function uploadImageNode(
+  canvasId: string,
+  body: { image_url: string; x: number; y: number; width: number; height: number }
+): Promise<DirectResponse> {
+  const res = await fetch(`${API_BASE}/canvas/${canvasId}/upload_image`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    throw new Error(`${res.status}`);
+  }
+  return res.json();
+}
+
 export async function deleteNode(
   canvasId: string,
   nodeId: string

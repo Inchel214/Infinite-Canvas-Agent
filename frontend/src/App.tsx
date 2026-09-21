@@ -96,6 +96,16 @@ function App() {
     }
   }, [canvasId]);
 
+  // 操作完成后，提示自动淡出（非常驻显示）
+  const [fading, setFading] = useState(false);
+  useEffect(() => {
+    if (!statusMsg || loading) return;
+    setFading(false);
+    const t1 = setTimeout(() => setFading(true), 1700);
+    const t2 = setTimeout(() => { setStatusMsg(""); setFading(false); }, 2200);
+    return () => { clearTimeout(t1); clearTimeout(t2); };
+  }, [statusMsg, loading]);
+
   return (
     <>
       <Canvas
@@ -133,6 +143,8 @@ function App() {
             alignItems: "center",
             gap: 8,
             maxWidth: "70vw",
+            opacity: fading ? 0 : 1,
+            transition: "opacity 0.5s ease",
           }}
         >
           {loading && (
