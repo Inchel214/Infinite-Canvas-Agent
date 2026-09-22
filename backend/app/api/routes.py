@@ -298,6 +298,42 @@ def upload_image(canvas_id: str, req: UploadImageRequest):
     }
 
 
+class CloneNodeRequest(BaseModel):
+    image_url: str
+    x: float = 100
+    y: float = 100
+    width: int = 300
+    height: int = 300
+    content: str = ""
+    source_ids: list = []
+
+
+@router.post("/canvas/{canvas_id}/nodes/clone", summary="克隆节点（复制完整属性，含提示词）")
+def clone_node(canvas_id: str, req: CloneNodeRequest):
+    try:
+        state = deps.store.get_canvas(canvas_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    node = CanvasNode(
+        id=str(uuid.uuid4()),
+        type="image",
+        x=req.x,
+        y=req.y,
+        width=req.width,
+        height=req.height,
+        content=req.content,
+        image_url=req.image_url,
+        source_ids=list(req.source_ids),
+    )
+    state.add_node(node)
+    deps.store.save_canvas(state)
+    return {
+        "success": True,
+        "message": "已复制节点",
+        "canvas": state.to_dict(),
+    }
+
+
 @router.post("/canvas/{canvas_id}/generate_stream", summary="图片容器流式生成（SSE）")
 def generate_image_stream(canvas_id: str, req: StreamGenRequest):
     try:
