@@ -307,6 +307,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
           // 克隆节点：复制完整属性（含提示词 content、来源 source_ids）
           (async () => {
             let ox = 0, oy = 0;
+            let okCount = 0;
+            let failCount = 0;
             for (const src of clipboardRef.current!) {
               try {
                 const res = await cloneNode(canvasId!, {
@@ -318,14 +320,23 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
                   content: src.content ?? "",
                   source_ids: src.source_ids ?? [],
                 });
-                if (res.success) onCanvasUpdate?.(res.canvas);
+                if (res.success) {
+                  onCanvasUpdate?.(res.canvas);
+                  okCount++;
+                } else {
+                  failCount++;
+                }
                 ox += src.width * 0.3;
                 oy += src.height * 0.3;
               } catch {
-                // 单张失败跳过
+                failCount++;
               }
             }
-            setLocalStatusMsg(`已粘贴 ${clipboardRef.current!.length} 张图片`);
+            if (failCount === 0) {
+              setLocalStatusMsg(`已粘贴 ${okCount} 张图片`);
+            } else {
+              setLocalStatusMsg(`粘贴 ${okCount} 张成功，${failCount} 张失败（请检查后端）`);
+            }
             setTimeout(() => setLocalStatusMsg(null), 2200);
           })();
         }
