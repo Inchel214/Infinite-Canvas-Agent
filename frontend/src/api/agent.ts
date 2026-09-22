@@ -219,6 +219,22 @@ export async function deleteNode(
   return res.json();
 }
 
+// 批量删除节点（单次撤销点，一次性恢复全部）
+export async function deleteNodes(
+  canvasId: string,
+  nodeIds: string[]
+): Promise<DirectResponse> {
+  const res = await fetch(`${API_BASE}/canvas/${canvasId}/nodes/delete`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ node_ids: nodeIds }),
+  });
+  if (!res.ok) {
+    throw new Error(`${res.status}`);
+  }
+  return res.json();
+}
+
 // 撤销最近一次操作，无历史可撤销时后端返回 success:false
 export async function undoCanvas(canvasId: string): Promise<DirectResponse> {
   const res = await fetch(`${API_BASE}/canvas/${canvasId}/undo`, {

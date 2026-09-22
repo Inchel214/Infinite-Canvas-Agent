@@ -21,7 +21,7 @@ export type PendingContainer = {
   refIds: string[];     // 连线进来的参考图节点 ID
   error?: string;       // 生成失败提示
   previewUrl?: string;  // 流式生成的中间预览图
-  exiting?: boolean;    // 生成完成后正在退场（淡出中）
+  exiting?: boolean;    // 生成完成后正在退场（淡出中）         
 };
 
 // 宽高比预设（长边 = 分辨率档位）
@@ -97,7 +97,8 @@ function getConnectionEndpoints(src: BBox, tgt: BBox) {
       x2 = tgt.x + tgt.width;
       y2 = tgtCy;
     }
-    const offset = Math.max(40, Math.abs(dx) / 2);
+    // offset 不超过端点水平距离的一半：图靠得近时曲线保持单弧，不产生 S 形
+    const offset = Math.min(Math.max(40, Math.abs(dx) / 2), Math.max(12, Math.abs(x2 - x1) / 2));
     const dir = dx >= 0 ? 1 : -1;
     cx1 = x1 + dir * offset;
     cy1 = y1;
@@ -117,7 +118,7 @@ function getConnectionEndpoints(src: BBox, tgt: BBox) {
       x2 = tgtCx;
       y2 = tgt.y + tgt.height;
     }
-    const offset = Math.max(40, Math.abs(dy) / 2);
+    const offset = Math.min(Math.max(40, Math.abs(dy) / 2), Math.max(12, Math.abs(y2 - y1) / 2));
     const dir = dy >= 0 ? 1 : -1;
     cx1 = x1;
     cy1 = y1 + dir * offset;
@@ -131,7 +132,18 @@ function getConnectionEndpoints(src: BBox, tgt: BBox) {
 type MenuState = {
   x: number;
   y: number;
-  mode: "menu" | "compose" | "variate" | "edit" | "background";
+  mode: "menu" | "compose" | "variate" | "background";
+};
+
+// 编辑图片框：独立于右键菜单，可与之并存
+// 连线在画布 SVG 层（世界坐标系）渲染，与图片间连线同风格
+type EditPanelState = {
+  nodeId: string;   // 被编辑的图片节点
+  x: number;         // 屏幕坐标（fixed 定位）
+  y: number;
+  prompt: string;
+  aspect: string;
+  resolution: string;
 };
 
 interface CanvasProps {
@@ -153,6 +165,11 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
   const containerRef = useRef<HTMLDivElement>(null);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [zoom, setZoom] = useState(0.5);
+  // pan/zoom 的 ref 镜像：原生 wheel 监听里读最新值，避免闭包过期
+  const panRef = useRef(pan);
+  panRef.current = pan;
+  const zoomRef = useRef(zoom);
+  zoomRef.current = zoom;
   const [isPanning, setIsPanning] = useState(false);
   const panStart = useRef({ x: 0, y: 0, panX: 0, panY: 0 });
   const prevNodeCount = useRef(0);
@@ -173,15 +190,26 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
   const [aspect, setAspect] = useState<string>("1:1");
   const [resolution, setResolution] = useState<string>("2K");
 
+  // ===== 编辑图片框（独立于右键菜单，可与普通菜单并存） =====
+  const [editPanel, setEditPanel] = useState<EditPanelState | null>(null);
+  const editPanelRef = useRef<HTMLDivElement>(null);
+  // 测量编辑框实际高度（连线终点垂直居中用）
+  const [editPanelH, setEditPanelH] = useState(420);
+
   // ===== 待生成图片容器 + 连线 =====
   const [containers, setContainers] = useState<PendingContainer[]>([]);
   const [connecting, setConnecting] = useState<{ fromId: string; x: number; y: number; sx: number; sy: number } | null>(null);
   const [draggingContainer, setDraggingContainer] = useState<{ id: string; offsetX: number; offsetY: number } | null>(null);
   const [generatingContainerId, setGeneratingContainerId] = useState<string | null>(null);
   const [genProgress, setGenProgress] = useState(0);
+  const [localStatusMsg, setLocalStatusMsg] = useState<string | null>(null);
   const containerSeqRef = useRef(0);
+  // 画布内复制/粘贴的剪贴板（存节点副本，Ctrl+V 粘贴到画布）
+  const clipboardRef = useRef<CanvasNode[] | null>(null);
 
   const marqueeStartRef = useRef<{ x: number; y: number } | null>(null);
+  // 平移 rAF 合帧数据
+  const panRafData = useRef<{ raf: number | null; dx: number; dy: number }>({ raf: null, dx: 0, dy: 0 });
   const dragStartPosRef = useRef<{ x: number; y: number } | null>(null);
   const backgroundDownRef = useRef<{ x: number; y: number } | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -213,6 +241,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
     const handler = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         setMenu(null);
+        setEditPanel(null);
         setSelectedIds(new Set());
         setConnecting(null);
         return;
@@ -251,27 +280,58 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
         setMenu(null);
         return;
       }
-      // Ctrl+C / Cmd+C → 复制选中图片（单选时）
-      if ((e.ctrlKey || e.metaKey) && (e.key === "c" || e.key === "C") && selectedIds.size === 1) {
-        const id = [...selectedIds][0];
-        const node = nodes.find((n) => n.id === id);
-        const url = node?.image_url;
-        if (url) {
+      // Ctrl+C / Cmd+C → 画布内复制选中图片（存入剪贴板状态）
+      if ((e.ctrlKey || e.metaKey) && (e.key === "c" || e.key === "C") && selectedIds.size >= 1) {
+        const ids = [...selectedIds];
+        const copies = ids
+          .map((id) => nodes.find((n) => n.id === id))
+          .filter((n): n is CanvasNode => !!n && !!n.image_url);
+        if (copies.length > 0) {
           e.preventDefault();
+          clipboardRef.current = copies;
+          setLocalStatusMsg(`已复制 ${copies.length} 张图片，Ctrl+V 粘贴到画布`);
+          setTimeout(() => setLocalStatusMsg(null), 2200);
+        }
+      }
+      // Ctrl+V / Cmd+V → 在当前视图中心粘贴复制的图片到画布
+      if ((e.ctrlKey || e.metaKey) && (e.key === "v" || e.key === "V") && clipboardRef.current) {
+        const target = e.target as HTMLElement;
+        if (target.tagName === "INPUT" || target.tagName === "TEXTAREA") return;
+        e.preventDefault();
+        const container = containerRef.current;
+        if (container) {
+          const rect = container.getBoundingClientRect();
+          // 世界坐标 = 视图中心
+          const cx = (rect.width / 2 - panRef.current.x) / zoomRef.current;
+          const cy = (rect.height / 2 - panRef.current.y) / zoomRef.current;
+          // 复制的节点直接通过 upload 端点添加（带 image_url，不重新生成）
           (async () => {
-            try {
-              const blob = await (await fetch(url)).blob();
-              await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
-            } catch {
-              // 静默失败（剪贴板权限或浏览器不支持）
+            let ox = 0, oy = 0;
+            for (const src of clipboardRef.current!) {
+              try {
+                const res = await uploadImageNode(canvasId!, {
+                  image_url: src.image_url!,
+                  x: cx + ox,
+                  y: cy + oy,
+                  width: src.width,
+                  height: src.height,
+                });
+                if (res.success) onCanvasUpdate?.(res.canvas);
+                ox += src.width * 0.3;
+                oy += src.height * 0.3;
+              } catch {
+                // 单张失败跳过
+              }
             }
+            setLocalStatusMsg(`已粘贴 ${clipboardRef.current!.length} 张图片`);
+            setTimeout(() => setLocalStatusMsg(null), 2200);
           })();
         }
       }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [selectedIds, nodes, onAction, canvasId, onCanvasUpdate]);
+  }, [selectedIds, nodes, onAction, canvasId, onCanvasUpdate, setLocalStatusMsg]);
 
   // 空格键抬起：清除平移模式
   useEffect(() => {
@@ -375,6 +435,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
   // Ctrl+V 粘贴图片（输入框聚焦时让位给正常文本粘贴）
   useEffect(() => {
     const handler = (e: ClipboardEvent) => {
+      // 画布内复制优先：如果 clipboardRef 有内容，让 keydown 处理，跳过系统剪贴板
+      if (clipboardRef.current) return;
       const items = e.clipboardData?.items;
       if (!items) return;
       const t = e.target as HTMLElement | null;
@@ -420,10 +482,12 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
     []
   );
 
-  // 点击菜单外部关闭
+  // 点击菜单外部关闭（点击编辑框时不关闭菜单，两者可并存）
   useEffect(() => {
     if (!menu) return;
     const handler = (e: MouseEvent) => {
+      // 点击编辑框内部时不关闭普通菜单
+      if (editPanelRef.current && editPanelRef.current.contains(e.target as Node)) return;
       if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
         setMenu(null);
       }
@@ -461,27 +525,41 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
     });
   }, [canvasState]);
 
-  // 滚轮缩放
-  const handleWheel = useCallback((e: React.WheelEvent) => {
-    e.preventDefault();
+  // 滚轮缩放：原生非 passive 监听（React onWheel 是 passive，preventDefault 无效）
+  // rAF 合帧：同一帧内的多次 wheel 事件合并为一次渲染，避免高频重渲染卡顿
+  useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
-    const rect = container.getBoundingClientRect();
-    const mouseX = e.clientX - rect.left;
-    const mouseY = e.clientY - rect.top;
-
-    const delta = -e.deltaY * 0.001;
-    const factor = Math.exp(delta);
-    const newZoom = Math.min(Math.max(zoom * factor, 0.05), 5);
-
-    const worldX = (mouseX - pan.x) / zoom;
-    const worldY = (mouseY - pan.y) / zoom;
-    setPan({
-      x: mouseX - worldX * newZoom,
-      y: mouseY - worldY * newZoom,
-    });
-    setZoom(newZoom);
-  }, [zoom, pan]);
+    let raf: number | null = null;
+    let acc = 0; // 帧内 deltaY 累积
+    let mx = 0, my = 0; // 最后一次事件的鼠标位置
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const rect = container.getBoundingClientRect();
+      mx = e.clientX - rect.left;
+      my = e.clientY - rect.top;
+      acc += e.deltaY;
+      if (raf !== null) return;
+      raf = requestAnimationFrame(() => {
+        raf = null;
+        const delta = -acc * 0.001;
+        acc = 0;
+        const p = panRef.current;
+        const z = zoomRef.current;
+        const factor = Math.exp(delta);
+        const newZoom = Math.min(Math.max(z * factor, 0.05), 5);
+        const worldX = (mx - p.x) / z;
+        const worldY = (my - p.y) / z;
+        setPan({ x: mx - worldX * newZoom, y: my - worldY * newZoom });
+        setZoom(newZoom);
+      });
+    };
+    container.addEventListener("wheel", onWheel, { passive: false });
+    return () => {
+      container.removeEventListener("wheel", onWheel);
+      if (raf !== null) cancelAnimationFrame(raf);
+    };
+  }, []);
 
   // 背景鼠标按下：直接拖=框选，Shift/空格/中键拖=平移
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
@@ -559,11 +637,16 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
         },
       }));
     } else if (isPanning) {
-      const dx = e.clientX - panStart.current.x;
-      const dy = e.clientY - panStart.current.y;
-      setPan({
-        x: panStart.current.panX + dx,
-        y: panStart.current.panY + dy,
+      // rAF 合帧：一帧内多次 mousemove 合并为一次 setPan，避免高频重渲染
+      panRafData.current.dx = e.clientX - panStart.current.x;
+      panRafData.current.dy = e.clientY - panStart.current.y;
+      if (panRafData.current.raf !== null) return;
+      panRafData.current.raf = requestAnimationFrame(() => {
+        panRafData.current.raf = null;
+        setPan({
+          x: panStart.current.panX + panRafData.current.dx,
+          y: panStart.current.panY + panRafData.current.dy,
+        });
       });
     }
   }, [connecting, draggingContainer, draggingNode, isPanning, pan, zoom, dragOffset, screenToWorld]);
@@ -657,7 +740,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
     }
 
     if (isPanning) {
-      // 空白 click（无位移）：清空选择
+      // 空白 click（无位移）：清空选择、关闭普通菜单（编辑框独立保留，只能 Esc 关闭）
       const down = backgroundDownRef.current;
       if (down && Math.abs(e.clientX - down.x) + Math.abs(e.clientY - down.y) < 4) {
         setSelectedIds(new Set());
@@ -666,7 +749,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
       backgroundDownRef.current = null;
       setIsPanning(false);
     }
-  }, [marquee, draggingNode, localOverrides, onNodeMoved, isPanning, pan, zoom, nodes, connecting, containers, updateContainer, screenToWorld, draggingContainer, createContainer]);
+  }, [marquee, draggingNode, localOverrides, onNodeMoved, isPanning, pan, zoom, nodes, connecting, containers, updateContainer, screenToWorld, draggingContainer, createContainer, menu]);
 
   // 图片节点拖拽开始（记录起点用于 click/drag 判定）
   const handleNodeMouseDown = useCallback((e: React.MouseEvent, node: CanvasNode) => {
@@ -690,7 +773,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
     setDraggingNode(node.id);
   }, [pan, zoom]);
 
-  // 图片右键：选中（若未选中）并打开菜单
+  // 图片右键：选中（若未选中）并打开普通菜单
+  // 编辑框若已打开则保持不变，右键其它图片正常弹出普通菜单（两者并存）
   const handleNodeContextMenu = useCallback((e: React.MouseEvent, node: CanvasNode) => {
     e.preventDefault();
     e.stopPropagation();
@@ -703,9 +787,37 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
 
   // 菜单操作
   const handleMenuAction = useCallback((mode: "compose" | "variate" | "edit") => {
-    setPromptInput("");
+    // 编辑图片：打开独立编辑框（带连线），默认回填原提示词，与普通菜单分离
+    if (mode === "edit" && selectedIds.size === 1) {
+      const node = nodes.find((n) => n.id === [...selectedIds][0]);
+      const c = node?.content ?? "";
+      if (node && containerRef.current) {
+        const rect = containerRef.current.getBoundingClientRect();
+        const sx = rect.left + pan.x + node.x * zoom;
+        const sy = rect.top + pan.y + node.y * zoom;
+        const sw = node.width * zoom;
+        const sh = node.height * zoom;
+        const PANEL_W = 340;
+        const PANEL_H = 440;
+        let mx = sx + sw + 28; // 右侧优先
+        if (mx + PANEL_W > window.innerWidth - 8) mx = Math.max(8, sx - PANEL_W - 28); // 空间不够放左侧
+        const my = Math.max(8, Math.min(sy + sh / 2 - PANEL_H / 2, window.innerHeight - PANEL_H - 8));
+        setEditPanel({
+          nodeId: node.id,
+          x: mx,
+          y: my,
+          prompt: c && c !== "本地图片" ? c : "",
+          aspect,
+          resolution,
+        });
+        setMenu(null); // 关闭普通菜单，编辑框独立显示
+        return;
+      }
+    } else {
+      setPromptInput("");
+    }
     setMenu((prev) => (prev ? { ...prev, mode } : null));
-  }, []);
+  }, [nodes, selectedIds, pan, zoom, aspect, resolution]);
 
   const handleExecute = useCallback(() => {
     if (!onAction || !menu) return;
@@ -718,8 +830,6 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
       onAction({ type: "compose", nodeIds: ids, prompt, size });
     } else if (menu.mode === "variate" && ids.length === 1) {
       onAction({ type: "variate", nodeId: ids[0], prompt, size });
-    } else if (menu.mode === "edit" && ids.length === 1 && prompt) {
-      onAction({ type: "edit", nodeId: ids[0], prompt, size });
     } else {
       return;
     }
@@ -727,38 +837,77 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
     setPromptInput("");
   }, [onAction, menu, selectedIds, promptInput, aspect, resolution]);
 
+  // 编辑框执行：使用编辑框自身的 nodeId 和 prompt（不依赖菜单/选中状态）
+  const handleEditPanelExecute = useCallback(() => {
+    if (!onAction || !editPanel) return;
+    const prompt = editPanel.prompt.trim();
+    if (!prompt) return;
+    const size = calcSize(editPanel.aspect, editPanel.resolution);
+    onAction({ type: "edit", nodeId: editPanel.nodeId, prompt, size });
+    setEditPanel(null);
+  }, [onAction, editPanel]);
+
   const handleDelete = useCallback(() => {
     if (!onAction || selectedIds.size === 0) return;
     onAction({ type: "delete", nodeIds: [...selectedIds] });
     setMenu(null);
   }, [onAction, selectedIds]);
 
-  // 复制选中图片到系统剪贴板（可在文件管理器 Ctrl+V 粘贴为 PNG 文件）
-  const handleCopyImage = useCallback(async () => {
-    const id = [...selectedIds][0];
-    const node = nodes.find((n) => n.id === id);
+  // 画布内复制选中图片（存入剪贴板状态，Ctrl+V 粘贴到画布）
+  const handleCopyImage = useCallback(() => {
+    const copies = [...selectedIds]
+      .map((id) => nodes.find((n) => n.id === id))
+      .filter((n): n is CanvasNode => !!n && !!n.image_url);
     setMenu(null);
-    if (!node?.image_url) return;
-    try {
-      const blob = await (await fetch(node.image_url)).blob();
-      await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
-    } catch {
-      // 浏览器不支持或剪贴板被拒：静默失败
-    }
+    if (copies.length === 0) return;
+    clipboardRef.current = copies;
+    setLocalStatusMsg(`已复制 ${copies.length} 张图片，Ctrl+V 粘贴到画布`);
+    setTimeout(() => setLocalStatusMsg(null), 2200);
   }, [selectedIds, nodes]);
 
-  // 另存为：触发浏览器下载
-  const handleSaveImage = useCallback(() => {
+  // 另存为：优先用 File System Access API（弹「保存到…」对话框，可选桌面等任意文件夹），
+  // 不支持/失败时回退普通下载。浏览器剪贴板不允许写「文件引用」格式，
+  // 所以无法直接 Ctrl+V 粘到文件管理器，保存对话框是最接近原生的体验。
+  const handleSaveImage = useCallback(async () => {
     const id = [...selectedIds][0];
     const node = nodes.find((n) => n.id === id);
     setMenu(null);
     if (!node?.image_url) return;
+    const filename = `canvas-${node.id.slice(0, 8)}.png`;
+    let blob: Blob;
+    try {
+      blob = await (await fetch(node.image_url)).blob();
+    } catch {
+      return;
+    }
+    const w = window as unknown as {
+      showSaveFilePicker?: (opts?: object) => Promise<{
+        createWritable: () => Promise<{ write: (b: Blob) => Promise<void>; close: () => Promise<void> }>;
+      }>;
+    };
+    if (w.showSaveFilePicker) {
+      try {
+        const handle = await w.showSaveFilePicker({
+          suggestedName: filename,
+          types: [{ description: "图片", accept: { [blob.type || "image/png"]: [".png", ".jpg", ".jpeg"] } }],
+        });
+        const ws = await handle.createWritable();
+        await ws.write(blob);
+        await ws.close();
+        return;
+      } catch (e) {
+        const err = e as { name?: string };
+        if (err?.name === "AbortError") return; // 用户取消
+        // 其他错误（权限等）回退下载
+      }
+    }
     const a = document.createElement("a");
-    a.href = node.image_url;
-    a.download = `canvas-${node.id.slice(0, 8)}.png`;
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
     document.body.appendChild(a);
     a.click();
     a.remove();
+    URL.revokeObjectURL(a.href);
   }, [selectedIds, nodes]);
 
   // 空白右键：打开「新建容器」菜单
@@ -872,7 +1021,6 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
   return (
     <div
       ref={containerRef}
-      onWheel={handleWheel}
       onMouseDown={handleMouseDown}
       onMouseMove={handleMouseMove}
       onMouseUp={handleMouseUp}
@@ -941,6 +1089,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
           position: "absolute",
           transformOrigin: "0 0",
           transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+          // 提升为合成层：pan/zoom 变化时 GPU 缩放缓存纹理，不逐帧重光栅化所有图片
+          willChange: "transform",
         }}
       >
         {/* 连线层（实线 = 已生成谱系，虚线 = 待生成参考） */}
@@ -953,6 +1103,32 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
             pointerEvents: "none",
           }}
         >
+          <defs>
+            {/* 谱系连线箭头：源图 → 生成图 */}
+            <marker
+              id="ica-arrow-solid"
+              viewBox="0 0 10 10"
+              refX="9"
+              refY="5"
+              markerWidth="6"
+              markerHeight="6"
+              orient="auto-start-reverse"
+            >
+              <path d="M 0 1 L 10 5 L 0 9 z" fill="#6366f1" />
+            </marker>
+            {/* 参考连线箭头（虚线用浅紫） */}
+            <marker
+              id="ica-arrow-dashed"
+              viewBox="0 0 10 10"
+              refX="9"
+              refY="5"
+              markerWidth="6"
+              markerHeight="6"
+              orient="auto-start-reverse"
+            >
+              <path d="M 0 1 L 10 5 L 0 9 z" fill="#a78bfa" />
+            </marker>
+          </defs>
           {nodes
             .filter((n) => n.source_ids && n.source_ids.length > 0)
             .map((target) =>
@@ -969,9 +1145,9 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
                       stroke="rgba(99,102,241,0.6)"
                       strokeWidth={3}
                       strokeLinecap="round"
+                      markerEnd="url(#ica-arrow-solid)"
                     />
                     <circle cx={ep.x1} cy={ep.y1} r={5} fill="#6366f1" />
-                    <circle cx={ep.x2} cy={ep.y2} r={5} fill="#6366f1" />
                   </g>
                 );
               })
@@ -995,12 +1171,44 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
                     strokeWidth={2.5}
                     strokeDasharray="8 6"
                     strokeLinecap="round"
+                    markerEnd="url(#ica-arrow-dashed)"
                   />
                   <circle cx={ep.x1} cy={ep.y1} r={4} fill="#a78bfa" />
                 </g>
               );
             });
           })}
+
+          {/* 编辑框连线：源图 → 编辑框（虚线，与参考连线同风格，世界坐标系渲染） */}
+          {editPanel &&
+            (() => {
+              const node = nodes.find((n) => n.id === editPanel.nodeId);
+              if (!node) return null;
+              // 画布容器 fixed inset:0，左上角 = (0,0)，编辑框屏幕坐标 → 世界坐标
+              const PANEL_W = 340;
+              const panelWorldX = (editPanel.x - pan.x) / zoom;
+              const panelWorldY = (editPanel.y - pan.y) / zoom;
+              const panelWorldW = PANEL_W / zoom;
+              const panelWorldH = editPanelH / zoom;
+              const src: BBox = { x: node.x, y: node.y, width: node.width, height: node.height };
+              const tgt: BBox = { x: panelWorldX, y: panelWorldY, width: panelWorldW, height: panelWorldH };
+              const ep = getConnectionEndpoints(src, tgt);
+              const path = `M ${ep.x1} ${ep.y1} C ${ep.cx1} ${ep.cy1}, ${ep.cx2} ${ep.cy2}, ${ep.x2} ${ep.y2}`;
+              return (
+                <g key={`edit-${editPanel.nodeId}`}>
+                  <path
+                    d={path}
+                    fill="none"
+                    stroke="rgba(167,139,250,0.7)"
+                    strokeWidth={2.5}
+                    strokeDasharray="8 6"
+                    strokeLinecap="round"
+                    markerEnd="url(#ica-arrow-dashed)"
+                  />
+                  <circle cx={ep.x1} cy={ep.y1} r={4} fill="#a78bfa" />
+                </g>
+              );
+            })()}
 
           {/* 拖动中的临时连线 */}
           {connecting &&
@@ -1018,14 +1226,14 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
               const horizontal = Math.abs(dx) >= Math.abs(dy);
               let cx1: number, cy1: number, cx2: number, cy2: number;
               if (horizontal) {
-                const offset = Math.max(40, Math.abs(dx) / 2);
+                const offset = Math.min(Math.max(40, Math.abs(dx) / 2), Math.max(12, Math.abs(x2 - x1) / 2));
                 const dir = dx >= 0 ? 1 : -1;
                 cx1 = x1 + dir * offset;
                 cy1 = y1;
                 cx2 = x2 - dir * offset;
                 cy2 = y2;
               } else {
-                const offset = Math.max(40, Math.abs(dy) / 2);
+                const offset = Math.min(Math.max(40, Math.abs(dy) / 2), Math.max(12, Math.abs(y2 - y1) / 2));
                 const dir = dy >= 0 ? 1 : -1;
                 cx1 = x1;
                 cy1 = y1 + dir * offset;
@@ -1133,7 +1341,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
         </div>
       )}
 
-      {/* 右键菜单 */}
+      {/* 右键菜单（普通菜单 / compose / variate 输入框） */}
       {menu && (
         <ContextMenu
           ref={menuRef}
@@ -1162,8 +1370,30 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
         />
       )}
 
-      {/* 选中数量提示 */}
-      {selectedCount > 0 && !menu && !connecting && !busy && (
+      {/* 编辑图片框（独立于右键菜单，可与普通菜单并存；连线在画布 SVG 层渲染） */}
+      {editPanel && (
+        <EditPanel
+          ref={editPanelRef}
+          x={editPanel.x}
+          y={editPanel.y}
+          nodeContent={
+            nodes.find((n) => n.id === editPanel.nodeId)?.content ?? ""
+          }
+          prompt={editPanel.prompt}
+          onPromptChange={(v) => setEditPanel((p) => (p ? { ...p, prompt: v } : p))}
+          aspect={editPanel.aspect}
+          resolution={editPanel.resolution}
+          onAspectChange={(v) => setEditPanel((p) => (p ? { ...p, aspect: v } : p))}
+          onResolutionChange={(v) => setEditPanel((p) => (p ? { ...p, resolution: v } : p))}
+          onExecute={handleEditPanelExecute}
+          onClose={() => setEditPanel(null)}
+          onMove={(nx, ny) => setEditPanel((p) => (p ? { ...p, x: nx, y: ny } : p))}
+          onMeasure={(h) => setEditPanelH(h)}
+        />
+      )}
+
+      {/* 选中数量提示（localStatusMsg 显示时隐藏，避免重叠） */}
+      {selectedCount > 0 && !menu && !connecting && !busy && !localStatusMsg && (
         <div
           style={{
             position: "absolute",
@@ -1201,6 +1431,28 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
           }}
         >
           松手到图片容器 = 添加参考图 · 松手到空白处 = 新建容器 · Esc 取消
+        </div>
+      )}
+
+      {/* 局部操作提示（复制失败等） */}
+      {localStatusMsg && (
+        <div
+          style={{
+            position: "absolute",
+            top: 16,
+            left: "50%",
+            transform: "translateX(-50%)",
+            background: "rgba(248,113,113,0.95)",
+            color: "white",
+            padding: "6px 14px",
+            borderRadius: 8,
+            fontSize: 13,
+            pointerEvents: "none",
+            zIndex: 600,
+            animation: "ica-fade-out 0.3s 1.9s forwards",
+          }}
+        >
+          {localStatusMsg}
         </div>
       )}
 
@@ -1251,7 +1503,7 @@ const ContextMenu = ({
   ref: React.RefObject<HTMLDivElement | null>;
   x: number;
   y: number;
-  mode: "menu" | "compose" | "variate" | "edit" | "background";
+  mode: "menu" | "compose" | "variate" | "background";
   selectedCount: number;
   selectedNodeContent: string;
   promptInput: string;
@@ -1268,12 +1520,38 @@ const ContextMenu = ({
   onCreateContainer: () => void;
   onClose: () => void;
 }) => {
-  const MENU_W = 260;
-  const left = Math.min(x, window.innerWidth - MENU_W - 8);
-  const menuH = mode === "menu"
+  // 输入模式（组合/变体/编辑）加宽，操作菜单保持紧凑
+  const MENU_W = mode === "menu" || mode === "background" ? 260 : 340;
+  // 菜单可拖动：初始位置用传入坐标，拖动后用 offset 覆盖
+  const [dragOffset, setDragOffset] = useState<{ dx: number; dy: number } | null>(null);
+  const dragStart = useRef<{ mx: number; my: number; left: number; top: number } | null>(null);
+  const baseLeft = Math.min(x, window.innerWidth - MENU_W - 8);
+  const baseTop = Math.min(y, window.innerHeight - (mode === "menu"
     ? (selectedCount === 1 && selectedNodeContent ? 320 : 200)
-    : 390;
-  const top = Math.min(y, window.innerHeight - menuH);
+    : 435));
+  const left = dragOffset ? Math.max(0, Math.min(baseLeft + dragOffset.dx, window.innerWidth - MENU_W - 8)) : baseLeft;
+  const top = dragOffset ? Math.max(0, Math.min(baseTop + dragOffset.dy, window.innerHeight - 40)) : baseTop;
+
+  const onTitleMouseDown = useCallback((e: React.MouseEvent) => {
+    if (e.button !== 0) return;
+    e.stopPropagation();
+    e.preventDefault();
+    dragStart.current = { mx: e.clientX, my: e.clientY, left, top };
+    const onMove = (ev: MouseEvent) => {
+      if (!dragStart.current) return;
+      setDragOffset({
+        dx: ev.clientX - dragStart.current.mx,
+        dy: ev.clientY - dragStart.current.my,
+      });
+    };
+    const onUp = () => {
+      dragStart.current = null;
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  }, [left, top]);
 
   const itemStyle: React.CSSProperties = {
     padding: "8px 14px",
@@ -1291,13 +1569,11 @@ const ContextMenu = ({
     e.currentTarget.style.background = "transparent";
   };
 
-  // 输入框模式（组合 / 变体 / 编辑）
+  // 输入框模式（组合 / 变体）
   const inputPlaceholder =
     mode === "compose"
       ? "组合描述，留空直接生成"
-      : mode === "variate"
-        ? "变体描述，留空直接生成"
-        : "编辑描述（必填），如：把背景改成星空";
+      : "变体描述，留空直接生成";
 
   return (
     <div
@@ -1318,14 +1594,17 @@ const ContextMenu = ({
       onMouseDown={(e) => e.stopPropagation()}
       onContextMenu={(e) => e.preventDefault()}
     >
-      {/* 标题 */}
+      {/* 标题栏（可拖拽移动整个菜单） */}
       <div
+        onMouseDown={onTitleMouseDown}
         style={{
           padding: "6px 14px 8px",
           fontSize: 11,
           color: "rgba(255,255,255,0.45)",
           borderBottom: "1px solid rgba(255,255,255,0.08)",
           marginBottom: 4,
+          cursor: "move",
+          userSelect: "none",
         }}
       >
         {mode === "menu"
@@ -1333,9 +1612,10 @@ const ContextMenu = ({
           : mode === "background"
             ? "画布空白处"
             : "描述（可选）"}
+        <span style={{ float: "right", opacity: 0.4, fontSize: 10 }}>⠿ 拖</span>
       </div>
 
-      {/* 选中图片的生成提示词（详情） */}
+      {/* 选中图片的生成提示词（详情，可鼠标选中复制） */}
       {mode === "menu" && selectedCount === 1 && selectedNodeContent && (
         <div
           style={{
@@ -1349,6 +1629,7 @@ const ContextMenu = ({
             maxHeight: 120,
             overflowY: "auto",
             wordBreak: "break-word",
+            userSelect: "text",
           }}
         >
           <div style={{ fontSize: 10, color: "rgba(255,255,255,0.4)", marginBottom: 4 }}>
@@ -1402,12 +1683,12 @@ const ContextMenu = ({
         </>
       ) : (
         <div style={{ padding: "8px 10px" }}>
-          <input
+          <textarea
             autoFocus
             value={promptInput}
             onChange={(e) => onPromptChange(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter") {
+              if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();
                 onExecute();
               }
@@ -1417,6 +1698,7 @@ const ContextMenu = ({
               }
             }}
             placeholder={inputPlaceholder}
+            rows={3}
             style={{
               width: "100%",
               boxSizing: "border-box",
@@ -1427,6 +1709,9 @@ const ContextMenu = ({
               color: "white",
               fontSize: 13,
               outline: "none",
+              resize: "none",
+              fontFamily: "inherit",
+              lineHeight: 1.5,
             }}
           />
 
@@ -1483,16 +1768,15 @@ const ContextMenu = ({
           <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
             <button
               onClick={onExecute}
-              disabled={mode === "edit" && !promptInput.trim()}
               style={{
                 flex: 1,
                 padding: "7px 0",
-                background: mode === "edit" && !promptInput.trim() ? "rgba(99,102,241,0.3)" : "#6366f1",
+                background: "#6366f1",
                 color: "white",
                 border: "none",
                 borderRadius: 6,
                 fontSize: 13,
-                cursor: mode === "edit" && !promptInput.trim() ? "not-allowed" : "pointer",
+                cursor: "pointer",
               }}
             >
               执行
@@ -1515,6 +1799,255 @@ const ContextMenu = ({
           </div>
         </div>
       )}
+    </div>
+  );
+};
+
+/**
+ * 编辑图片框：独立浮窗，带连线指向源图（连线在画布 SVG 层渲染）。
+ * 与右键菜单并存，只能 Esc/取消关闭。prompt 必填。
+ * 位置由父组件控制（拖动时 onMove 回调更新父组件 state，连线随之更新）。
+ */
+const EditPanel = ({
+  ref,
+  x,
+  y,
+  nodeContent,
+  prompt,
+  onPromptChange,
+  aspect,
+  resolution,
+  onAspectChange,
+  onResolutionChange,
+  onExecute,
+  onClose,
+  onMove,
+  onMeasure,
+}: {
+  ref: React.RefObject<HTMLDivElement | null>;
+  x: number;
+  y: number;
+  nodeContent: string;
+  prompt: string;
+  onPromptChange: (v: string) => void;
+  aspect: string;
+  resolution: string;
+  onAspectChange: (v: string) => void;
+  onResolutionChange: (v: string) => void;
+  onExecute: () => void;
+  onClose: () => void;
+  onMove: (x: number, y: number) => void;
+  onMeasure: (h: number) => void;
+}) => {
+  const PANEL_W = 340;
+  const left = Math.min(x, window.innerWidth - PANEL_W - 8);
+  const top = Math.min(y, window.innerHeight - 435);
+
+  const onTitleMouseDown = useCallback((e: React.MouseEvent) => {
+    if (e.button !== 0) return;
+    e.stopPropagation();
+    e.preventDefault();
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const origLeft = left;
+    const origTop = top;
+    const onMov = (ev: MouseEvent) => {
+      const nl = Math.max(0, Math.min(origLeft + ev.clientX - startX, window.innerWidth - PANEL_W - 8));
+      const nt = Math.max(0, Math.min(origTop + ev.clientY - startY, window.innerHeight - 40));
+      onMove(nl, nt);
+    };
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMov);
+      document.removeEventListener("mouseup", onUp);
+    };
+    document.addEventListener("mousemove", onMov);
+    document.addEventListener("mouseup", onUp);
+  }, [left, top, onMove]);
+
+  // 测量实际高度，回报父组件用于连线计算
+  useEffect(() => {
+    if (ref.current) onMeasure(ref.current.offsetHeight);
+  });
+
+  const canExecute = prompt.trim().length > 0;
+
+  return (
+    <div
+      ref={ref}
+      style={{
+        position: "fixed",
+        left,
+        top,
+        width: PANEL_W,
+        background: "rgba(26,26,46,0.97)",
+        border: "1px solid rgba(167,139,250,0.6)",
+        borderRadius: 10,
+        boxShadow: "0 8px 32px rgba(0,0,0,0.6)",
+        padding: 6,
+        zIndex: 1000,
+        backdropFilter: "blur(8px)",
+      }}
+      onMouseDown={(e) => e.stopPropagation()}
+      onContextMenu={(e) => e.preventDefault()}
+    >
+      {/* 标题栏（可拖拽移动） */}
+      <div
+        onMouseDown={onTitleMouseDown}
+        style={{
+          padding: "6px 14px 8px",
+          fontSize: 13,
+          color: "#c7d2fe",
+          borderBottom: "1px solid rgba(255,255,255,0.08)",
+          marginBottom: 4,
+          cursor: "move",
+          userSelect: "none",
+        }}
+      >
+        ✏️ 编辑图片
+        <span style={{ float: "right", opacity: 0.4, fontSize: 10 }}>⠿ 拖</span>
+      </div>
+
+      {/* 源图原始提示词（可鼠标选中复制） */}
+      {nodeContent && nodeContent !== "本地图片" && (
+        <div
+          style={{
+            padding: "8px 14px",
+            fontSize: 12,
+            color: "#c7d2fe",
+            background: "rgba(167,139,250,0.08)",
+            borderRadius: 6,
+            margin: "0 6px 6px",
+            lineHeight: 1.5,
+            maxHeight: 100,
+            overflowY: "auto",
+            wordBreak: "break-word",
+            userSelect: "text",
+          }}
+        >
+          <div style={{ fontSize: 10, color: "rgba(255,255,255,0.4)", marginBottom: 4 }}>
+            原始提示词
+          </div>
+          {nodeContent}
+        </div>
+      )}
+
+      <div style={{ padding: "8px 10px" }}>
+        <textarea
+          autoFocus
+          value={prompt}
+          onChange={(e) => onPromptChange(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey && canExecute) {
+              e.preventDefault();
+              onExecute();
+            }
+            if (e.key === "Escape") {
+              e.preventDefault();
+              onClose();
+            }
+          }}
+          placeholder="编辑描述（必填），如：把背景改成星空"
+          rows={3}
+          style={{
+            width: "100%",
+            boxSizing: "border-box",
+            padding: "8px 10px",
+            background: "rgba(255,255,255,0.08)",
+            border: "1px solid rgba(167,139,250,0.5)",
+            borderRadius: 6,
+            color: "white",
+            fontSize: 13,
+            outline: "none",
+            resize: "none",
+            fontFamily: "inherit",
+            lineHeight: 1.5,
+          }}
+        />
+
+        {/* 尺寸选择：宽高比 + 分辨率 */}
+        <div style={{ marginTop: 10 }}>
+          <div style={{ fontSize: 11, color: "rgba(255,255,255,0.4)", marginBottom: 5 }}>
+            宽高比
+          </div>
+          <div style={{ display: "flex", gap: 4 }}>
+            {ASPECT_RATIOS.map((r) => (
+              <button
+                key={r.key}
+                onClick={() => onAspectChange(r.key)}
+                style={{
+                  flex: 1,
+                  padding: "5px 0",
+                  background: aspect === r.key ? "#a78bfa" : "rgba(255,255,255,0.08)",
+                  color: aspect === r.key ? "white" : "rgba(255,255,255,0.6)",
+                  border: "none",
+                  borderRadius: 5,
+                  fontSize: 11,
+                  cursor: "pointer",
+                }}
+              >
+                {r.key}
+              </button>
+            ))}
+          </div>
+          <div style={{ fontSize: 11, color: "rgba(255,255,255,0.4)", margin: "8px 0 5px" }}>
+            分辨率
+          </div>
+          <div style={{ display: "flex", gap: 4 }}>
+            {RESOLUTIONS.map((res) => (
+              <button
+                key={res}
+                onClick={() => onResolutionChange(res)}
+                style={{
+                  flex: 1,
+                  padding: "5px 0",
+                  background: resolution === res ? "#a78bfa" : "rgba(255,255,255,0.08)",
+                  color: resolution === res ? "white" : "rgba(255,255,255,0.6)",
+                  border: "none",
+                  borderRadius: 5,
+                  fontSize: 11,
+                  cursor: "pointer",
+                }}
+              >
+                {res}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+          <button
+            onClick={onExecute}
+            disabled={!canExecute}
+            style={{
+              flex: 1,
+              padding: "7px 0",
+              background: canExecute ? "#a78bfa" : "rgba(167,139,250,0.3)",
+              color: "white",
+              border: "none",
+              borderRadius: 6,
+              fontSize: 13,
+              cursor: canExecute ? "pointer" : "not-allowed",
+            }}
+          >
+            执行
+          </button>
+          <button
+            onClick={onClose}
+            style={{
+              flex: 1,
+              padding: "7px 0",
+              background: "rgba(255,255,255,0.08)",
+              color: "rgba(255,255,255,0.7)",
+              border: "none",
+              borderRadius: 6,
+              fontSize: 13,
+              cursor: "pointer",
+            }}
+          >
+            取消
+          </button>
+        </div>
+      </div>
     </div>
   );
 };
@@ -1581,6 +2114,7 @@ function ImageNode({
           src={node.image_url}
           alt={node.content || "image"}
           draggable={false}
+          decoding="async"
           style={{
             width: "100%",
             height: "100%",
@@ -1736,12 +2270,12 @@ function PendingContainerNode({
         : `多图组合 · ${refNodes.length} 参考图`;
 
   const smallBtn = (active: boolean): React.CSSProperties => ({
-    padding: "4px 0",
+    padding: "6px 0",
     background: active ? "#a78bfa" : "rgba(255,255,255,0.08)",
-    color: active ? "#1a1a2e" : "rgba(255,255,255,0.6)",
+    color: active ? "#1a1a2e" : "rgba(255,255,255,0.75)",
     border: "none",
-    borderRadius: 5,
-    fontSize: 10,
+    borderRadius: 6,
+    fontSize: 12,
     cursor: "pointer",
     fontWeight: active ? 600 : 400,
   });
@@ -1792,7 +2326,7 @@ function PendingContainerNode({
           userSelect: "none",
         }}
       >
-        <span style={{ fontSize: 11, fontWeight: 600, color: "#c4b5fd" }}>
+        <span style={{ fontSize: 13, fontWeight: 600, color: "#c4b5fd" }}>
           📦 图片容器 · {modeLabel}
         </span>
         <button
@@ -1839,8 +2373,8 @@ function PendingContainerNode({
           flexDirection: "column",
           alignItems: "center",
           justifyContent: "center",
-          color: "rgba(255,255,255,0.35)",
-          fontSize: 11,
+          color: "rgba(255,255,255,0.55)",
+          fontSize: 13,
           gap: 6,
           background: "rgba(0,0,0,0.15)",
           overflow: "hidden",
@@ -1903,7 +2437,7 @@ function PendingContainerNode({
               style={{
                 position: "relative",
                 zIndex: 1,
-                fontSize: 10,
+                fontSize: 12,
                 textShadow: container.previewUrl ? "0 1px 8px rgba(0,0,0,0.9)" : "none",
               }}
             >
@@ -1920,9 +2454,9 @@ function PendingContainerNode({
           </>
         ) : (
           <>
-            <span style={{ fontSize: 22 }}>🖼️</span>
+            <span style={{ fontSize: 24 }}>🖼️</span>
             <span>{calcSize(container.aspect, container.resolution)}</span>
-            <span style={{ fontSize: 10 }}>
+            <span style={{ fontSize: 12 }}>
               {refNodes.length > 0 ? "参考图已连线" : "等待生成"}
             </span>
           </>
@@ -1988,9 +2522,9 @@ function PendingContainerNode({
       )}
 
       {/* 宽高比 */}
-      <div style={{ marginTop: 8 }}>
-        <div style={{ fontSize: 9, color: "rgba(255,255,255,0.4)", marginBottom: 3 }}>宽高比</div>
-        <div style={{ display: "flex", gap: 3 }}>
+      <div style={{ marginTop: 10 }}>
+        <div style={{ fontSize: 11, color: "rgba(255,255,255,0.55)", marginBottom: 4 }}>宽高比</div>
+        <div style={{ display: "flex", gap: 4 }}>
           {ASPECT_RATIOS.map((r) => (
             <button
               key={r.key}
@@ -2004,9 +2538,9 @@ function PendingContainerNode({
       </div>
 
       {/* 分辨率 */}
-      <div style={{ marginTop: 6 }}>
-        <div style={{ fontSize: 9, color: "rgba(255,255,255,0.4)", marginBottom: 3 }}>分辨率</div>
-        <div style={{ display: "flex", gap: 3 }}>
+      <div style={{ marginTop: 8 }}>
+        <div style={{ fontSize: 11, color: "rgba(255,255,255,0.55)", marginBottom: 4 }}>分辨率</div>
+        <div style={{ display: "flex", gap: 4 }}>
           {RESOLUTIONS.map((res) => (
             <button
               key={res}
@@ -2040,13 +2574,13 @@ function PendingContainerNode({
         style={{
           width: "100%",
           boxSizing: "border-box",
-          marginTop: 8,
-          padding: "6px 8px",
+          marginTop: 10,
+          padding: "8px 10px",
           background: "rgba(0,0,0,0.25)",
           border: "1px solid rgba(167,139,250,0.5)",
           borderRadius: 6,
           color: "white",
-          fontSize: 12,
+          fontSize: 13,
           outline: "none",
           resize: "none",
           fontFamily: "inherit",
@@ -2054,7 +2588,7 @@ function PendingContainerNode({
       />
 
       {container.error && (
-        <div style={{ color: "#f87171", fontSize: 10, marginTop: 4 }}>{container.error}</div>
+        <div style={{ color: "#f87171", fontSize: 12, marginTop: 6 }}>{container.error}</div>
       )}
 
       {/* 生成按钮 */}
@@ -2063,13 +2597,13 @@ function PendingContainerNode({
         disabled={isGenerating}
         style={{
           width: "100%",
-          marginTop: 8,
-          padding: "8px 0",
+          marginTop: 10,
+          padding: "10px 0",
           background: isGenerating ? "rgba(167,139,250,0.4)" : "#a78bfa",
           color: "#1a1a2e",
           border: "none",
           borderRadius: 8,
-          fontSize: 13,
+          fontSize: 14,
           fontWeight: 700,
           cursor: isGenerating ? "not-allowed" : "pointer",
         }}
