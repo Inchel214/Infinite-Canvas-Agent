@@ -205,6 +205,30 @@ export async function uploadImageNode(
   return res.json();
 }
 
+// 克隆节点（画布内复制粘贴，复制完整属性含提示词）
+export async function cloneNode(
+  canvasId: string,
+  body: {
+    image_url: string;
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    content: string;
+    source_ids: string[];
+  }
+): Promise<DirectResponse> {
+  const res = await fetch(`${API_BASE}/canvas/${canvasId}/nodes/clone`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    throw new Error(`${res.status}`);
+  }
+  return res.json();
+}
+
 export async function deleteNode(
   canvasId: string,
   nodeId: string

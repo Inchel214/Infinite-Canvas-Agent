@@ -1,6 +1,6 @@
 import { useEffect, useRef, useCallback, useState } from "react";
 import type { CanvasState, CanvasNode } from "../types/canvas";
-import { generateImageStream, uploadImageNode, undoCanvas } from "../api/agent";
+import { generateImageStream, uploadImageNode, cloneNode, undoCanvas } from "../api/agent";
 
 // 右键菜单可触发的操作类型
 export type CanvasAction =
@@ -304,17 +304,19 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
           // 世界坐标 = 视图中心
           const cx = (rect.width / 2 - panRef.current.x) / zoomRef.current;
           const cy = (rect.height / 2 - panRef.current.y) / zoomRef.current;
-          // 复制的节点直接通过 upload 端点添加（带 image_url，不重新生成）
+          // 克隆节点：复制完整属性（含提示词 content、来源 source_ids）
           (async () => {
             let ox = 0, oy = 0;
             for (const src of clipboardRef.current!) {
               try {
-                const res = await uploadImageNode(canvasId!, {
+                const res = await cloneNode(canvasId!, {
                   image_url: src.image_url!,
                   x: cx + ox,
                   y: cy + oy,
                   width: src.width,
                   height: src.height,
+                  content: src.content ?? "",
+                  source_ids: src.source_ids ?? [],
                 });
                 if (res.success) onCanvasUpdate?.(res.canvas);
                 ox += src.width * 0.3;
