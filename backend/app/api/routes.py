@@ -201,6 +201,31 @@ def delete_node(canvas_id: str, node_id: str):
     }
 
 
+class BatchDeleteRequest(BaseModel):
+    node_ids: List[str]
+
+
+@router.post("/canvas/{canvas_id}/nodes/delete", summary="批量删除节点（单次撤销）")
+def batch_delete_nodes(canvas_id: str, req: BatchDeleteRequest):
+    try:
+        state = deps.store.get_canvas(canvas_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    deleted = 0
+    for nid in req.node_ids:
+        node = state.get_node(nid)
+        if node:
+            state.remove_node(nid)
+            deleted += 1
+    if deleted > 0:
+        deps.store.save_canvas(state)
+    return {
+        "success": True,
+        "message": f"已删除 {deleted} 张图片",
+        "canvas": state.to_dict(),
+    }
+
+
 @router.post("/canvas/{canvas_id}/undo", summary="撤销最近一次操作")
 def undo_canvas(canvas_id: str):
     try:

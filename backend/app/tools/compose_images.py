@@ -59,13 +59,7 @@ class ComposeImagesTool(BaseTool):
 
         urls = [n.image_url for n in sources]
 
-        # 增强提示词：融入源图片的描述
-        source_descs = [n.content for n in sources if n.content]
-        if source_descs and not prompt:
-            prompt = "融合以下内容生成一张新图：" + "；".join(source_descs)
-        elif source_descs and prompt:
-            prompt = f"{prompt}。参考内容：{'；'.join(source_descs)}"
-
+        # 仅把参考图发给模型，提示词由用户自己描述，不自动拼接源图 content
         result = self.image_generator.compose(
             image_urls=urls,
             prompt=prompt,

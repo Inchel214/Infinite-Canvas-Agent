@@ -8,7 +8,7 @@ import {
   composeImages,
   variateImage,
   editImage,
-  deleteNode,
+  deleteNodes,
   generateImage,
 } from "./api/agent";
 import type { CanvasState } from "./types/canvas";
@@ -77,15 +77,10 @@ function App() {
         return res.success;
       } else if (action.type === "delete") {
         setStatusMsg("正在删除...");
-        let last: Awaited<ReturnType<typeof deleteNode>> | null = null;
-        for (const nid of action.nodeIds) {
-          last = await deleteNode(canvasId, nid);
-          setCanvasState(last.canvas);
-        }
-        setStatusMsg(
-          last ? `已删除 ${action.nodeIds.length} 张图片` : "删除失败"
-        );
-        return !!last;
+        const res = await deleteNodes(canvasId, action.nodeIds);
+        setCanvasState(res.canvas);
+        setStatusMsg(res.message);
+        return res.success;
       }
       return false;
     } catch (e) {
