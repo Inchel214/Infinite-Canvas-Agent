@@ -1,4 +1,4 @@
-"""LLM 抽象 + Mock/Ark 实现"""
+"""LLM 抽象 + Mock/OpenAI 兼容实现"""
 from __future__ import annotations
 
 import json
@@ -209,24 +209,26 @@ class MockLLM(BaseLLM):
         return (100, 100)
 
 
-class ArkLLM(BaseLLM):
+class OpenAICompatLLM(BaseLLM):
     """
-    火山引擎方舟 LLM，通过 OpenAI 兼容的 chat/completions 接口调用，
-    支持原生 function calling。
+    OpenAI 兼容 LLM（chat/completions + 原生 function calling）。
+    适配 Ark / DeepSeek / 硅基流动 / OpenAI 及各类自建网关，仅 base_url 不同。
     """
-
-    _API_URL = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
 
     def __init__(
         self,
         api_key: str | None = None,
-        model: str = "doubao-seed-2-1-pro-260915",
+        base_url: str | None = None,
+        model: str = "gpt-4o-mini",
         temperature: float = 0.3,
         timeout: int = 120,
     ):
         self.api_key = api_key or os.getenv("ARK_API_KEY", "")
         if not self.api_key:
-            raise ValueError("ARK_API_KEY 未配置，请检查 .env 文件")
+            raise ValueError("API Key 未配置")
+        base_url = (base_url or os.getenv("ARK_BASE_URL") or
+                    "https://ark.cn-beijing.volces.com/api/v3").rstrip("/")
+        self.api_url = f"{base_url}/chat/completions"
         self.model = model
         self.temperature = temperature
         self.timeout = timeout
@@ -246,7 +248,7 @@ class ArkLLM(BaseLLM):
         session = requests.Session()
         session.trust_env = False
         resp = session.post(
-            self._API_URL,
+            self.api_url,
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",

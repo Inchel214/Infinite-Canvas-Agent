@@ -3,12 +3,21 @@ import json
 import uuid
 from typing import List, Optional
 
+import requests
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app import deps
 from app.canvas.state import CanvasNode
+from app.providers.schema import (
+    AppSettings,
+    ImageConfig,
+    LLMConfig,
+    PROVIDER_PRESETS,
+    mask_key,
+    resolve_preset,
+)
 
 router = APIRouter(prefix="/api", tags=["agent"])
 
@@ -71,29 +80,6 @@ class StreamGenRequest(BaseModel):
 
 def _sse(obj: dict) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
-
-
-def _clamp_size(size: str) -> str:
-    """流式模型（Seedream 5.0 Lite）总像素下限 3686400：不足时等比放大（32 倍数对齐）"""
-    MIN_PIXELS = 3686400  # ≈1920x1920，Ark 报错信息给出的硬下限
-    if size == "1K":
-        return "2048x2048"
-    try:
-        if "x" in size:
-            w, h = (int(v) for v in size.lower().split("x", 1))
-            if w * h < MIN_PIXELS:
-                scale = (MIN_PIXELS / (w * h)) ** 0.5
-                w = max(32, -(-int(w * scale) // 32) * 32)  # 向上取整到 32 倍数
-                h = max(32, -(-int(h * scale) // 32) * 32)
-                while w * h < MIN_PIXELS:  # 对齐后仍不足则继续加
-                    if w <= h:
-                        w += 32
-                    else:
-                        h += 32
-                return f"{w}x{h}"
-    except ValueError:
-        pass
-    return size
 
 
 @router.post("/canvas", summary="创建新画布")
@@ -373,7 +359,7 @@ def generate_image_stream(canvas_id: str, req: StreamGenRequest):
         width, height = 300, 300
         ids = []
 
-    size = _clamp_size(req.size)
+    size = req.size
 
     def _add_node(image_url: str, w: int, h: int) -> None:
         node = CanvasNode(
@@ -389,7 +375,7 @@ def generate_image_stream(canvas_id: str, req: StreamGenRequest):
         )
         state.add_node(node)
 
-    gen = deps.image_generator
+    gen = deps.manager.generator
 
     def sse():
         # 流式模式：支持 SSE 的真实 generator 逐预览推送
@@ -463,3 +449,220 @@ def chat(req: ChatRequest):
         canvas=result.state.to_dict(),
         steps=result.steps,
     )
+
+
+# ==================== 大模型服务商设置 ====================
+
+
+class LLMConfigRequest(BaseModel):
+    provider: str = ""  # ""=未设置（回退 .env/Mock），"mock"=显式 Mock，其余为预设 key
+    api_key: str = ""
+    base_url: str = ""
+    model: str = ""
+
+
+class ImageConfigRequest(BaseModel):
+    provider: str = ""
+    api_key: str = ""
+    base_url: str = ""
+    model: str = ""
+    stream_model: str = ""
+
+
+class SettingsRequest(BaseModel):
+    llm: LLMConfigRequest
+    image: ImageConfigRequest
+
+
+def _masked_settings() -> dict:
+    """当前用户设置（key 脱敏）+ 生效状态"""
+    s = deps.manager.settings
+    return {
+        "llm": {
+            "provider": s.llm.provider,
+            "api_key": mask_key(s.llm.api_key),
+            "base_url": s.llm.base_url,
+            "model": s.llm.model,
+        },
+        "image": {
+            "provider": s.image.provider,
+            "api_key": mask_key(s.image.api_key),
+            "base_url": s.image.base_url,
+            "model": s.image.model,
+            "stream_model": s.image.stream_model,
+        },
+        "status": deps.manager.status(),
+    }
+
+
+def _parse_settings(req: SettingsRequest) -> AppSettings:
+    """请求数据 → AppSettings：校验 provider、补预设默认值、脱敏占位符保留原 key"""
+    if req.llm.provider not in PROVIDER_PRESETS and req.llm.provider not in ("", "mock"):
+        raise HTTPException(status_code=400, detail=f"未知的 LLM 服务商: {req.llm.provider}")
+    if req.image.provider not in PROVIDER_PRESETS and req.image.provider not in ("", "mock"):
+        raise HTTPException(status_code=400, detail=f"未知的图片服务商: {req.image.provider}")
+
+    old = deps.manager.settings
+    llm = LLMConfig(
+        provider=req.llm.provider,
+        api_key=req.llm.api_key,
+        base_url=req.llm.base_url,
+        model=req.llm.model,
+    )
+    image = ImageConfig(
+        provider=req.image.provider,
+        api_key=req.image.api_key,
+        base_url=req.image.base_url,
+        model=req.image.model,
+        stream_model=req.image.stream_model,
+    )
+    # key 传回脱敏占位符（含 ****）或留空时保留原值，便于只改模型不动 key
+    if llm.provider not in ("", "mock"):
+        if "****" in llm.api_key or not llm.api_key:
+            llm.api_key = old.llm.api_key if old.llm.provider == llm.provider else ""
+        if not llm.api_key:
+            raise HTTPException(status_code=400, detail="LLM 服务商已选择，请填写 API Key")
+        resolve_preset(llm, is_image=False)
+    else:
+        llm.api_key = ""  # 未设置/显式 Mock 不保留 key
+    if image.provider not in ("", "mock"):
+        if (PROVIDER_PRESETS.get(image.provider) or {}).get("image_api") is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"服务商 {image.provider} 不支持图片生成，请选择其他服务商或 Mock",
+            )
+        if "****" in image.api_key or not image.api_key:
+            image.api_key = old.image.api_key if old.image.provider == image.provider else ""
+        if not image.api_key:
+            raise HTTPException(status_code=400, detail="图片服务商已选择，请填写 API Key")
+        resolve_preset(image, is_image=True)
+    else:
+        image.api_key = ""
+    return AppSettings(llm=llm, image=image)
+
+
+@router.get("/settings", summary="获取当前大模型配置（key 脱敏）")
+def get_settings():
+    return _masked_settings()
+
+
+@router.put("/settings", summary="保存大模型配置并热切换（无需重启）")
+def put_settings(req: SettingsRequest):
+    settings = _parse_settings(req)
+    deps.manager.update(settings)
+    return {"success": True, "message": "配置已保存并生效", "settings": _masked_settings()}
+
+
+@router.delete("/settings", summary="清除用户配置（回退 .env / Mock）")
+def delete_settings():
+    deps.manager.reset()
+    return {"success": True, "message": "已恢复默认配置", "settings": _masked_settings()}
+
+
+@router.get("/providers", summary="获取内置服务商预设列表")
+def get_providers():
+    return {"providers": PROVIDER_PRESETS}
+
+
+def _err_snippet(resp: requests.Response) -> str:
+    return resp.text[:200].replace("\n", " ")
+
+
+@router.post("/settings/test", summary="测试配置连通性（不保存）")
+def test_settings(req: SettingsRequest):
+    """LLM 发 1 token 轻量对话验证；图片服务探测 /models 列表接口"""
+    result: dict = {"llm": {}, "image": {}}
+
+    # ---- LLM 测试 ----
+    if req.llm.provider in ("", "mock"):
+        result["llm"] = {
+            "ok": True,
+            "message": "未设置（当前跟随 .env / Mock），无需测试",
+        }
+    else:
+        llm = LLMConfig(
+            provider=req.llm.provider,
+            api_key=req.llm.api_key,
+            base_url=req.llm.base_url,
+            model=req.llm.model,
+        )
+        if "****" in llm.api_key or not llm.api_key:
+            old = deps.manager.settings
+            llm.api_key = old.llm.api_key if old.llm.provider == llm.provider else ""
+        resolve_preset(llm, is_image=False)
+        if not llm.api_key or not llm.base_url:
+            result["llm"] = {"ok": False, "message": "请填写 API Key 和 Base URL"}
+        else:
+            try:
+                session = requests.Session()
+                session.trust_env = False
+                resp = session.post(
+                    f"{llm.base_url.rstrip('/')}/chat/completions",
+                    headers={"Authorization": f"Bearer {llm.api_key}"},
+                    json={
+                        "model": llm.model,
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "max_tokens": 1,
+                    },
+                    timeout=30,
+                    proxies={"http": None, "https": None},
+                )
+                if resp.status_code == 200:
+                    result["llm"] = {"ok": True, "message": f"连接成功（{llm.model}）"}
+                elif resp.status_code in (401, 403):
+                    result["llm"] = {"ok": False, "message": "API Key 无效或无权限"}
+                else:
+                    result["llm"] = {
+                        "ok": False,
+                        "message": f"HTTP {resp.status_code}: {_err_snippet(resp)}",
+                    }
+            except requests.RequestException as e:
+                result["llm"] = {"ok": False, "message": f"连接失败: {e}"}
+
+    # ---- 图片服务测试 ----
+    if req.image.provider in ("", "mock"):
+        result["image"] = {
+            "ok": True,
+            "message": "未设置（当前跟随 .env / Mock），无需测试",
+        }
+    else:
+        image = ImageConfig(
+            provider=req.image.provider,
+            api_key=req.image.api_key,
+            base_url=req.image.base_url,
+            model=req.image.model,
+        )
+        if "****" in image.api_key or not image.api_key:
+            old = deps.manager.settings
+            image.api_key = old.image.api_key if old.image.provider == image.provider else ""
+        resolve_preset(image, is_image=True)
+        if not image.api_key or not image.base_url:
+            result["image"] = {"ok": False, "message": "请填写 API Key 和 Base URL"}
+        else:
+            try:
+                session = requests.Session()
+                session.trust_env = False
+                resp = session.get(
+                    f"{image.base_url.rstrip('/')}/models",
+                    headers={"Authorization": f"Bearer {image.api_key}"},
+                    timeout=30,
+                    proxies={"http": None, "https": None},
+                )
+                if resp.status_code == 200:
+                    result["image"] = {"ok": True, "message": f"连接成功（{image.model}）"}
+                elif resp.status_code in (401, 403):
+                    result["image"] = {"ok": False, "message": "API Key 无效或无权限"}
+                elif resp.status_code in (404, 405):
+                    result["image"] = {
+                        "ok": True,
+                        "message": "接口连通（该服务商不提供模型列表接口，未深度验证）",
+                    }
+                else:
+                    result["image"] = {
+                        "ok": False,
+                        "message": f"HTTP {resp.status_code}: {_err_snippet(resp)}",
+                    }
+            except requests.RequestException as e:
+                result["image"] = {"ok": False, "message": f"连接失败: {e}"}
+
+    return result

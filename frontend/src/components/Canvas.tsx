@@ -826,9 +826,9 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
         setMenu(null); // 关闭普通菜单，编辑框独立显示
         return;
       }
-    } else {
-      setPromptInput("");
     }
+    if (mode === "edit") return; // 编辑仅支持单图独立编辑框，条件不满足时忽略
+    setPromptInput("");
     setMenu((prev) => (prev ? { ...prev, mode } : null));
   }, [nodes, selectedIds, pan, zoom, aspect, resolution]);
 

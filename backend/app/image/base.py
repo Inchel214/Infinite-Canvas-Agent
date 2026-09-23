@@ -1,8 +1,34 @@
 """图片生成服务抽象接口（预留真实 API 扩展点）"""
 from __future__ import annotations
 
+import base64
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+
+# 画布节点显示尺寸：图片最长边缩放到该值
+_DISPLAY_MAX = 400
+
+
+def image_size_from_data_url(data_url: str) -> tuple[int, int] | None:
+    """从 data URL 解析真实宽高（支持 PNG/JPEG/WEBP 等），失败返回 None"""
+    try:
+        from PIL import Image
+        import io
+        b64 = data_url.split(",", 1)[1] if data_url.startswith("data:") else data_url
+        raw = base64.b64decode(b64)
+        with Image.open(io.BytesIO(raw)) as im:
+            return (int(im.width), int(im.height))
+    except Exception:
+        return None
+
+
+def display_size(real: tuple[int, int] | None, fallback: tuple[int, int]) -> tuple[int, int]:
+    """真实尺寸按比例缩放到最长边 _DISPLAY_MAX，作为节点显示尺寸"""
+    if not real or real[0] <= 0 or real[1] <= 0:
+        return fallback
+    w, h = real
+    scale = _DISPLAY_MAX / max(w, h)
+    return (max(1, round(w * scale)), max(1, round(h * scale)))
 
 
 @dataclass

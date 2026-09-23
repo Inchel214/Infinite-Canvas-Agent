@@ -1,4 +1,4 @@
-"""火山引擎方舟（Ark）图片生成器：调用 Doubao Seedream 真实 API"""
+"""火山引擎方舟（Ark）风格图片生成器：Seedream 系列，支持自定义 base_url（中转站等）"""
 from __future__ import annotations
 
 import base64
@@ -9,45 +9,48 @@ from typing import Iterator
 
 import requests
 
-from app.image.base import BaseImageGenerator, ImageResult
+from app.image.base import (
+    BaseImageGenerator,
+    ImageResult,
+    display_size as _display_size,
+    image_size_from_data_url as _image_size,
+)
 
-_API_URL = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
+_DEFAULT_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 _DEFAULT_MODEL = "doubao-seedream-4-0-20260415"
 # 4.0 同时支持非流式与 SSE 流式
 _STREAM_DEFAULT_MODEL = "doubao-seedream-4-0-20260415"
 
-# 画布节点显示尺寸：图片最长边缩放到该值
-_DISPLAY_MAX = 400
+# 流式模型（Seedream 5.0 Lite）总像素下限 3686400：不足时等比放大（32 倍数对齐）
+_MIN_PIXELS = 3686400
 
 
-def _image_size(data_url: str) -> tuple[int, int] | None:
-    """从 data URL 解析真实宽高（支持 PNG/JPEG/WEBP 等），失败返回 None"""
+def _clamp_size(size: str) -> str:
+    if size == "1K":
+        return "2048x2048"
     try:
-        from PIL import Image
-        import io
-        b64 = data_url.split(",", 1)[1] if data_url.startswith("data:") else data_url
-        raw = base64.b64decode(b64)
-        with Image.open(io.BytesIO(raw)) as im:
-            return (int(im.width), int(im.height))
-    except Exception:
-        return None
-
-
-def _display_size(real: tuple[int, int] | None, fallback: tuple[int, int]) -> tuple[int, int]:
-    """真实尺寸按比例缩放到最长边 _DISPLAY_MAX，作为节点显示尺寸"""
-    if not real or real[0] <= 0 or real[1] <= 0:
-        return fallback
-    w, h = real
-    scale = _DISPLAY_MAX / max(w, h)
-    return (max(1, round(w * scale)), max(1, round(h * scale)))
+        if "x" in size:
+            w, h = (int(v) for v in size.lower().split("x", 1))
+            if w * h < _MIN_PIXELS:
+                scale = (_MIN_PIXELS / (w * h)) ** 0.5
+                w = max(32, -(-int(w * scale) // 32) * 32)  # 向上取整到 32 倍数
+                h = max(32, -(-int(h * scale) // 32) * 32)
+                while w * h < _MIN_PIXELS:  # 对齐后仍不足则继续加
+                    if w <= h:
+                        w += 32
+                    else:
+                        h += 32
+                return f"{w}x{h}"
+    except ValueError:
+        pass
+    return size
 
 
 class VolcEngineImageGenerator(BaseImageGenerator):
     """
-    火山引擎方舟图片生成器。
-
-    通过 Ark API 调用 Doubao Seedream 模型，
-    支持文生图、图生图、局部编辑、多图组合。
+    Ark（Seedream）风格图片生成器。
+    通过 OpenAI 兼容的 images/generations 接口调用，
+    支持文生图、图生图、局部编辑、多图组合（含 SSE 流式）。
     """
 
     def __init__(
@@ -55,13 +58,16 @@ class VolcEngineImageGenerator(BaseImageGenerator):
         api_key: str | None = None,
         model: str = _DEFAULT_MODEL,
         stream_model: str | None = None,
+        base_url: str | None = None,
     ):
         self.api_key = api_key or os.getenv("ARK_API_KEY", "")
         if not self.api_key:
-            raise ValueError("ARK_API_KEY 未配置，请检查 .env 文件")
+            raise ValueError("API Key 未配置，请检查 .env 文件或前端设置")
         self.model = model
         # 流式生成专用模型（需在 Ark 流式支持列表内）
         self.stream_model = stream_model or os.getenv("ARK_IMAGE_STREAM_MODEL", _STREAM_DEFAULT_MODEL)
+        base_url = (base_url or os.getenv("ARK_BASE_URL") or _DEFAULT_BASE_URL).rstrip("/")
+        self.api_url = f"{base_url}/images/generations"
 
     @staticmethod
     def _valid_refs(image_urls: list[str] | None) -> list[str]:
@@ -84,7 +90,7 @@ class VolcEngineImageGenerator(BaseImageGenerator):
         body: dict = {
             "model": self.model,
             "prompt": prompt,
-            "size": size,
+            "size": _clamp_size(size),
             "response_format": "url",
             "watermark": False,
         }
@@ -96,7 +102,7 @@ class VolcEngineImageGenerator(BaseImageGenerator):
         session = requests.Session()
         session.trust_env = False
         resp = session.post(
-            _API_URL,
+            self.api_url,
             headers=headers,
             json=body,
             timeout=120,
@@ -144,7 +150,7 @@ class VolcEngineImageGenerator(BaseImageGenerator):
         body: dict = {
             "model": self.stream_model,
             "prompt": prompt,
-            "size": size,
+            "size": _clamp_size(size),
             "response_format": "url",
             "watermark": False,
             "stream": True,
@@ -156,7 +162,7 @@ class VolcEngineImageGenerator(BaseImageGenerator):
         session = requests.Session()
         session.trust_env = False
         resp = session.post(
-            _API_URL,
+            self.api_url,
             headers=headers,
             json=body,
             stream=True,
