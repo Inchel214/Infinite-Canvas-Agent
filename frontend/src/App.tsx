@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from "react";
 import { Canvas, type CanvasAction } from "./components/Canvas";
 import { HistoryPanel, type HistoryItem } from "./components/HistoryPanel";
+import { SettingsPanel } from "./components/SettingsPanel";
 import {
   createCanvas,
   getCanvas,
@@ -10,6 +11,10 @@ import {
   editImage,
   deleteNodes,
   generateImage,
+  getSettings,
+  getProviders,
+  type AppSettingsData,
+  type ProviderPreset,
 } from "./api/agent";
 import type { CanvasState } from "./types/canvas";
 
@@ -21,6 +26,9 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [history] = useState<HistoryItem[]>([]);
   const [statusMsg, setStatusMsg] = useState("");
+  const [showSettings, setShowSettings] = useState(false);
+  const [settings, setSettings] = useState<AppSettingsData | null>(null);
+  const [providers, setProviders] = useState<Record<string, ProviderPreset>>({});
 
   // 初始化画布：优先从 localStorage 恢复上次的画布，刷新不丢图
   useEffect(() => {
@@ -44,6 +52,23 @@ function App() {
       setCanvasState(state);
     })();
   }, []);
+
+  // 加载大模型配置（供顶栏徽标显示）
+  useEffect(() => {
+    (async () => {
+      try {
+        const [s, p] = await Promise.all([getSettings(), getProviders()]);
+        setSettings(s);
+        setProviders(p.providers);
+      } catch {
+        // 后端未启动时静默失败，徽标显示默认文案
+      }
+    })();
+  }, []);
+
+  // 服务商显示名（徽标用）
+  const providerName = (key: string): string =>
+    key === "mock" ? "Mock" : providers[key]?.name || key;
 
   // 右键菜单/图片容器直接操作（不走 Agent），返回是否成功（容器据此决定是否移除自己）
   const handleAction = useCallback(async (action: CanvasAction): Promise<boolean> => {
@@ -119,6 +144,62 @@ function App() {
         onAction={handleAction}
         onCanvasUpdate={setCanvasState}
       />
+
+      {/* 大模型设置入口 + 当前模式徽标 */}
+      <div
+        onClick={() => setShowSettings(true)}
+        style={{
+          position: "fixed",
+          top: 16,
+          right: 16,
+          zIndex: 1000,
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          background: "rgba(26,26,46,0.95)",
+          border: "1px solid rgba(255,255,255,0.1)",
+          borderRadius: 10,
+          padding: "8px 14px",
+          cursor: "pointer",
+          color: "#ccc",
+          fontSize: 13,
+          userSelect: "none",
+          backdropFilter: "blur(8px)",
+        }}
+        title="点击设置大模型服务商与 API Key"
+      >
+        <span style={{ fontSize: 15 }}>⚙</span>
+        {settings ? (
+          <span>
+            图片 {providerName(settings.status.image.provider)}
+            <span style={{ color: "#555", margin: "0 4px" }}>|</span>
+            对话 {providerName(settings.status.llm.provider)}
+          </span>
+        ) : (
+          <span>设置</span>
+        )}
+        {settings && settings.status.image.mode === "mock" && (
+          <span
+            style={{
+              background: "rgba(217,119,6,0.25)",
+              color: "#fbbf24",
+              padding: "1px 8px",
+              borderRadius: 6,
+              fontSize: 11,
+            }}
+          >
+            未配置
+          </span>
+        )}
+      </div>
+
+      {/* 设置面板 */}
+      {showSettings && (
+        <SettingsPanel
+          onClose={() => setShowSettings(false)}
+          onSaved={(s) => setSettings(s)}
+        />
+      )}
 
       {/* 执行状态提示 */}
       {statusMsg && (

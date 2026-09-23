@@ -269,3 +269,107 @@ export async function undoCanvas(canvasId: string): Promise<DirectResponse> {
   }
   return res.json();
 }
+
+// ===== 大模型服务商设置 =====
+
+export interface LLMSettings {
+  provider: string;
+  api_key: string;
+  base_url: string;
+  model: string;
+}
+
+export interface ImageSettings {
+  provider: string;
+  api_key: string;
+  base_url: string;
+  model: string;
+  stream_model: string;
+}
+
+// mode: "user"（用户设置）/ "env"（.env 回退）/ "mock"
+export interface SettingsStatus {
+  mode: "user" | "env" | "mock";
+  provider: string;
+  model: string;
+}
+
+export interface AppSettingsData {
+  llm: LLMSettings;
+  image: ImageSettings;
+  status: { llm: SettingsStatus; image: SettingsStatus };
+}
+
+export interface SettingsPayload {
+  llm: LLMSettings;
+  image: ImageSettings;
+}
+
+export interface ProviderPreset {
+  name: string;
+  base_url: string;
+  llm_api: string;
+  llm_model: string;
+  image_api: string | null;
+  image_model: string;
+  stream_model: string;
+}
+
+export interface TestResult {
+  ok: boolean;
+  message: string;
+}
+
+export async function getSettings(): Promise<AppSettingsData> {
+  const res = await fetch(`${API_BASE}/settings`);
+  if (!res.ok) throw new Error(`${res.status}`);
+  return res.json();
+}
+
+export async function saveSettings(
+  payload: SettingsPayload
+): Promise<{ success: boolean; message: string; settings: AppSettingsData }> {
+  const res = await fetch(`${API_BASE}/settings`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: `${res.status}` }));
+    throw new Error(err.detail || `${res.status}`);
+  }
+  return res.json();
+}
+
+export async function resetSettings(): Promise<{
+  success: boolean;
+  message: string;
+  settings: AppSettingsData;
+}> {
+  const res = await fetch(`${API_BASE}/settings`, { method: "DELETE" });
+  if (!res.ok) throw new Error(`${res.status}`);
+  return res.json();
+}
+
+export async function getProviders(): Promise<{
+  providers: Record<string, ProviderPreset>;
+}> {
+  const res = await fetch(`${API_BASE}/providers`);
+  if (!res.ok) throw new Error(`${res.status}`);
+  return res.json();
+}
+
+export async function testSettings(
+  payload: SettingsPayload
+): Promise<{ llm: TestResult; image: TestResult }> {
+  const res = await fetch(`${API_BASE}/settings/test`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: `${res.status}` }));
+    throw new Error(err.detail || `${res.status}`);
+  }
+  return res.json();
+}
