@@ -1,6 +1,6 @@
 // 后端 API 调用
 
-import type { CanvasState, ChatResponse } from "../types/canvas";
+import type { CanvasState, CanvasSummary, ChatResponse } from "../types/canvas";
 
 const API_BASE = "http://127.0.0.1:8000/api";
 
@@ -266,6 +266,43 @@ export async function undoCanvas(canvasId: string): Promise<DirectResponse> {
   });
   if (!res.ok) {
     throw new Error(`${res.status}`);
+  }
+  return res.json();
+}
+
+// ===== 多画布管理 =====
+
+export async function listCanvases(): Promise<CanvasSummary[]> {
+  const res = await fetch(`${API_BASE}/canvas`);
+  if (!res.ok) throw new Error(`${res.status}`);
+  return res.json();
+}
+
+export async function renameCanvas(
+  canvasId: string,
+  name: string
+): Promise<{ success: boolean; message: string; name: string }> {
+  const res = await fetch(`${API_BASE}/canvas/${canvasId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: `${res.status}` }));
+    throw new Error(err.detail || `${res.status}`);
+  }
+  return res.json();
+}
+
+export async function deleteCanvas(
+  canvasId: string
+): Promise<{ success: boolean; message: string }> {
+  const res = await fetch(`${API_BASE}/canvas/${canvasId}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: `${res.status}` }));
+    throw new Error(err.detail || `${res.status}`);
   }
   return res.json();
 }

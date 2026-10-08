@@ -16,6 +16,7 @@ from app.image.base import (
     display_size as _display_size,
     image_size_from_data_url as _image_size,
 )
+from app.image.files import is_local_image_url, local_url_to_data_url
 
 _DEFAULT_BASE_URL = "https://api.openai.com/v1"
 
@@ -29,7 +30,9 @@ def _norm_size(size: str) -> str:
 
 
 def _fetch_image(url: str) -> tuple[bytes, str]:
-    """把 http(s) URL 或 data URL 统一转为 (bytes, mime)"""
+    """把 http(s) URL、data URL 或本地托管图片 URL 统一转为 (bytes, mime)"""
+    if is_local_image_url(url):
+        url = local_url_to_data_url(url)
     if url.startswith("data:"):
         header, _, b64 = url.partition(",")
         mime = header[5:].split(";", 1)[0] or "image/png"

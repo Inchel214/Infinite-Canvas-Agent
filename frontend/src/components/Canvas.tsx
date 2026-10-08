@@ -2127,6 +2127,7 @@ function ImageNode({
           src={node.image_url}
           alt={node.content || "image"}
           draggable={false}
+          loading="lazy"
           decoding="async"
           style={{
             width: "100%",

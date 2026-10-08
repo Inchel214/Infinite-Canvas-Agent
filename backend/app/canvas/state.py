@@ -1,6 +1,7 @@
 """画布状态数据模型"""
 from __future__ import annotations
 
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Literal
@@ -57,12 +58,19 @@ class CanvasState:
     canvas_id: str
     nodes: dict[str, CanvasNode] = field(default_factory=dict)
     version: int = 0
+    # 画布元数据（多画布管理用）；旧数据缺省时回退
+    name: str = ""
+    created_at: float = 0
+    updated_at: float = 0
 
     def to_dict(self) -> dict:
         return {
             "canvas_id": self.canvas_id,
             "nodes": {nid: node.to_dict() for nid, node in self.nodes.items()},
             "version": self.version,
+            "name": self.name,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
         }
 
     @classmethod
@@ -75,6 +83,9 @@ class CanvasState:
             canvas_id=data["canvas_id"],
             nodes=nodes,
             version=data.get("version", 0),
+            name=data.get("name", "") or f"画布 {data['canvas_id'][:6]}",
+            created_at=data.get("created_at", 0),
+            updated_at=data.get("updated_at", 0),
         )
 
     def add_node(self, node: CanvasNode) -> None:
@@ -99,6 +110,12 @@ class CanvasState:
         return list(self.nodes.values())
 
 
-def create_canvas() -> CanvasState:
+def create_canvas(name: str = "") -> CanvasState:
     """创建新画布"""
-    return CanvasState(canvas_id=str(uuid.uuid4()))
+    now = time.time()
+    return CanvasState(
+        canvas_id=str(uuid.uuid4()),
+        name=name,
+        created_at=now,
+        updated_at=now,
+    )
