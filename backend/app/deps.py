@@ -5,6 +5,7 @@ LLM / 图片生成器由 ProviderManager 统一管理：
 更新配置（PUT /api/settings）后热切换生效，无需重启。
 """
 from app.agent.react_loop import ReActAgent
+from app.agent.sessions import ChatSessionStore
 from app.canvas.store import FileStore
 from app.providers.manager import GeneratorProxy, LLMProxy, ProviderManager
 from app.tools.base import ToolManager
@@ -18,6 +19,9 @@ from app.tools.variate_image import VariateImageTool
 
 # 单例组件：文件持久化存储，刷新/重启后画布状态不丢
 store = FileStore()
+
+# Agent 对话历史存储：按画布隔离，持久化到 backend/data/chats/
+chat_sessions = ChatSessionStore()
 
 # 服务商管理器：解析用户设置 / .env，构建当前生效的 generator 与 llm
 manager = ProviderManager()

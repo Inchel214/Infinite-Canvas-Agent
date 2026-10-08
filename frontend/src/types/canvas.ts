@@ -43,3 +43,9 @@ export interface ChatResponse {
   canvas: CanvasState;
   steps: AgentStep[];
 }
+
+// 对话历史消息（GET /agent/history 返回，user/assistant 文本对）
+export interface ChatMessage {
+  role: "user" | "assistant";
+  content: string;
+}

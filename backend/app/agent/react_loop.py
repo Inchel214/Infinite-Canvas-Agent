@@ -39,13 +39,16 @@ class ReActAgent:
         self.store = store
         self.max_steps = max_steps
 
-    def run(self, prompt: str, canvas_id: str) -> AgentResult:
-        """执行 Agent 循环"""
+    def run(self, prompt: str, canvas_id: str, history: list[dict] | None = None) -> AgentResult:
+        """执行 Agent 循环。history 为该画布的历史对话（user/assistant），注入 LLM 上下文"""
         state = self.store.get_canvas(canvas_id)
+        # system + 历史对话 + 当前用户消息（当前消息每步重建画布状态）
         messages: list[dict] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": self._build_user_message(prompt, state)},
+            *(history or []),
         ]
+        user_msg_index = len(messages)
+        messages.append({"role": "user", "content": self._build_user_message(prompt, state)})
 
         steps: list[dict] = []
 
@@ -92,8 +95,8 @@ class ReActAgent:
                     state = result.state
                     self.store.save_canvas(state)
 
-            # 更新用户消息中的画布状态
-            messages[1] = {
+            # 更新当前用户消息中的画布状态（历史消息保持原样）
+            messages[user_msg_index] = {
                 "role": "user",
                 "content": self._build_user_message(prompt, state),
             }
