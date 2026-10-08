@@ -157,7 +157,7 @@ interface CanvasProps {
 
 /**
  * 轻量无限画布：零依赖，CSS transform 实现 pan/zoom
- * 支持：滚轮缩放、拖拽平移、图片拖拽移动、自动适配
+ * 支持：滚轮缩放、拖拽平移、图片拖拽移动、自动适配（可开关）
  * 多选：单击/Ctrl+Shift+点选、空白直接拖动框选、右键菜单直接生成
  * 平移：空格+拖动 / Shift+拖动 / 鼠标中键拖动
  */
@@ -173,6 +173,26 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
   const [isPanning, setIsPanning] = useState(false);
   const panStart = useRef({ x: 0, y: 0, panX: 0, panY: 0 });
   const prevNodeCount = useRef(0);
+
+  // 自动适配相机视角开关：节点增减时是否自动缩放/居中（默认开启，偏好持久化）
+  const [autoFit, setAutoFit] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("ica-auto-fit") !== "0";
+    } catch {
+      return true;
+    }
+  });
+  const toggleAutoFit = useCallback(() => {
+    setAutoFit((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem("ica-auto-fit", next ? "1" : "0");
+      } catch {
+        // 隐私模式等写入异常时忽略，仅本次会话生效
+      }
+      return next;
+    });
+  }, []);
 
   // 拖拽图片相关状态
   const [draggingNode, setDraggingNode] = useState<string | null>(null);
@@ -509,12 +529,9 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
     return () => document.removeEventListener("mousedown", handler);
   }, [menu]);
 
-  // 自动适配：节点数量变化时缩放到合适大小
-  useEffect(() => {
+  // 适配全部节点：计算包围盒并缩放居中（自动适配与"回到全图视角"按钮共用）
+  const fitAllNodes = useCallback(() => {
     if (nodes.length === 0 || !containerRef.current) return;
-    if (nodes.length === prevNodeCount.current) return;
-    prevNodeCount.current = nodes.length;
-
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (const n of nodes) {
       minX = Math.min(minX, n.x);
@@ -536,7 +553,20 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
       x: (cw - contentW * newZoom) / 2 - minX * newZoom,
       y: (ch - contentH * newZoom) / 2 - minY * newZoom,
     });
-  }, [canvasState]);
+  }, [nodes]);
+
+  // 自动适配：节点数量变化时缩放到合适大小（受 autoFit 开关控制）
+  useEffect(() => {
+    if (nodes.length === 0) return;
+    if (!autoFit) {
+      // 关闭期间仅同步计数：重新开启后不会因数量差立刻跳转视角
+      prevNodeCount.current = nodes.length;
+      return;
+    }
+    if (nodes.length === prevNodeCount.current) return;
+    prevNodeCount.current = nodes.length;
+    fitAllNodes();
+  }, [canvasState, autoFit, fitAllNodes, nodes.length]);
 
   // 滚轮缩放：原生非 passive 监听（React onWheel 是 passive，preventDefault 无效）
   // rAF 合帧：同一帧内的多次 wheel 事件合并为一次渲染，避免高频重渲染卡顿
@@ -1081,6 +1111,34 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
           from { opacity: 0; transform: scale(0.92); }
           to   { opacity: 1; transform: scale(1); }
         }
+        .ica-autofit-btn {
+          width: 32px; height: 32px;
+          display: flex; align-items: center; justify-content: center;
+          border-radius: 8px; border: 1px solid transparent;
+          cursor: pointer; z-index: 500;
+          transition: transform .15s ease, box-shadow .15s ease, background .15s ease, border-color .15s ease, color .15s ease;
+        }
+        .ica-autofit-btn:hover { transform: scale(1.1); }
+        .ica-autofit-btn.on {
+          background: rgba(99,102,241,.28); border-color: rgba(99,102,241,.7); color: #c7d2fe;
+        }
+        .ica-autofit-btn.on:hover { box-shadow: 0 0 10px rgba(99,102,241,.55); }
+        .ica-autofit-btn.off { background: rgba(0,0,0,.6); color: #9ca3af; }
+        .ica-autofit-btn.off:hover { box-shadow: 0 0 10px rgba(255,255,255,.2); color: #e5e7eb; }
+        .ica-fitview-btn {
+          width: 32px; height: 32px;
+          display: flex; align-items: center; justify-content: center;
+          border-radius: 8px; border: 1px solid transparent;
+          cursor: pointer; z-index: 500;
+          background: rgba(0,0,0,.6); color: #9ca3af;
+          transition: transform .15s ease, box-shadow .15s ease, background .15s ease, border-color .15s ease, color .15s ease;
+        }
+        .ica-fitview-btn:hover {
+          transform: scale(1.1); color: #c7d2fe;
+          background: rgba(99,102,241,.28); border-color: rgba(99,102,241,.7);
+          box-shadow: 0 0 10px rgba(99,102,241,.55);
+        }
+        .ica-fitview-btn:active { transform: scale(0.95); }
       `}</style>
       {/* 网格背景 */}
       <div
@@ -1468,6 +1526,69 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
           {localStatusMsg}
         </div>
       )}
+
+      {/* 自动适配相机视角开关 */}
+      <button
+        type="button"
+        className={`ica-autofit-btn ${autoFit ? "on" : "off"}`}
+        title={
+          autoFit
+            ? "自动适配视图：已开启（节点增减时自动缩放居中）· 点击关闭"
+            : "自动适配视图：已关闭 · 点击开启"
+        }
+        style={{ position: "absolute", bottom: 16, left: 16 }}
+        onMouseDown={(e) => e.stopPropagation()}
+        onClick={(e) => {
+          e.stopPropagation();
+          toggleAutoFit();
+        }}
+      >
+        <svg
+          width="18"
+          height="18"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        >
+          <path d="M4 9V5a1 1 0 0 1 1-1h4" />
+          <path d="M15 4h4a1 1 0 0 1 1 1v4" />
+          <path d="M20 15v4a1 1 0 0 1-1 1h-4" />
+          <path d="M9 20H5a1 1 0 0 1-1-1v-4" />
+          {!autoFit && <line x1="4.5" y1="19.5" x2="19.5" y2="4.5" />}
+        </svg>
+      </button>
+
+      {/* 回到全图视角按钮：手动触发一次适配全部节点（不受开关影响） */}
+      <button
+        type="button"
+        className="ica-fitview-btn"
+        title="回到全图视角：缩放并居中显示所有内容"
+        style={{ position: "absolute", bottom: 16, left: 56 }}
+        onMouseDown={(e) => e.stopPropagation()}
+        onClick={(e) => {
+          e.stopPropagation();
+          fitAllNodes();
+        }}
+      >
+        <svg
+          width="18"
+          height="18"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        >
+          <polyline points="15 3 21 3 21 9" />
+          <polyline points="9 21 3 21 3 15" />
+          <line x1="21" y1="3" x2="14" y2="10" />
+          <line x1="3" y1="21" x2="10" y2="14" />
+        </svg>
+      </button>
 
       {/* 缩放指示器 */}
       <div
