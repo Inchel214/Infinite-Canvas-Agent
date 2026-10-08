@@ -84,8 +84,15 @@ def _sse(obj: dict) -> str:
 
 @router.post("/canvas", summary="创建新画布")
 def create_canvas():
-    state = deps.store.create_canvas()
-    return {"canvas_id": state.canvas_id}
+    # 默认名按现有数量递增，避免都叫"未命名"
+    default_name = f"画布 {len(deps.store.list_canvases()) + 1}"
+    state = deps.store.create_canvas(default_name)
+    return {"canvas_id": state.canvas_id, "name": state.name}
+
+
+@router.get("/canvas", summary="列出所有画布摘要")
+def list_canvases():
+    return deps.store.list_canvases()
 
 
 @router.get("/canvas/{canvas_id}", summary="获取画布状态")
@@ -95,6 +102,35 @@ def get_canvas(canvas_id: str):
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return state.to_dict()
+
+
+class RenameCanvasRequest(BaseModel):
+    name: str
+
+
+@router.patch("/canvas/{canvas_id}", summary="重命名画布")
+def rename_canvas(canvas_id: str, req: RenameCanvasRequest):
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="画布名称不能为空")
+    if len(name) > 50:
+        raise HTTPException(status_code=400, detail="画布名称不能超过 50 字")
+    try:
+        state = deps.store.get_canvas(canvas_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    state.name = name
+    deps.store.save_canvas(state)
+    return {"success": True, "message": "已重命名", "name": name}
+
+
+@router.delete("/canvas/{canvas_id}", summary="删除画布")
+def delete_canvas(canvas_id: str):
+    try:
+        deps.store.delete_canvas(canvas_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {"success": True, "message": "已删除画布"}
 
 
 @router.patch("/canvas/{canvas_id}/node/{node_id}", summary="更新节点位置")

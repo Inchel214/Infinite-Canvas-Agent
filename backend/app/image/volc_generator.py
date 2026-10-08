@@ -15,6 +15,7 @@ from app.image.base import (
     display_size as _display_size,
     image_size_from_data_url as _image_size,
 )
+from app.image.files import to_sendable_ref
 
 _DEFAULT_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 _DEFAULT_MODEL = "doubao-seedream-4-0-20260415"
@@ -71,10 +72,16 @@ class VolcEngineImageGenerator(BaseImageGenerator):
 
     @staticmethod
     def _valid_refs(image_urls: list[str] | None) -> list[str]:
-        """参考图：Ark 支持 http(s) URL 和 Base64 data URL 两种输入"""
+        """参考图：Ark 支持 http(s) URL 和 Base64 data URL；本地托管图片须转回内联 data URL"""
         if not image_urls:
             return []
-        return [u for u in image_urls if u.startswith("http") or u.startswith("data:image/")]
+        refs = []
+        for u in image_urls:
+            if u.startswith("data:image/"):
+                refs.append(u)
+            elif u.startswith("http"):
+                refs.append(to_sendable_ref(u))
+        return refs
 
     def _call(
         self,

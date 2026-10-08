@@ -16,6 +16,17 @@ export interface CanvasState {
   canvas_id: string;
   nodes: Record<string, CanvasNode>;
   version: number;
+  name?: string;
+  created_at?: number;
+  updated_at?: number;
+}
+
+// 画布摘要（列表用，GET /api/canvas）
+export interface CanvasSummary {
+  canvas_id: string;
+  name: string;
+  node_count: number;
+  updated_at: number;
 }
 
 export interface AgentStep {

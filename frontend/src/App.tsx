@@ -1,7 +1,8 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import { Canvas, type CanvasAction } from "./components/Canvas";
 import { HistoryPanel, type HistoryItem } from "./components/HistoryPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
+import { CanvasPickerPanel } from "./components/CanvasPickerPanel";
 import {
   createCanvas,
   getCanvas,
@@ -27,18 +28,75 @@ function App() {
   const [history] = useState<HistoryItem[]>([]);
   const [statusMsg, setStatusMsg] = useState("");
   const [showSettings, setShowSettings] = useState(false);
+  const [showPicker, setShowPicker] = useState(false);
   const [settings, setSettings] = useState<AppSettingsData | null>(null);
   const [providers, setProviders] = useState<Record<string, ProviderPreset>>({});
+  // 守卫用：异步回调校验画布身份时读最新值（不经 React state 闭包）
+  const canvasIdRef = useRef<string | null>(null);
 
-  // 初始化画布：优先从 localStorage 恢复上次的画布，刷新不丢图
+  // 应用画布身份：同步 state / ref / localStorage / URL（多标签直达 + 刷新恢复）
+  const applyCanvasId = useCallback((id: string, state?: CanvasState) => {
+    canvasIdRef.current = id;
+    setCanvasId(id);
+    localStorage.setItem(LAST_CANVAS_KEY, id);
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.set("canvas", id);
+      window.history.replaceState(null, "", url);
+    } catch {
+      // URL 操作失败不影响画布加载
+    }
+    if (state) setCanvasState(state);
+  }, []);
+
+  // 状态守卫：旧画布上残留的异步回调（SSE 生成完成、粘贴完成等）带着旧画布状态 resolve
+  // 时，若已切换画布则丢弃，防止旧数据覆盖新画布
+  const applyCanvasState = useCallback((next: CanvasState) => {
+    if (canvasIdRef.current && next.canvas_id !== canvasIdRef.current) return;
+    setCanvasState(next);
+  }, []);
+
+  // 切换到指定画布（画布管理面板调用），返回是否成功
+  const switchCanvas = useCallback(async (id: string): Promise<boolean> => {
+    try {
+      const state = await getCanvas(id);
+      applyCanvasId(id, state);
+      return true;
+    } catch {
+      return false;
+    }
+  }, [applyCanvasId]);
+
+  // 新建画布并切换过去，返回新画布 id（失败返回 null）
+  const createNewCanvas = useCallback(async (): Promise<string | null> => {
+    try {
+      const id = await createCanvas();
+      const state = await getCanvas(id);
+      applyCanvasId(id, state);
+      return id;
+    } catch {
+      return null;
+    }
+  }, [applyCanvasId]);
+
+  // 初始化画布：URL ?canvas=xx 直达 > 上次打开的画布 > 新建
   useEffect(() => {
     (async () => {
+      const urlId = new URLSearchParams(window.location.search).get("canvas");
+      if (urlId) {
+        try {
+          const state = await getCanvas(urlId);
+          applyCanvasId(urlId, state);
+          return;
+        } catch {
+          // 后端已删该画布，回退到 localStorage
+        }
+      }
       const savedId = localStorage.getItem(LAST_CANVAS_KEY);
       if (savedId) {
         try {
           const state = await getCanvas(savedId);
-          setCanvasId(savedId);
-          setCanvasState(state);
+          applyCanvasId(savedId, state);
           return;
         } catch {
           // 画布不存在（后端数据被清理），忽略并新建
@@ -46,12 +104,10 @@ function App() {
         }
       }
       const id = await createCanvas();
-      localStorage.setItem(LAST_CANVAS_KEY, id);
-      setCanvasId(id);
       const state = await getCanvas(id);
-      setCanvasState(state);
+      applyCanvasId(id, state);
     })();
-  }, []);
+  }, [applyCanvasId]);
 
   // 加载大模型配置（供顶栏徽标显示）
   useEffect(() => {
@@ -79,31 +135,31 @@ function App() {
       if (action.type === "compose") {
         setStatusMsg(`正在组合 ${action.nodeIds.length} 张图片...`);
         const res = await composeImages(canvasId, action.nodeIds, action.prompt, action.size, action.x, action.y);
-        setCanvasState(res.canvas);
+        applyCanvasState(res.canvas);
         setStatusMsg(res.message);
         return res.success;
       } else if (action.type === "variate") {
         setStatusMsg("正在生成变体...");
         const res = await variateImage(canvasId, action.nodeId, action.prompt, action.size, action.x, action.y);
-        setCanvasState(res.canvas);
+        applyCanvasState(res.canvas);
         setStatusMsg(res.message);
         return res.success;
       } else if (action.type === "edit") {
         setStatusMsg("正在编辑图片...");
         const res = await editImage(canvasId, action.nodeId, action.prompt, action.size);
-        setCanvasState(res.canvas);
+        applyCanvasState(res.canvas);
         setStatusMsg(res.message);
         return res.success;
       } else if (action.type === "generate") {
         setStatusMsg("正在生成图片...");
         const res = await generateImage(canvasId, action.prompt, action.size, action.x, action.y);
-        setCanvasState(res.canvas);
+        applyCanvasState(res.canvas);
         setStatusMsg(res.message);
         return res.success;
       } else if (action.type === "delete") {
         setStatusMsg("正在删除...");
         const res = await deleteNodes(canvasId, action.nodeIds);
-        setCanvasState(res.canvas);
+        applyCanvasState(res.canvas);
         setStatusMsg(res.message);
         return res.success;
       }
@@ -114,7 +170,7 @@ function App() {
     } finally {
       setLoading(false);
     }
-  }, [canvasId]);
+  }, [canvasId, applyCanvasState]);
 
   // 操作完成后，提示自动淡出（非常驻显示）
   const [fading, setFading] = useState(false);
@@ -129,6 +185,7 @@ function App() {
   return (
     <>
       <Canvas
+        key={canvasId ?? "none"}
         canvasState={canvasState}
         canvasId={canvasId}
         busy={loading}
@@ -136,18 +193,17 @@ function App() {
           if (!canvasId) return;
           try {
             const newCanvas = await updateNodePosition(canvasId, nodeId, x, y);
-            setCanvasState(newCanvas);
+            applyCanvasState(newCanvas);
           } catch {
             // 静默失败，不影响用户操作
           }
         }}
         onAction={handleAction}
-        onCanvasUpdate={setCanvasState}
+        onCanvasUpdate={applyCanvasState}
       />
 
-      {/* 大模型设置入口 + 当前模式徽标 */}
+      {/* 右上角入口：画布管理 + 大模型设置 */}
       <div
-        onClick={() => setShowSettings(true)}
         style={{
           position: "fixed",
           top: 16,
@@ -156,18 +212,59 @@ function App() {
           display: "flex",
           alignItems: "center",
           gap: 8,
-          background: "rgba(26,26,46,0.95)",
-          border: "1px solid rgba(255,255,255,0.1)",
-          borderRadius: 10,
-          padding: "8px 14px",
-          cursor: "pointer",
-          color: "#ccc",
-          fontSize: 13,
-          userSelect: "none",
-          backdropFilter: "blur(8px)",
         }}
-        title="点击设置大模型服务商与 API Key"
       >
+        {/* 画布管理入口（显示当前画布名） */}
+        <div
+          onClick={() => setShowPicker(true)}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            background: "rgba(26,26,46,0.95)",
+            border: "1px solid rgba(255,255,255,0.1)",
+            borderRadius: 10,
+            padding: "8px 14px",
+            cursor: "pointer",
+            color: "#ccc",
+            fontSize: 13,
+            userSelect: "none",
+            backdropFilter: "blur(8px)",
+            maxWidth: 220,
+          }}
+          title="切换 / 新建 / 管理画布"
+        >
+          <span style={{ fontSize: 15 }}>🗂</span>
+          <span
+            style={{
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {canvasState?.name || "画布"}
+          </span>
+        </div>
+
+        {/* 大模型设置入口 + 当前模式徽标 */}
+        <div
+          onClick={() => setShowSettings(true)}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            background: "rgba(26,26,46,0.95)",
+            border: "1px solid rgba(255,255,255,0.1)",
+            borderRadius: 10,
+            padding: "8px 14px",
+            cursor: "pointer",
+            color: "#ccc",
+            fontSize: 13,
+            userSelect: "none",
+            backdropFilter: "blur(8px)",
+          }}
+          title="点击设置大模型服务商与 API Key"
+        >
         <span style={{ fontSize: 15 }}>⚙</span>
         {settings ? (
           <span>
@@ -191,6 +288,7 @@ function App() {
             未配置
           </span>
         )}
+        </div>
       </div>
 
       {/* 设置面板 */}
@@ -198,6 +296,17 @@ function App() {
         <SettingsPanel
           onClose={() => setShowSettings(false)}
           onSaved={(s) => setSettings(s)}
+        />
+      )}
+
+      {/* 画布管理面板 */}
+      {showPicker && (
+        <CanvasPickerPanel
+          currentCanvasId={canvasId}
+          onClose={() => setShowPicker(false)}
+          onSwitch={switchCanvas}
+          onCreate={createNewCanvas}
+          onStatus={setStatusMsg}
         />
       )}
 

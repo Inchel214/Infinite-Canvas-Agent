@@ -10,8 +10,10 @@ load_dotenv(_env_path)
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from app.api.routes import router
+from app.image.files import IMAGES_DIR
 
 app = FastAPI(title="Infinite Canvas Agent", version="0.1.0")
 
@@ -25,6 +27,10 @@ app.add_middleware(
 )
 
 app.include_router(router)
+
+# 画布图片静态服务（节点 image_url 指向这里，画布 JSON 只存 URL）
+IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/images", StaticFiles(directory=str(IMAGES_DIR)), name="images")
 
 
 @app.get("/health", summary="健康检查")
