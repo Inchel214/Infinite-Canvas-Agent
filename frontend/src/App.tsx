@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import { Canvas, type CanvasAction } from "./components/Canvas";
-import { HistoryPanel, type HistoryItem } from "./components/HistoryPanel";
+import { ChatPanel } from "./components/ChatPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { CanvasPickerPanel } from "./components/CanvasPickerPanel";
 import {
@@ -25,7 +25,6 @@ function App() {
   const [canvasId, setCanvasId] = useState<string | null>(null);
   const [canvasState, setCanvasState] = useState<CanvasState | null>(null);
   const [loading, setLoading] = useState(false);
-  const [history] = useState<HistoryItem[]>([]);
   const [statusMsg, setStatusMsg] = useState("");
   const [showSettings, setShowSettings] = useState(false);
   const [showPicker, setShowPicker] = useState(false);
@@ -310,6 +309,13 @@ function App() {
         />
       )}
 
+      {/* AI 对话面板（按画布 key 重挂载，切换画布自动换对应历史） */}
+      <ChatPanel
+        key={`chat-${canvasId ?? "none"}`}
+        canvasId={canvasId}
+        onCanvasUpdate={applyCanvasState}
+      />
+
       {/* 执行状态提示 */}
       {statusMsg && (
         <div
@@ -348,10 +354,6 @@ function App() {
           {statusMsg}
         </div>
       )}
-
-      <HistoryPanel items={history} />
-      {/* 底部指令栏暂时隐藏 */}
-      {/* <PromptBar onSend={handleSend} loading={loading} /> */}
 
       {/* spinner 动画 */}
       <style>{`

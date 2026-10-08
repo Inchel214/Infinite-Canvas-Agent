@@ -1,6 +1,6 @@
 // 后端 API 调用
 
-import type { CanvasState, CanvasSummary, ChatResponse } from "../types/canvas";
+import type { CanvasState, CanvasSummary, ChatMessage, ChatResponse } from "../types/canvas";
 
 const API_BASE = "http://127.0.0.1:8000/api";
 
@@ -35,6 +35,25 @@ export async function chatWithAgent(
     throw new Error(`${res.status}`);
   }
   return res.json();
+}
+
+// 获取画布对话历史（后端按画布持久化）
+export async function getChatHistory(canvasId: string): Promise<ChatMessage[]> {
+  const res = await fetch(
+    `${API_BASE}/agent/history?canvas_id=${encodeURIComponent(canvasId)}`
+  );
+  if (!res.ok) throw new Error(`${res.status}`);
+  const data = await res.json();
+  return data.messages ?? [];
+}
+
+// 清空画布对话历史
+export async function clearChatHistory(canvasId: string): Promise<void> {
+  const res = await fetch(
+    `${API_BASE}/agent/history?canvas_id=${encodeURIComponent(canvasId)}`,
+    { method: "DELETE" }
+  );
+  if (!res.ok) throw new Error(`${res.status}`);
 }
 
 // ===== 流式生成（SSE，图片容器用）=====

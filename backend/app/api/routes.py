@@ -130,6 +130,8 @@ def delete_canvas(canvas_id: str):
         deps.store.delete_canvas(canvas_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    # 级联清理该画布的 Agent 对话历史
+    deps.chat_sessions.delete(canvas_id)
     return {"success": True, "message": "已删除画布"}
 
 
@@ -472,12 +474,17 @@ def generate_image_stream(canvas_id: str, req: StreamGenRequest):
     return StreamingResponse(sse(), media_type="text/event-stream")
 
 
-@router.post("/agent/chat", response_model=ChatResponse, summary="发送提示词给 Agent")
+@router.post("/agent/chat", response_model=ChatResponse, summary="发送提示词给 Agent（携带对话历史）")
 def chat(req: ChatRequest):
     try:
-        result = deps.agent.run(req.prompt, req.canvas_id)
+        # 注入该画布的历史对话尾部，Agent 具备跨轮记忆
+        history = deps.chat_sessions.get_context(req.canvas_id)
+        result = deps.agent.run(req.prompt, req.canvas_id, history=history)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+    # 回写一轮对话（用户原文 + Agent 最终回复），供下轮上下文与前端历史展示
+    deps.chat_sessions.append_round(req.canvas_id, req.prompt, result.message)
 
     return ChatResponse(
         success=result.success,
@@ -485,6 +492,17 @@ def chat(req: ChatRequest):
         canvas=result.state.to_dict(),
         steps=result.steps,
     )
+
+
+@router.get("/agent/history", summary="获取画布对话历史")
+def get_agent_history(canvas_id: str):
+    return {"canvas_id": canvas_id, "messages": deps.chat_sessions.get_messages(canvas_id)}
+
+
+@router.delete("/agent/history", summary="清空画布对话历史")
+def clear_agent_history(canvas_id: str):
+    deps.chat_sessions.clear(canvas_id)
+    return {"success": True, "message": "已清空对话历史"}
 
 
 # ==================== 大模型服务商设置 ====================
