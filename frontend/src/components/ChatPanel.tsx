@@ -132,7 +132,22 @@ const MIN_PANEL_WIDTH = 360;
 const MAX_PANEL_WIDTH = 720;
 
 export function ChatPanel({ canvasId, onCanvasUpdate }: ChatPanelProps) {
-  const [open, setOpen] = useState(true);
+  // 面板开合状态持久化：刷新后保持上次收起/打开状态
+  const [open, setOpen] = useState(() => {
+    try {
+      return localStorage.getItem("chatPanelOpen") !== "0";
+    } catch {
+      return true;
+    }
+  });
+  const toggleOpen = (next: boolean) => {
+    setOpen(next);
+    try {
+      localStorage.setItem("chatPanelOpen", next ? "1" : "0");
+    } catch {
+      /* 忽略隐私模式等写入失败 */
+    }
+  };
   const [entries, setEntries] = useState<ChatEntry[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
@@ -260,7 +275,7 @@ export function ChatPanel({ canvasId, onCanvasUpdate }: ChatPanelProps) {
   if (!open) {
     return (
       <div
-        onClick={() => setOpen(true)}
+        onClick={() => toggleOpen(true)}
         style={{
           position: "fixed",
           right: 20,
@@ -368,7 +383,7 @@ export function ChatPanel({ canvasId, onCanvasUpdate }: ChatPanelProps) {
             {confirmClear ? "确认清空？" : "清空"}
           </span>
           <span
-            onClick={() => setOpen(false)}
+            onClick={() => toggleOpen(false)}
             style={{
               color: "#888",
               fontSize: 14,
