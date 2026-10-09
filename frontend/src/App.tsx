@@ -12,6 +12,7 @@ import {
   editImage,
   deleteNodes,
   generateImage,
+  arrangeCanvas,
   getSettings,
   getProviders,
   type AppSettingsData,
@@ -132,20 +133,18 @@ function App() {
 
     try {
       if (action.type === "compose") {
-        setStatusMsg(`正在组合 ${action.nodeIds.length} 张图片...`);
+        // 进行中状态显示在被操作图片的边界框上（Canvas processing），顶部不再提示
         const res = await composeImages(canvasId, action.nodeIds, action.prompt, action.size, action.x, action.y);
         applyCanvasState(res.canvas);
         setStatusMsg(res.message);
         return res.success;
       } else if (action.type === "variate") {
-        setStatusMsg("正在生成变体...");
         const res = await variateImage(canvasId, action.nodeId, action.prompt, action.size, action.x, action.y);
         applyCanvasState(res.canvas);
         setStatusMsg(res.message);
         return res.success;
       } else if (action.type === "edit") {
-        setStatusMsg("正在编辑图片...");
-        const res = await editImage(canvasId, action.nodeId, action.prompt, action.size);
+        const res = await editImage(canvasId, action.nodeId, action.prompt, action.size, action.x, action.y);
         applyCanvasState(res.canvas);
         setStatusMsg(res.message);
         return res.success;
@@ -158,6 +157,12 @@ function App() {
       } else if (action.type === "delete") {
         setStatusMsg("正在删除...");
         const res = await deleteNodes(canvasId, action.nodeIds);
+        applyCanvasState(res.canvas);
+        setStatusMsg(res.message);
+        return res.success;
+      } else if (action.type === "arrange") {
+        setStatusMsg("正在整理画布...");
+        const res = await arrangeCanvas(canvasId);
         applyCanvasState(res.canvas);
         setStatusMsg(res.message);
         return res.success;

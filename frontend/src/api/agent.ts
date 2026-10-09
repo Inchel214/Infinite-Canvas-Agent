@@ -195,12 +195,14 @@ export async function editImage(
   canvasId: string,
   nodeId: string,
   prompt: string,
-  size = "2K"
+  size = "2K",
+  x?: number,
+  y?: number
 ): Promise<DirectResponse> {
   const res = await fetch(`${API_BASE}/canvas/${canvasId}/edit`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ node_id: nodeId, prompt, size }),
+    body: JSON.stringify({ node_id: nodeId, prompt, size, x, y }),
   });
   if (!res.ok) {
     throw new Error(`${res.status}`);
@@ -281,6 +283,17 @@ export async function deleteNodes(
 // 撤销最近一次操作，无历史可撤销时后端返回 success:false
 export async function undoCanvas(canvasId: string): Promise<DirectResponse> {
   const res = await fetch(`${API_BASE}/canvas/${canvasId}/undo`, {
+    method: "POST",
+  });
+  if (!res.ok) {
+    throw new Error(`${res.status}`);
+  }
+  return res.json();
+}
+
+// 自动整理：网格对齐所有图片
+export async function arrangeCanvas(canvasId: string): Promise<DirectResponse> {
+  const res = await fetch(`${API_BASE}/canvas/${canvasId}/arrange`, {
     method: "POST",
   });
   if (!res.ok) {

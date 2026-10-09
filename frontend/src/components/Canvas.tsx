@@ -6,9 +6,10 @@ import { generateImageStream, uploadImageNode, cloneNode, undoCanvas } from "../
 export type CanvasAction =
   | { type: "compose"; nodeIds: string[]; prompt: string; size: string; x?: number; y?: number }
   | { type: "variate"; nodeId: string; prompt: string; size: string; x?: number; y?: number }
-  | { type: "edit"; nodeId: string; prompt: string; size: string }
+  | { type: "edit"; nodeId: string; prompt: string; size: string; x?: number; y?: number }
   | { type: "generate"; prompt: string; size: string; x: number; y: number }
-  | { type: "delete"; nodeIds: string[] };
+  | { type: "delete"; nodeIds: string[] }
+  | { type: "arrange" };
 
 // 待生成图片容器（右键空白创建，接收连线作为参考图）
 export type PendingContainer = {
@@ -59,6 +60,81 @@ function calcSize(ratioKey: string, res: string): string {
 
 // 矩形（节点或容器）的边界框
 type BBox = { x: number; y: number; width: number; height: number };
+
+// ===== 生成位置避让：避开已有图片与连线 =====
+
+// 所有连线段（源图中心 → 目标图中心）
+function segmentsOf(nodes: CanvasNode[]): Array<[number, number, number, number]> {
+  const segs: Array<[number, number, number, number]> = [];
+  for (const n of nodes) {
+    if (!n.source_ids) continue;
+    for (const sid of n.source_ids) {
+      const s = nodes.find((m) => m.id === sid);
+      if (s) {
+        segs.push([
+          s.x + s.width / 2,
+          s.y + s.height / 2,
+          n.x + n.width / 2,
+          n.y + n.height / 2,
+        ]);
+      }
+    }
+  }
+  return segs;
+}
+
+function orient(ax: number, ay: number, bx: number, by: number, cx: number, cy: number) {
+  return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+}
+
+// 线段是否穿过矩形（端点在内 或 与任一边相交）
+function segHitsRect(
+  x1: number, y1: number, x2: number, y2: number,
+  rx: number, ry: number, rw: number, rh: number
+): boolean {
+  if (rx <= x1 && x1 <= rx + rw && ry <= y1 && y1 <= ry + rh) return true;
+  if (rx <= x2 && x2 <= rx + rw && ry <= y2 && y2 <= ry + rh) return true;
+  const segCross = (
+    ax: number, ay: number, bx: number, by: number,
+    cx: number, cy: number, dx: number, dy: number
+  ) => {
+    const o1 = orient(ax, ay, bx, by, cx, cy);
+    const o2 = orient(ax, ay, bx, by, dx, dy);
+    const o3 = orient(cx, cy, dx, dy, ax, ay);
+    const o4 = orient(cx, cy, dx, dy, bx, by);
+    if (o1 === 0 || o2 === 0 || o3 === 0 || o4 === 0) return true; // 共线保守处理
+    return (o1 > 0) !== (o2 > 0) && (o3 > 0) !== (o4 > 0);
+  };
+  const edges: Array<[number, number, number, number]> = [
+    [rx, ry, rx + rw, ry],
+    [rx, ry + rh, rx + rw, ry + rh],
+    [rx, ry, rx, ry + rh],
+    [rx + rw, ry, rx + rw, ry + rh],
+  ];
+  return edges.some((e) => segCross(x1, y1, x2, y2, e[0], e[1], e[2], e[3]));
+}
+
+// (x, y) 处放 w×h 是否避开了所有节点（带 padding）和连线
+function spotFree(
+  nodes: CanvasNode[],
+  segs: Array<[number, number, number, number]>,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  pad = 24
+): boolean {
+  const px = x - pad, py = y - pad, pw = w + 2 * pad, ph = h + 2 * pad;
+  for (const n of nodes) {
+    if (px < n.x + n.width && px + pw > n.x && py < n.y + n.height && py + ph > n.y) {
+      return false;
+    }
+  }
+  for (const [x1, y1, x2, y2] of segs) {
+    if (segHitsRect(x1, y1, x2, y2, px, py, pw, ph)) return false;
+  }
+  return true;
+}
 
 /**
  * 根据源节点和目标节点的相对位置，自动选择最佳连接端口，
@@ -213,6 +289,11 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
   // ===== 编辑图片框（独立于右键菜单，可与普通菜单并存） =====
   const [editPanel, setEditPanel] = useState<EditPanelState | null>(null);
   const editPanelRef = useRef<HTMLDivElement>(null);
+  // 生成中占位框：编辑/变体/组合执行时，在新图将要出现的位置预先画出矩形框，
+  // 框内显示"正在编辑图片..."等状态；完成后新图淡入该位置
+  const [processingBox, setProcessingBox] = useState<{
+    x: number; y: number; w: number; h: number; label: string;
+  } | null>(null);
   // 测量编辑框实际高度（连线终点垂直居中用）
   const [editPanelH, setEditPanelH] = useState(420);
 
@@ -862,33 +943,84 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
     setMenu((prev) => (prev ? { ...prev, mode } : null));
   }, [nodes, selectedIds, pan, zoom, aspect, resolution]);
 
+  // 计算生成中占位框的尺寸/位置：尺寸与最终图节点一致（最长边 400），
+  // 位置优先放参考图组右侧（顶部对齐），若该处有图片或连线则依次退让：
+  // 源图组下方 → 全部内容最右侧；占位框位置即最终落图位置（随 action 传后端）
+  const buildProcessingBox = useCallback((
+    aspectKey: string,
+    srcNodes: CanvasNode[]
+  ): { x: number; y: number; w: number; h: number } => {
+    const ratio = ASPECT_RATIOS.find((r) => r.key === aspectKey) ?? ASPECT_RATIOS[0];
+    const long = 400; // 与后端 _DISPLAY_MAX 一致，新图出现时无缝衔接
+    const w = ratio.w >= ratio.h ? long : Math.round((long * ratio.w) / ratio.h);
+    const h = ratio.w >= ratio.h ? Math.round((long * ratio.h) / ratio.w) : long;
+
+    if (nodes.length > 0) {
+      const segs = segmentsOf(nodes);
+      const gap = 60;
+      // 候选1：源图组右侧，顶部对齐
+      const rightX = Math.max(...srcNodes.map((n) => n.x + n.width)) + gap;
+      const rightY = Math.min(...srcNodes.map((n) => n.y));
+      if (spotFree(nodes, segs, rightX, rightY, w, h)) return { x: rightX, y: rightY, w, h };
+      // 候选2：源图组下方，左对齐
+      const belowY = Math.max(...srcNodes.map((n) => n.y + n.height)) + gap;
+      const belowX = Math.min(...srcNodes.map((n) => n.x));
+      if (spotFree(nodes, segs, belowX, belowY, w, h)) return { x: belowX, y: belowY, w, h };
+      // 候选3：全部内容最右侧（必然无重叠）
+      const allX = Math.max(...nodes.map((n) => n.x + n.width)) + gap;
+      const allY = Math.min(...nodes.map((n) => n.y));
+      return { x: allX, y: allY, w, h };
+    }
+
+    // 空画布：源图组（不存在则原点附近）右侧
+    const x = Math.max(100, ...srcNodes.map((n) => n.x + n.width)) + 60;
+    const y = srcNodes.length > 0 ? Math.min(...srcNodes.map((n) => n.y)) : 100;
+    return { x, y, w, h };
+  }, [nodes]);
+
   const handleExecute = useCallback(() => {
     if (!onAction || !menu) return;
     const ids = [...selectedIds];
     if (ids.length === 0) return;
     const prompt = promptInput.trim();
     const size = calcSize(aspect, resolution);
+    const srcNodes = ids.map((id) => nodes.find((n) => n.id === id)).filter((n): n is CanvasNode => !!n);
+    if (srcNodes.length === 0) return;
+    const box = buildProcessingBox(aspect, srcNodes);
 
     if (menu.mode === "compose" && ids.length >= 2) {
-      onAction({ type: "compose", nodeIds: ids, prompt, size });
+      setMenu(null);
+      setPromptInput("");
+      setProcessingBox({ ...box, label: `正在组合 ${ids.length} 张图片...` });
+      Promise.resolve(
+        onAction({ type: "compose", nodeIds: ids, prompt, size, x: box.x, y: box.y })
+      ).finally(() => setProcessingBox(null));
     } else if (menu.mode === "variate" && ids.length === 1) {
-      onAction({ type: "variate", nodeId: ids[0], prompt, size });
-    } else {
-      return;
+      setMenu(null);
+      setPromptInput("");
+      setProcessingBox({ ...box, label: "正在生成变体..." });
+      Promise.resolve(
+        onAction({ type: "variate", nodeId: ids[0], prompt, size, x: box.x, y: box.y })
+      ).finally(() => setProcessingBox(null));
     }
-    setMenu(null);
-    setPromptInput("");
-  }, [onAction, menu, selectedIds, promptInput, aspect, resolution]);
+  }, [onAction, menu, selectedIds, nodes, promptInput, aspect, resolution, buildProcessingBox]);
 
   // 编辑框执行：使用编辑框自身的 nodeId 和 prompt（不依赖菜单/选中状态）
+  // 点生成 → 面板关闭 → 在新图位置（原图右侧）画占位框显示"正在编辑图片..."
   const handleEditPanelExecute = useCallback(() => {
     if (!onAction || !editPanel) return;
     const prompt = editPanel.prompt.trim();
     if (!prompt) return;
     const size = calcSize(editPanel.aspect, editPanel.resolution);
-    onAction({ type: "edit", nodeId: editPanel.nodeId, prompt, size });
+    const node = nodes.find((n) => n.id === editPanel.nodeId);
+    if (!node) return;
+    const box = buildProcessingBox(editPanel.aspect, [node]);
     setEditPanel(null);
-  }, [onAction, editPanel]);
+    setProcessingBox({ ...box, label: "正在编辑图片..." });
+    Promise.resolve(
+      onAction({ type: "edit", nodeId: node.id, prompt, size, x: box.x, y: box.y })
+    ).finally(() => setProcessingBox(null));
+  }, [onAction, editPanel, nodes, buildProcessingBox]);
 
   const handleDelete = useCallback(() => {
     if (!onAction || selectedIds.size === 0) return;
@@ -1110,6 +1242,14 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
         @keyframes ica-img-in {
           from { opacity: 0; transform: scale(0.92); }
           to   { opacity: 1; transform: scale(1); }
+        }
+        @keyframes ica-proc-pulse {
+          0%, 100% { box-shadow: 0 0 0 3px rgba(167,139,250,0.95), 0 0 28px rgba(167,139,250,0.5); }
+          50%      { box-shadow: 0 0 0 5px rgba(196,181,253,0.55), 0 0 42px rgba(167,139,250,0.9); }
+        }
+        @keyframes ica-dot-bounce {
+          0%, 80%, 100% { transform: translateY(0); opacity: 0.4; }
+          40%           { transform: translateY(-6px); opacity: 1; }
         }
         .ica-autofit-btn {
           width: 32px; height: 32px;
@@ -1370,6 +1510,56 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
             onGenerate={() => handleContainerGenerate(c)}
           />
         ))}
+
+        {/* 生成中占位框：编辑/变体/组合执行时，新图位置的预留矩形 */}
+        {processingBox && (
+          <div
+            style={{
+              position: "absolute",
+              left: processingBox.x,
+              top: processingBox.y,
+              width: processingBox.w,
+              height: processingBox.h,
+              border: "2px solid rgba(167,139,250,0.9)",
+              borderRadius: 8,
+              background: "rgba(167,139,250,0.10)",
+              boxShadow: "0 0 30px rgba(167,139,250,0.35)",
+              animation: "ica-proc-pulse 1.2s ease-in-out infinite",
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: 10,
+              zIndex: 20,
+              pointerEvents: "none",
+            }}
+          >
+            <div style={{ display: "flex", gap: 5 }}>
+              {[0, 1, 2].map((i) => (
+                <span
+                  key={i}
+                  style={{
+                    width: 8,
+                    height: 8,
+                    borderRadius: "50%",
+                    background: "#c4b5fd",
+                    animation: `ica-dot-bounce 1.1s ${i * 0.18}s ease-in-out infinite`,
+                  }}
+                />
+              ))}
+            </div>
+            <span
+              style={{
+                color: "#ddd6fe",
+                fontSize: 15,
+                fontWeight: 600,
+                textShadow: "0 1px 8px rgba(0,0,0,0.8)",
+              }}
+            >
+              {processingBox.label}
+            </span>
+          </div>
+        )}
       </div>
 
       {/* 框选矩形（屏幕坐标） */}
@@ -1587,6 +1777,37 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
           <polyline points="9 21 3 21 3 15" />
           <line x1="21" y1="3" x2="14" y2="10" />
           <line x1="3" y1="21" x2="10" y2="14" />
+        </svg>
+      </button>
+
+      {/* 自动整理按钮：网格对齐所有图片（后端重排，可撤销） */}
+      <button
+        type="button"
+        className="ica-fitview-btn"
+        title="自动整理：按连线层级排列（根图在左，派生图向右展开，可撤销）"
+        style={{ position: "absolute", bottom: 16, left: 96 }}
+        onMouseDown={(e) => e.stopPropagation()}
+        onClick={async (e) => {
+          e.stopPropagation();
+          if (!onAction) return;
+          const ok = await onAction({ type: "arrange" });
+          if (ok !== false) fitAllNodes(); // 整理后自动回到全图视角
+        }}
+      >
+        <svg
+          width="18"
+          height="18"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        >
+          <rect x="3" y="3" width="7" height="7" />
+          <rect x="14" y="3" width="7" height="7" />
+          <rect x="3" y="14" width="7" height="7" />
+          <rect x="14" y="14" width="7" height="7" />
         </svg>
       </button>
 
