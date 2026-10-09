@@ -16,13 +16,15 @@ export type PendingContainer = {
   id: string;
   x: number;            // 世界坐标
   y: number;
+  w: number;            // 世界宽（创建时按缩放补偿，可手动拉伸）
+  h: number;            // 世界高
   aspect: string;
   resolution: string;
   prompt: string;
   refIds: string[];     // 连线进来的参考图节点 ID
   error?: string;       // 生成失败提示
   previewUrl?: string;  // 流式生成的中间预览图
-  exiting?: boolean;    // 生成完成后正在退场（淡出中）         
+  exiting?: boolean;    // 生成完成后正在退场（淡出中）
 };
 
 // 宽高比预设（长边 = 分辨率档位）
@@ -36,14 +38,38 @@ const ASPECT_RATIOS = [
 
 const RESOLUTIONS = ["1K", "2K", "4K"] as const;
 
-// 容器显示尺寸：按宽高比缩放，最长边 300
-function containerDisplaySize(aspectKey: string): { w: number; h: number } {
+// 容器外框尺寸：外矩形直接呈现待生成图片的形状比例（替代内部尺寸预览框）
+// 横型比例：高度贴内容最小高，宽度按比例放大；竖型比例：宽度贴内容最小宽，高度按比例放大
+const CONTAINER_MIN_W = 300; // 控件（按钮/输入框）所需最小宽度
+const CONTAINER_MIN_H = 360; // 控件所需最小高度
+
+function containerOuterSize(aspectKey: string): { w: number; h: number } {
   const ratio = ASPECT_RATIOS.find((r) => r.key === aspectKey) ?? ASPECT_RATIOS[0];
-  const long = 300;
   if (ratio.w >= ratio.h) {
-    return { w: long, h: Math.round((long * ratio.h) / ratio.w) };
+    const h = CONTAINER_MIN_H;
+    return { w: Math.round((h * ratio.w) / ratio.h), h };
   }
-  return { w: Math.round((long * ratio.w) / ratio.h), h: long };
+  const w = CONTAINER_MIN_W;
+  return { w, h: Math.round((w * ratio.h) / ratio.w) };
+}
+
+// 创建容器时的尺寸（与相机视觉自适应）：zoom < 1 时按 1/zoom 放大世界尺寸，
+// 保证画布缩小查看时容器在屏幕上仍有基准大小、控件可交互；zoom >= 1 保持基准
+function containerCreateSize(aspectKey: string, zoom: number): { w: number; h: number } {
+  const base = containerOuterSize(aspectKey);
+  const k = 1 / Math.min(1, zoom);
+  return { w: Math.round(base.w * k), h: Math.round(base.h * k) };
+}
+
+// 切换宽高比时保持容器当前整体缩放（含相机自适应与手动拉伸），仅形状随新比例变化
+function containerSizeForAspect(
+  c: { w: number; h: number; aspect: string },
+  nextAspect: string
+): { w: number; h: number } {
+  const oldBase = containerOuterSize(c.aspect);
+  const newBase = containerOuterSize(nextAspect);
+  const scale = Math.max(c.w / oldBase.w, c.h / oldBase.h);
+  return { w: Math.round(newBase.w * scale), h: Math.round(newBase.h * scale) };
 }
 
 // 按比例 + 分辨率档位计算 size 字符串（如 "2048x1152"）
@@ -326,8 +352,10 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
     return ov ? { ...n, x: ov.x, y: ov.y } : n;
   });
 
-  // 节点被删除后清理选中集合
+  // 画布状态变更（拖拽后端回显/自动整理/删除等）后：本地坐标覆盖让位于后端权威数据，
+  // 否则自动整理后节点仍停留在拖拽前的旧位置，需刷新页面才能看到新布局
   useEffect(() => {
+    setLocalOverrides({});
     setSelectedIds((prev) => {
       const alive = new Set(nodes.map((n) => n.id));
       const next = new Set([...prev].filter((id) => alive.has(id)));
@@ -475,20 +503,24 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
     [pan, zoom]
   );
 
-  // 创建待生成容器（在世界坐标 wx/wy 处，可带初始参考图）
+  // 创建待生成容器（居中于世界坐标 wx/wy 处，可带初始参考图）：
+  // 尺寸与相机视觉自适应——缩放较小时按 1/zoom 放大世界尺寸，屏幕上保持基准大小
   const createContainer = useCallback((wx: number, wy: number, refId?: string) => {
     containerSeqRef.current += 1;
+    const size = containerCreateSize("1:1", zoom);
     const c: PendingContainer = {
       id: `pending-${Date.now()}-${containerSeqRef.current}`,
-      x: wx,
-      y: wy,
+      x: Math.round(wx - size.w / 2),
+      y: Math.round(wy - size.h / 2),
+      w: size.w,
+      h: size.h,
       aspect: "1:1",
       resolution: "2K",
       prompt: "",
       refIds: refId ? [refId] : [],
     };
     setContainers((prev) => [...prev, c]);
-  }, []);
+  }, [zoom]);
 
   const updateContainer = useCallback((id: string, patch: Partial<PendingContainer>) => {
     setContainers((prev) => prev.map((c) => (c.id === id ? { ...c, ...patch } : c)));
@@ -649,6 +681,16 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
     fitAllNodes();
   }, [canvasState, autoFit, fitAllNodes, nodes.length]);
 
+  // 整理等操作完成后待执行的视角适配：须等 canvasState 重渲染出最新节点后再 fit，
+  // 否则 fitAllNodes 闭包里是旧坐标，视角跳错位置（表现为"要刷新页面才更新"）
+  const pendingFitRef = useRef(false);
+  useEffect(() => {
+    if (pendingFitRef.current) {
+      pendingFitRef.current = false;
+      fitAllNodes();
+    }
+  }, [canvasState, fitAllNodes]);
+
   // 滚轮缩放：原生非 passive 监听（React onWheel 是 passive，preventDefault 无效）
   // rAF 合帧：同一帧内的多次 wheel 事件合并为一次渲染，避免高频重渲染卡顿
   useEffect(() => {
@@ -658,6 +700,40 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
     let acc = 0; // 帧内 deltaY 累积
     let mx = 0, my = 0; // 最后一次事件的鼠标位置
     const onWheel = (e: WheelEvent) => {
+      // 光标位于实际溢出的可滚动元素上（textarea / overflow 滚动区）→ 交给原生滚动，不缩放
+      const target = e.target as HTMLElement | null;
+      if (target) {
+        let el: HTMLElement | null = target;
+        while (el && el !== container) {
+          if (el.scrollHeight > el.clientHeight + 1 || el.scrollWidth > el.clientWidth + 1) {
+            const st = window.getComputedStyle(el);
+            if (
+              el.tagName === "TEXTAREA" ||
+              st.overflowY === "auto" || st.overflowY === "scroll" ||
+              st.overflowX === "auto" || st.overflowX === "scroll"
+            ) {
+              return; // 不 preventDefault，浏览器自己滚
+            }
+          }
+          el = el.parentElement;
+        }
+        // 光标位于图片容器框内：滚轮操控框内溢出的描述输入框滚动条，而非缩放画布
+        const scope = target.closest("[data-scroll-scope]");
+        if (scope) {
+          const scroller = Array.from(
+            scope.querySelectorAll<HTMLElement>("textarea")
+          ).find((t) => t.scrollHeight > t.clientHeight + 1);
+          if (scroller) {
+            const dy =
+              e.deltaMode === 1 ? e.deltaY * 16
+                : e.deltaMode === 2 ? e.deltaY * scroller.clientHeight
+                  : e.deltaY;
+            scroller.scrollTop += dy;
+            e.preventDefault();
+            return;
+          }
+        }
+      }
       e.preventDefault();
       const rect = container.getBoundingClientRect();
       mx = e.clientX - rect.left;
@@ -779,21 +855,19 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
     // 连线结束：判断是否命中容器（命中范围覆盖容器整个可视区域）
     if (connecting) {
       const w = screenToWorld(e.clientX, e.clientY);
-      const hit = containers.find((c) => {
-        const size = containerDisplaySize(c.aspect);
-        return (
+      const hit = containers.find(
+        (c) =>
           w.x >= c.x &&
-          w.x <= c.x + size.w + 24 &&
+          w.x <= c.x + c.w &&
           w.y >= c.y &&
-          w.y <= c.y + size.h + 280
-        );
-      });
+          w.y <= c.y + c.h + 24
+      );
       if (hit && !hit.refIds.includes(connecting.fromId)) {
         // 命中容器：添加参考图
         updateContainer(hit.id, { refIds: [...hit.refIds, connecting.fromId], error: undefined });
       } else if (!hit) {
-        // 空白处松手：原地新建容器，并自动连上该参考图
-        createContainer(w.x - 160, w.y - 120, connecting.fromId);
+        // 空白处松手：原地新建容器（居中于落点），并自动连上该参考图
+        createContainer(w.x, w.y, connecting.fromId);
       }
       setConnecting(null);
       return;
@@ -1091,12 +1165,11 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
     setMenu({ x: e.clientX, y: e.clientY, mode: "background" });
   }, []);
 
-  // 菜单点击「新建图片容器」：在右键位置（转世界坐标）创建
+  // 菜单点击「新建图片容器」：在右键位置（转世界坐标）居中创建
   const handleCreateContainer = useCallback(() => {
     if (!menu) return;
     const w = screenToWorld(menu.x, menu.y);
-    // 容器左上角对齐点击点，稍微上移让标题可见
-    createContainer(w.x, w.y - 20);
+    createContainer(w.x, w.y);
     setMenu(null);
   }, [menu, screenToWorld, createContainer]);
 
@@ -1366,8 +1439,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
 
           {/* 容器的待生成参考连线（虚线） */}
           {containers.map((c) => {
-            const size = containerDisplaySize(c.aspect);
-            const tgtRect: BBox = { x: c.x, y: c.y, width: size.w, height: size.h };
+            const tgtRect: BBox = { x: c.x, y: c.y, width: c.w, height: c.h };
             return c.refIds.map((rid) => {
               const src = nodes.find((n) => n.id === rid);
               if (!src) return null;
@@ -1491,6 +1563,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
             key={c.id}
             container={c}
             nodes={nodes}
+            zoom={zoom}
             isGenerating={generatingContainerId === c.id}
             isDragActive={draggingContainer?.id === c.id}
             isConnectTarget={!!connecting}
@@ -1791,7 +1864,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
           e.stopPropagation();
           if (!onAction) return;
           const ok = await onAction({ type: "arrange" });
-          if (ok !== false) fitAllNodes(); // 整理后自动回到全图视角
+          // 置位待执行标志：等新画布状态渲染出最新节点坐标后再 fit（见 pendingFitRef effect）
+          if (ok !== false) pendingFitRef.current = true;
         }}
       >
         <svg
@@ -2194,8 +2268,17 @@ const EditPanel = ({
   onMove: (x: number, y: number) => void;
   onMeasure: (h: number) => void;
 }) => {
-  const PANEL_W = 340;
-  const left = Math.min(x, window.innerWidth - PANEL_W - 8);
+  // 可拉伸尺寸：宽度持久化；高度默认自适应（null），拉伸过一次后固定并持久化
+  const [panelW, setPanelW] = useState<number>(() => {
+    const v = Number(localStorage.getItem("ica:editPanelW"));
+    return Number.isFinite(v) && v >= 340 && v <= 720 ? v : 340;
+  });
+  const [panelH, setPanelH] = useState<number | null>(() => {
+    const v = Number(localStorage.getItem("ica:editPanelH"));
+    return Number.isFinite(v) && v >= 420 ? v : null;
+  });
+  const [resizeHover, setResizeHover] = useState(false);
+  const left = Math.min(x, window.innerWidth - panelW - 8);
   const top = Math.min(y, window.innerHeight - 435);
 
   const onTitleMouseDown = useCallback((e: React.MouseEvent) => {
@@ -2207,7 +2290,7 @@ const EditPanel = ({
     const origLeft = left;
     const origTop = top;
     const onMov = (ev: MouseEvent) => {
-      const nl = Math.max(0, Math.min(origLeft + ev.clientX - startX, window.innerWidth - PANEL_W - 8));
+      const nl = Math.max(0, Math.min(origLeft + ev.clientX - startX, window.innerWidth - panelW - 8));
       const nt = Math.max(0, Math.min(origTop + ev.clientY - startY, window.innerHeight - 40));
       onMove(nl, nt);
     };
@@ -2217,7 +2300,41 @@ const EditPanel = ({
     };
     document.addEventListener("mousemove", onMov);
     document.addEventListener("mouseup", onUp);
-  }, [left, top, onMove]);
+  }, [left, top, onMove, panelW]);
+
+  // 右下角拉伸：拖拽同时调整宽高（宽 340~720）；面板贴近视口底部时向上生长
+  const onResizeMouseDown = useCallback((e: React.MouseEvent) => {
+    if (e.button !== 0) return;
+    e.stopPropagation();
+    e.preventDefault();
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const origW = panelW;
+    const origH = panelH ?? ref.current?.offsetHeight ?? 420;
+    let lastW = origW;
+    let lastH = origH;
+    const onMov = (ev: MouseEvent) => {
+      lastW = Math.max(340, Math.min(origW + ev.clientX - startX, 720));
+      lastH = Math.max(420, origH + ev.clientY - startY);
+      // 底部超出视口 → 面板顶边上移（向上生长）；顶到 0 后高度钳制在视口内
+      const overflow = top + lastH - (window.innerHeight - 8);
+      if (overflow > 0) {
+        const newTop = Math.max(0, top - overflow);
+        onMove(left, newTop);
+        if (newTop === 0) lastH = Math.max(420, window.innerHeight - 8);
+      }
+      setPanelW(lastW);
+      setPanelH(lastH);
+    };
+    const onUp = () => {
+      localStorage.setItem("ica:editPanelW", String(lastW));
+      localStorage.setItem("ica:editPanelH", String(lastH));
+      document.removeEventListener("mousemove", onMov);
+      document.removeEventListener("mouseup", onUp);
+    };
+    document.addEventListener("mousemove", onMov);
+    document.addEventListener("mouseup", onUp);
+  }, [panelW, panelH, top, left, onMove, ref]);
 
   // 测量实际高度，回报父组件用于连线计算
   useEffect(() => {
@@ -2233,7 +2350,10 @@ const EditPanel = ({
         position: "fixed",
         left,
         top,
-        width: PANEL_W,
+        width: panelW,
+        height: panelH ?? undefined,
+        display: "flex",
+        flexDirection: "column",
         background: "rgba(26,26,46,0.97)",
         border: "1px solid rgba(167,139,250,0.6)",
         borderRadius: 10,
@@ -2286,7 +2406,15 @@ const EditPanel = ({
         </div>
       )}
 
-      <div style={{ padding: "8px 10px" }}>
+      <div
+        style={{
+          padding: "8px 10px",
+          flex: 1,
+          minHeight: 0,
+          display: "flex",
+          flexDirection: "column",
+        }}
+      >
         <textarea
           autoFocus
           value={prompt}
@@ -2316,6 +2444,9 @@ const EditPanel = ({
             resize: "none",
             fontFamily: "inherit",
             lineHeight: 1.5,
+            // 拉伸过高度后（panelH 固定），输入框弹性填满剩余空间
+            flex: panelH ? 1 : undefined,
+            minHeight: 60,
           }}
         />
 
@@ -2402,6 +2533,39 @@ const EditPanel = ({
             取消
           </button>
         </div>
+      </div>
+
+      {/* 右下角拉伸手柄：平时隐形热区，hover 显示对角线指示 */}
+      <div
+        onMouseDown={onResizeMouseDown}
+        onMouseEnter={() => setResizeHover(true)}
+        onMouseLeave={() => setResizeHover(false)}
+        title="拖拽调整编辑框大小"
+        style={{
+          position: "absolute",
+          right: 0,
+          bottom: 0,
+          width: 28,
+          height: 28,
+          cursor: "nwse-resize",
+          zIndex: 10,
+        }}
+      >
+        <svg
+          width="28"
+          height="28"
+          viewBox="0 0 28 28"
+          style={{
+            position: "absolute",
+            right: 0,
+            bottom: 0,
+            opacity: resizeHover ? 1 : 0,
+            transition: "opacity 0.15s ease",
+          }}
+        >
+          <line x1="23" y1="12" x2="12" y2="23" stroke="#c4b5fd" strokeWidth="2.5" strokeLinecap="round" />
+          <line x1="23" y1="17.5" x2="17.5" y2="23" stroke="#c4b5fd" strokeWidth="2.5" strokeLinecap="round" />
+        </svg>
       </div>
     </div>
   );
@@ -2587,11 +2751,59 @@ function ImageNode({
 }
 
 /**
+ * 容器边缘/四角拉伸柄：平时隐形热区，悬停淡入紫色指示（与面板拉伸柄同风格）。
+ * thickness 为世界坐标值（调用方按 zoom 补偿，保证屏幕热区恒定）。
+ */
+function ContainerResizeHandle({
+  dir,
+  thickness,
+  onDown,
+}: {
+  dir: string;
+  thickness: number;
+  onDown: (e: React.MouseEvent, dir: string) => void;
+}) {
+  const [hover, setHover] = useState(false);
+  const corner = thickness * 2; // 角柄方形热区稍大更好抓
+  const style: React.CSSProperties = {
+    position: "absolute",
+    zIndex: 30,
+    background: hover ? "rgba(196,181,253,0.4)" : "transparent",
+    transition: "background 0.15s ease",
+  };
+  if (dir === "n")
+    Object.assign(style, { top: -thickness / 2, left: corner, right: corner, height: thickness, cursor: "ns-resize" });
+  else if (dir === "s")
+    Object.assign(style, { bottom: -thickness / 2, left: corner, right: corner, height: thickness, cursor: "ns-resize" });
+  else if (dir === "e")
+    Object.assign(style, { right: -thickness / 2, top: corner, bottom: corner, width: thickness, cursor: "ew-resize" });
+  else if (dir === "w")
+    Object.assign(style, { left: -thickness / 2, top: corner, bottom: corner, width: thickness, cursor: "ew-resize" });
+  else if (dir === "ne")
+    Object.assign(style, { top: -thickness / 2, right: -thickness / 2, width: corner, height: corner, cursor: "nesw-resize" });
+  else if (dir === "nw")
+    Object.assign(style, { top: -thickness / 2, left: -thickness / 2, width: corner, height: corner, cursor: "nwse-resize" });
+  else if (dir === "se")
+    Object.assign(style, { bottom: -thickness / 2, right: -thickness / 2, width: corner, height: corner, cursor: "nwse-resize" });
+  else if (dir === "sw")
+    Object.assign(style, { bottom: -thickness / 2, left: -thickness / 2, width: corner, height: corner, cursor: "nesw-resize" });
+  return (
+    <div
+      style={style}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      onMouseDown={(e) => onDown(e, dir)}
+    />
+  );
+}
+
+/**
  * 待生成图片容器：规定宽高，接收参考图连线，生成后原地变真实图片
  */
 function PendingContainerNode({
   container,
   nodes,
+  zoom,
   isGenerating,
   isDragActive,
   isConnectTarget,
@@ -2604,6 +2816,7 @@ function PendingContainerNode({
 }: {
   container: PendingContainer;
   nodes: CanvasNode[];
+  zoom: number;
   isGenerating: boolean;
   isDragActive: boolean;
   isConnectTarget: boolean;
@@ -2614,7 +2827,6 @@ function PendingContainerNode({
   onRemove: () => void;
   onGenerate: () => void;
 }) {
-  const size = containerDisplaySize(container.aspect);
   const refNodes = container.refIds
     .map((rid) => nodes.find((n) => n.id === rid))
     .filter((n): n is CanvasNode => !!n);
@@ -2626,23 +2838,94 @@ function PendingContainerNode({
         : `多图组合 · ${refNodes.length} 参考图`;
 
   const smallBtn = (active: boolean): React.CSSProperties => ({
-    padding: "6px 0",
+    padding: "7px 0",
     background: active ? "#a78bfa" : "rgba(255,255,255,0.08)",
-    color: active ? "#1a1a2e" : "rgba(255,255,255,0.75)",
+    color: active ? "#1a1a2e" : "rgba(255,255,255,0.8)",
     border: "none",
     borderRadius: 6,
-    fontSize: 12,
+    fontSize: 14,
     cursor: "pointer",
     fontWeight: active ? 600 : 400,
   });
 
+  // ===== 左右上下 + 四角拉伸：世界坐标随动（dx/dy 除以 zoom），屏幕恒定热区 =====
+  const [resizeDir, setResizeDir] = useState<string | null>(null);
+  const resizeStartRef = useRef<{ mx: number; my: number; x: number; y: number; w: number; h: number } | null>(null);
+
+  const onHandleDown = (e: React.MouseEvent, dir: string) => {
+    if (e.button !== 0) return;
+    e.stopPropagation();
+    e.preventDefault();
+    resizeStartRef.current = { mx: e.clientX, my: e.clientY, x: container.x, y: container.y, w: container.w, h: container.h };
+    setResizeDir(dir);
+  };
+
+  useEffect(() => {
+    if (!resizeDir) return;
+    const cursor =
+      resizeDir === "n" || resizeDir === "s"
+        ? "ns-resize"
+        : resizeDir === "e" || resizeDir === "w"
+          ? "ew-resize"
+          : resizeDir === "ne" || resizeDir === "sw"
+            ? "nesw-resize"
+            : "nwse-resize";
+    const prevCursor = document.body.style.cursor;
+    document.body.style.cursor = cursor;
+    const onMove = (e: MouseEvent) => {
+      const s = resizeStartRef.current;
+      if (!s) return;
+      const dx = (e.clientX - s.mx) / zoom;
+      const dy = (e.clientY - s.my) / zoom;
+      // 下限：屏幕上不小于基准尺寸（与创建时的相机自适应一致）
+      const min = containerCreateSize(container.aspect, zoom);
+      let { x, y, w, h } = s;
+      if (resizeDir.includes("e")) w = s.w + dx;
+      if (resizeDir.includes("w")) {
+        w = s.w - dx;
+        x = s.x + dx;
+      }
+      if (resizeDir.includes("s")) h = s.h + dy;
+      if (resizeDir.includes("n")) {
+        h = s.h - dy;
+        y = s.y + dy;
+      }
+      // 越界回夹时保持对侧边缘不动
+      if (w < min.w) {
+        if (resizeDir.includes("w")) x = s.x + (s.w - min.w);
+        w = min.w;
+      }
+      if (h < min.h) {
+        if (resizeDir.includes("n")) y = s.y + (s.h - min.h);
+        h = min.h;
+      }
+      onChange({ x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(h) });
+    };
+    const onUp = () => setResizeDir(null);
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      document.body.style.cursor = prevCursor;
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [resizeDir, zoom, container.aspect, onChange]);
+
+  // 拉伸柄热区厚度：屏幕恒定（约 12px），世界值随 zoom 补偿，并按容器尺寸封顶
+  const handleT = Math.max(5, Math.min(12 / zoom, Math.min(container.w, container.h) / 10));
+
   return (
     <div
+      data-scroll-scope
       style={{
         position: "absolute",
         left: container.x,
         top: container.y,
-        width: size.w + 24, // 内容区 + padding
+        // 外矩形呈现待生成图片的形状比例；w/h 创建时相机自适应、可手动拉伸
+        width: container.w,
+        minHeight: container.h,
+        display: "flex",
+        flexDirection: "column",
         background: isGenerating
           ? "rgba(167,139,250,0.18)"
           : "rgba(167,139,250,0.08)",
@@ -2682,7 +2965,7 @@ function PendingContainerNode({
           userSelect: "none",
         }}
       >
-        <span style={{ fontSize: 13, fontWeight: 600, color: "#c4b5fd" }}>
+        <span style={{ fontSize: 15, fontWeight: 600, color: "#c4b5fd" }}>
           📦 图片容器 · {modeLabel}
         </span>
         <button
@@ -2715,108 +2998,6 @@ function PendingContainerNode({
         >
           ×
         </button>
-      </div>
-
-      {/* 尺寸预览框（按宽高比）：生成时显示进度/流式预览图 */}
-      <div
-        style={{
-          position: "relative",
-          width: size.w,
-          height: size.h,
-          border: "1px dashed rgba(196,181,253,0.5)",
-          borderRadius: 8,
-          display: "flex",
-          flexDirection: "column",
-          alignItems: "center",
-          justifyContent: "center",
-          color: "rgba(255,255,255,0.55)",
-          fontSize: 13,
-          gap: 6,
-          background: "rgba(0,0,0,0.15)",
-          overflow: "hidden",
-        }}
-      >
-        {/* 流式预览图（模糊→清晰渐进） */}
-        {isGenerating && container.previewUrl && (
-          <img
-            src={container.previewUrl}
-            alt="preview"
-            draggable={false}
-            style={{
-              position: "absolute",
-              inset: 0,
-              width: "100%",
-              height: "100%",
-              objectFit: "cover",
-              opacity: 0.92,
-            }}
-          />
-        )}
-        {isGenerating ? (
-          <>
-            <span
-              style={{
-                position: "relative",
-                zIndex: 1,
-                fontSize: 30,
-                fontWeight: 700,
-                color: "#c4b5fd",
-                fontVariantNumeric: "tabular-nums",
-                textShadow: container.previewUrl ? "0 2px 12px rgba(0,0,0,0.9)" : "none",
-              }}
-            >
-              {Math.round(progress)}%
-            </span>
-            {/* 进度条 */}
-            <div
-              style={{
-                position: "relative",
-                zIndex: 1,
-                width: "72%",
-                height: 6,
-                background: "rgba(0,0,0,0.45)",
-                borderRadius: 3,
-                overflow: "hidden",
-              }}
-            >
-              <div
-                style={{
-                  width: `${progress}%`,
-                  height: "100%",
-                  background: "linear-gradient(90deg, #a78bfa, #c4b5fd)",
-                  borderRadius: 3,
-                  transition: "width 0.15s linear",
-                }}
-              />
-            </div>
-            <span
-              style={{
-                position: "relative",
-                zIndex: 1,
-                fontSize: 12,
-                textShadow: container.previewUrl ? "0 1px 8px rgba(0,0,0,0.9)" : "none",
-              }}
-            >
-              {progress >= 100
-                ? "✨ 完成"
-                : container.previewUrl
-                  ? "预览已收到，细化中..."
-                  : progress >= 80
-                    ? "润色收尾中..."
-                    : progress >= 40
-                      ? "绘制细节中..."
-                      : "构思画面中..."}
-            </span>
-          </>
-        ) : (
-          <>
-            <span style={{ fontSize: 24 }}>🖼️</span>
-            <span>{calcSize(container.aspect, container.resolution)}</span>
-            <span style={{ fontSize: 12 }}>
-              {refNodes.length > 0 ? "参考图已连线" : "等待生成"}
-            </span>
-          </>
-        )}
       </div>
 
       {/* 参考图缩略 */}
@@ -2877,14 +3058,32 @@ function PendingContainerNode({
         </div>
       )}
 
-      {/* 宽高比 */}
+      {/* 宽高比（右侧显示输出像素尺寸） */}
       <div style={{ marginTop: 10 }}>
-        <div style={{ fontSize: 11, color: "rgba(255,255,255,0.55)", marginBottom: 4 }}>宽高比</div>
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            marginBottom: 4,
+          }}
+        >
+          <span style={{ fontSize: 13, color: "rgba(255,255,255,0.6)" }}>宽高比</span>
+          <span
+            style={{
+              fontSize: 12,
+              color: "rgba(255,255,255,0.45)",
+              fontVariantNumeric: "tabular-nums",
+            }}
+          >
+            {calcSize(container.aspect, container.resolution)}
+          </span>
+        </div>
         <div style={{ display: "flex", gap: 4 }}>
           {ASPECT_RATIOS.map((r) => (
             <button
               key={r.key}
-              onClick={() => onChange({ aspect: r.key })}
+              onClick={() => onChange({ aspect: r.key, ...containerSizeForAspect(container, r.key) })}
               style={{ flex: 1, ...smallBtn(container.aspect === r.key) }}
             >
               {r.key}
@@ -2895,7 +3094,7 @@ function PendingContainerNode({
 
       {/* 分辨率 */}
       <div style={{ marginTop: 8 }}>
-        <div style={{ fontSize: 11, color: "rgba(255,255,255,0.55)", marginBottom: 4 }}>分辨率</div>
+        <div style={{ fontSize: 13, color: "rgba(255,255,255,0.6)", marginBottom: 4 }}>分辨率</div>
         <div style={{ display: "flex", gap: 4 }}>
           {RESOLUTIONS.map((res) => (
             <button
@@ -2926,17 +3125,19 @@ function PendingContainerNode({
               ? "变体描述，留空直接生成"
               : "组合描述，留空自动融合"
         }
-        rows={2}
         style={{
           width: "100%",
           boxSizing: "border-box",
+          flex: 1,
+          minHeight: 100,
           marginTop: 10,
-          padding: "8px 10px",
+          padding: "10px 12px",
           background: "rgba(0,0,0,0.25)",
           border: "1px solid rgba(167,139,250,0.5)",
           borderRadius: 6,
           color: "white",
-          fontSize: 13,
+          fontSize: 16,
+          lineHeight: 1.6,
           outline: "none",
           resize: "none",
           fontFamily: "inherit",
@@ -2944,7 +3145,7 @@ function PendingContainerNode({
       />
 
       {container.error && (
-        <div style={{ color: "#f87171", fontSize: 12, marginTop: 6 }}>{container.error}</div>
+        <div style={{ color: "#f87171", fontSize: 14, marginTop: 6 }}>{container.error}</div>
       )}
 
       {/* 生成按钮 */}
@@ -2954,18 +3155,117 @@ function PendingContainerNode({
         style={{
           width: "100%",
           marginTop: 10,
-          padding: "10px 0",
+          padding: "11px 0",
           background: isGenerating ? "rgba(167,139,250,0.4)" : "#a78bfa",
           color: "#1a1a2e",
           border: "none",
           borderRadius: 8,
-          fontSize: 14,
+          fontSize: 16,
           fontWeight: 700,
           cursor: isGenerating ? "not-allowed" : "pointer",
         }}
       >
         {isGenerating ? `生成中 ${Math.round(progress)}%` : "⚡ 生成"}
       </button>
+
+      {/* 左右上下 + 四角拉伸柄：隐形热区，悬停淡入紫色指示 */}
+      {!container.exiting &&
+        (["n", "s", "e", "w", "ne", "nw", "se", "sw"] as const).map((dir) => (
+          <ContainerResizeHandle key={dir} dir={dir} thickness={handleT} onDown={onHandleDown} />
+        ))}
+
+      {/* 生成中覆盖层：整个容器（外矩形即图片形状）显示流式预览与进度 */}
+      {isGenerating && (
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            zIndex: 5,
+            borderRadius: 10,
+            background: container.previewUrl
+              ? "rgba(0,0,0,0.25)"
+              : "rgba(20,20,40,0.72)",
+            backdropFilter: "blur(3px)",
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: 8,
+            overflow: "hidden",
+            pointerEvents: "none",
+          }}
+        >
+          {/* 流式预览图（模糊→清晰渐进，贴合容器形状） */}
+          {container.previewUrl && (
+            <img
+              src={container.previewUrl}
+              alt="preview"
+              draggable={false}
+              style={{
+                position: "absolute",
+                inset: 0,
+                width: "100%",
+                height: "100%",
+                objectFit: "cover",
+                opacity: 0.92,
+              }}
+            />
+          )}
+          <span
+            style={{
+              position: "relative",
+              zIndex: 1,
+              fontSize: 30,
+              fontWeight: 700,
+              color: "#c4b5fd",
+              fontVariantNumeric: "tabular-nums",
+              textShadow: container.previewUrl ? "0 2px 12px rgba(0,0,0,0.9)" : "none",
+            }}
+          >
+            {Math.round(progress)}%
+          </span>
+          {/* 进度条 */}
+          <div
+            style={{
+              position: "relative",
+              zIndex: 1,
+              width: "72%",
+              height: 6,
+              background: "rgba(0,0,0,0.45)",
+              borderRadius: 3,
+              overflow: "hidden",
+            }}
+          >
+            <div
+              style={{
+                width: `${progress}%`,
+                height: "100%",
+                background: "linear-gradient(90deg, #a78bfa, #c4b5fd)",
+                borderRadius: 3,
+                transition: "width 0.15s linear",
+              }}
+            />
+          </div>
+          <span
+            style={{
+              position: "relative",
+              zIndex: 1,
+              fontSize: 12,
+              textShadow: container.previewUrl ? "0 1px 8px rgba(0,0,0,0.9)" : "none",
+            }}
+          >
+            {progress >= 100
+              ? "✨ 完成"
+              : container.previewUrl
+                ? "预览已收到，细化中..."
+                : progress >= 80
+                  ? "润色收尾中..."
+                  : progress >= 40
+                    ? "绘制细节中..."
+                    : "构思画面中..."}
+          </span>
+        </div>
+      )}
     </div>
   );
 }
