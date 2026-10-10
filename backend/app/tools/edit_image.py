@@ -6,7 +6,8 @@ import uuid
 from app.canvas.state import CanvasNode, CanvasState
 from app.image.base import BaseImageGenerator
 from app.tools.base import BaseTool, ToolResult
-from app.tools.layout import next_position
+from app.tools.layout import next_position_near
+from app.tools.tasks import tracks_generation
 
 
 class EditImageTool(BaseTool):
@@ -31,6 +32,7 @@ class EditImageTool(BaseTool):
     def __init__(self, image_generator: BaseImageGenerator):
         self.image_generator = image_generator
 
+    @tracks_generation
     def run(self, state: CanvasState, **kwargs) -> ToolResult:
         node_id = kwargs.get("node_id", "")
         prompt = kwargs.get("prompt", "")
@@ -51,11 +53,17 @@ class EditImageTool(BaseTool):
                 state=state,
             )
 
-        # 位置：用户指定则用用户值，否则自动布局
+        # 位置：用户指定则用用户值，否则在源图附近就近找空白（避免落到大老远）
         x = float(kwargs.get("x", 100))
         y = float(kwargs.get("y", 100))
         if x == 100 and y == 100:
-            x, y = next_position(state, source.width, source.height)
+            x, y = next_position_near(
+                state,
+                source.width,
+                source.height,
+                source.x + source.width / 2,
+                source.y + source.height / 2,
+            )
 
         result = self.image_generator.edit(
             source_image_url=source.image_url,

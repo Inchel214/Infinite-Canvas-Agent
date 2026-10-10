@@ -7,6 +7,7 @@ from app.canvas.state import CanvasNode, CanvasState
 from app.image.base import BaseImageGenerator
 from app.tools.base import BaseTool, ToolResult
 from app.tools.layout import next_position
+from app.tools.tasks import tracks_generation
 
 
 class GenerateImageTool(BaseTool):
@@ -31,6 +32,7 @@ class GenerateImageTool(BaseTool):
     def __init__(self, image_generator: BaseImageGenerator):
         self.image_generator = image_generator
 
+    @tracks_generation
     def run(self, state: CanvasState, **kwargs) -> ToolResult:
         prompt = kwargs.get("prompt", "")
         width = int(kwargs.get("width", 300))
