@@ -9,6 +9,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app import deps
+from app import experiences
 from app.canvas.state import CanvasNode
 from app.providers.schema import (
     AppSettings,
@@ -45,6 +46,7 @@ class ComposeRequest(BaseModel):
     size: str = "2K"
     x: Optional[float] = None
     y: Optional[float] = None
+    experience_id: Optional[str] = None  # 风格库：选中后读全文拼接进 prompt
 
 
 class VariateRequest(BaseModel):
@@ -53,6 +55,7 @@ class VariateRequest(BaseModel):
     size: str = "2K"
     x: Optional[float] = None
     y: Optional[float] = None
+    experience_id: Optional[str] = None
 
 
 class EditRequest(BaseModel):
@@ -61,6 +64,7 @@ class EditRequest(BaseModel):
     size: str = "2K"
     x: Optional[float] = None
     y: Optional[float] = None
+    experience_id: Optional[str] = None
 
 
 class GenerateRequest(BaseModel):
@@ -68,6 +72,7 @@ class GenerateRequest(BaseModel):
     size: str = "2K"
     x: Optional[float] = None
     y: Optional[float] = None
+    experience_id: Optional[str] = None
 
 
 class StreamGenRequest(BaseModel):
@@ -78,6 +83,20 @@ class StreamGenRequest(BaseModel):
     y: float = 100
     node_id: Optional[str] = None
     node_ids: Optional[List[str]] = None
+    experience_id: Optional[str] = None
+
+
+class ExperienceIn(BaseModel):
+    """导入风格 MD：名称/描述/正文"""
+    name: str
+    description: str = ""
+    content: str
+
+
+class ExperienceUpdate(BaseModel):
+    """编辑风格元数据（名称/描述）"""
+    name: Optional[str] = None
+    description: Optional[str] = None
 
 
 def _sse(obj: dict) -> str:
@@ -164,7 +183,8 @@ def compose_images(canvas_id: str, req: ComposeRequest):
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     tool = deps.tool_manager.get("compose_images")
-    kwargs = {"node_ids": req.node_ids, "prompt": req.prompt, "size": req.size}
+    prompt = experiences.apply_experience(req.experience_id, req.prompt) if req.experience_id else req.prompt
+    kwargs = {"node_ids": req.node_ids, "prompt": prompt, "size": req.size}
     if req.x is not None:
         kwargs["x"] = req.x
     if req.y is not None:
@@ -186,6 +206,8 @@ def variate_image(canvas_id: str, req: VariateRequest):
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     prompt = req.prompt or "基于参考图生成一个高质量的新变体，保持风格一致"
+    if req.experience_id:
+        prompt = experiences.apply_experience(req.experience_id, prompt)
     tool = deps.tool_manager.get("variate_image")
     kwargs = {"node_id": req.node_id, "prompt": prompt, "size": req.size}
     if req.x is not None:
@@ -209,7 +231,8 @@ def edit_image(canvas_id: str, req: EditRequest):
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     tool = deps.tool_manager.get("edit_image")
-    kwargs = {"node_id": req.node_id, "prompt": req.prompt, "size": req.size}
+    prompt = experiences.apply_experience(req.experience_id, req.prompt) if req.experience_id else req.prompt
+    kwargs = {"node_id": req.node_id, "prompt": prompt, "size": req.size}
     if req.x is not None:
         kwargs["x"] = req.x
     if req.y is not None:
@@ -243,6 +266,36 @@ def delete_node(canvas_id: str, node_id: str):
 
 class BatchDeleteRequest(BaseModel):
     node_ids: List[str]
+
+
+class BatchMoveItem(BaseModel):
+    node_id: str
+    x: float
+    y: float
+
+
+class BatchMoveRequest(BaseModel):
+    moves: List[BatchMoveItem]
+
+
+@router.post("/canvas/{canvas_id}/nodes/move", summary="批量移动节点（多选整组拖拽，单次撤销）")
+def batch_move_nodes(canvas_id: str, req: BatchMoveRequest):
+    try:
+        state = deps.store.get_canvas(canvas_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    moved = 0
+    for m in req.moves:
+        if state.get_node(m.node_id):
+            state.update_node_position(m.node_id, m.x, m.y)
+            moved += 1
+    if moved > 0:
+        deps.store.save_canvas(state)  # 单次保存 = 单次撤销点
+    return {
+        "success": True,
+        "message": f"已移动 {moved} 张图片",
+        "canvas": state.to_dict(),
+    }
 
 
 @router.post("/canvas/{canvas_id}/nodes/delete", summary="批量删除节点（单次撤销）")
@@ -315,7 +368,8 @@ def generate_image(canvas_id: str, req: GenerateRequest):
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     tool = deps.tool_manager.get("generate_image")
-    kwargs = {"prompt": req.prompt, "size": req.size}
+    prompt = experiences.apply_experience(req.experience_id, req.prompt) if req.experience_id else req.prompt
+    kwargs = {"prompt": prompt, "size": req.size}
     if req.x is not None:
         kwargs["x"] = req.x
     if req.y is not None:
@@ -444,6 +498,10 @@ def generate_image_stream(canvas_id: str, req: StreamGenRequest):
 
     size = req.size
 
+    # 风格库：选中风格后读全文确定性拼接进 prompt（对三种 op 统一生效）
+    if req.experience_id:
+        prompt = experiences.apply_experience(req.experience_id, prompt)
+
     def _add_node(image_url: str, w: int, h: int) -> None:
         node = CanvasNode(
             id=str(uuid.uuid4()),
@@ -512,12 +570,12 @@ def generate_image_stream(canvas_id: str, req: StreamGenRequest):
             if req.op == "compose":
                 tool = deps.tool_manager.get("compose_images")
                 result = tool.run(
-                    state, node_ids=req.node_ids or [], prompt=req.prompt, size=size, x=req.x, y=req.y
+                    state, node_ids=req.node_ids or [], prompt=prompt, size=size, x=req.x, y=req.y
                 )
             elif req.op == "variate":
                 tool = deps.tool_manager.get("variate_image")
                 result = tool.run(
-                    state, node_id=req.node_id or "", prompt=req.prompt, size=size, x=req.x, y=req.y
+                    state, node_id=req.node_id or "", prompt=prompt, size=size, x=req.x, y=req.y
                 )
             else:
                 tool = deps.tool_manager.get("generate_image")
@@ -657,6 +715,36 @@ def _parse_settings(req: SettingsRequest) -> AppSettings:
     else:
         image.api_key = ""
     return AppSettings(llm=llm, image=image)
+
+
+@router.get("/experiences", summary="列出风格库（热加载：每次重扫目录）")
+def list_experiences_route():
+    return {"experiences": experiences.list_experiences()}
+
+
+@router.post("/experiences", summary="导入风格 MD（立即生效）")
+def add_experience_route(req: ExperienceIn):
+    try:
+        item = experiences.add_experience(req.name, req.description, req.content)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"success": True, "experience": item}
+
+
+@router.put("/experiences/{exp_id}", summary="编辑风格名称/描述")
+def update_experience_route(exp_id: str, req: ExperienceUpdate):
+    item = experiences.update_experience(exp_id, req.name, req.description)
+    if not item:
+        raise HTTPException(status_code=404, detail="风格不存在")
+    return {"success": True, "experience": item}
+
+
+@router.delete("/experiences/{exp_id}", summary="删除风格")
+def delete_experience_route(exp_id: str):
+    ok = experiences.delete_experience(exp_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="风格不存在")
+    return {"success": True, "message": "已删除"}
 
 
 @router.get("/settings", summary="获取当前大模型配置（key 脱敏）")

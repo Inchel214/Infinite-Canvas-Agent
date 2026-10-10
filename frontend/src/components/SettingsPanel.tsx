@@ -1,15 +1,20 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   getSettings,
   getProviders,
   saveSettings,
   resetSettings,
   testSettings,
+  listExperiences,
+  addExperience,
+  updateExperience,
+  deleteExperience,
   type AppSettingsData,
   type LLMSettings,
   type ImageSettings,
   type ProviderPreset,
   type TestResult,
+  type ExperienceMeta,
 } from "../api/agent";
 
 interface SettingsPanelProps {
@@ -82,22 +87,118 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
   const [errorMsg, setErrorMsg] = useState("");
   const [notice, setNotice] = useState("");
 
-  // 加载当前配置 + 服务商预设
+  // ===== 风格库（经验文档）=====
+  const [experiences, setExperiences] = useState<ExperienceMeta[]>([]);
+  const [expNotice, setExpNotice] = useState("");
+  const [importDraft, setImportDraft] = useState<{
+    name: string;
+    description: string;
+    content: string;
+  } | null>(null);
+  const [importing, setImporting] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // 加载风格列表 + 服务商预设
   useEffect(() => {
     (async () => {
       try {
-        const [settings, providerData] = await Promise.all([
+        const [settings, providerData, exps] = await Promise.all([
           getSettings(),
           getProviders(),
+          listExperiences().catch(() => [] as ExperienceMeta[]),
         ]);
         setLlm(settings.llm);
         setImage(settings.image);
         setProviders(providerData.providers);
+        setExperiences(exps);
       } catch (e) {
         setErrorMsg("加载配置失败：" + (e as Error).message);
       }
     })();
   }, []);
+
+  // 选择 MD 文件 → 打开导入表单（名称/描述自动预填，可编辑）
+  const handlePickFile = async (file: File | undefined) => {
+    if (!file) return;
+    try {
+      const content = await file.text();
+      if (!content.trim()) {
+        setExpNotice("文件内容为空");
+        return;
+      }
+      const autoName = file.name.replace(/\.(md|markdown|txt)$/i, "");
+      const plain = content
+        .replace(/[#*`>\-\[\]()!_~|]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+      const autoDesc = plain.slice(0, 100) + (plain.length > 100 ? "…" : "");
+      setImportDraft({ name: autoName, description: autoDesc, content });
+      setExpNotice("");
+    } catch {
+      setExpNotice("读取文件失败");
+    }
+  };
+
+  // 确认导入 → 立即生效（后端写文件 + 注册，热加载）
+  const handleImport = async () => {
+    if (!importDraft) return;
+    setImporting(true);
+    try {
+      await addExperience(importDraft.name, importDraft.description, importDraft.content);
+      const exps = await listExperiences();
+      setExperiences(exps);
+      setImportDraft(null);
+      setExpNotice(`已导入《${importDraft.name}》，生成图片时可在面板风格中选择`);
+      setTimeout(() => setExpNotice(""), 2600);
+    } catch (e) {
+      setExpNotice("导入失败：" + (e as Error).message);
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  // 删除风格
+  const handleDeleteExp = async (id: string, name: string) => {
+    if (editDraft?.id === id) setEditDraft(null); // 正在编辑的项被删除，关闭表单
+    try {
+      await deleteExperience(id);
+      setExperiences((prev) => prev.filter((e) => e.id !== id));
+      setExpNotice(`已删除《${name}》`);
+      setTimeout(() => setExpNotice(""), 2600);
+    } catch {
+      setExpNotice("删除失败");
+    }
+  };
+
+  // ===== 编辑风格名称/描述 =====
+  const [editDraft, setEditDraft] = useState<{
+    id: string;
+    name: string;
+    description: string;
+  } | null>(null);
+  const [editSaving, setEditSaving] = useState(false);
+
+  const handleEditSave = async () => {
+    if (!editDraft || !editDraft.name.trim()) return;
+    setEditSaving(true);
+    try {
+      const updated = await updateExperience(editDraft.id, {
+        name: editDraft.name.trim(),
+        description: editDraft.description.trim(),
+      });
+      setExperiences((prev) =>
+        prev.map((e) => (e.id === updated.id ? { ...e, ...updated } : e))
+      );
+      const done = editDraft.name.trim();
+      setEditDraft(null);
+      setExpNotice(`已更新《${done}》`);
+      setTimeout(() => setExpNotice(""), 2600);
+    } catch (e) {
+      setExpNotice("保存失败：" + (e as Error).message);
+    } finally {
+      setEditSaving(false);
+    }
+  };
 
   // Esc 关闭
   useEffect(() => {
@@ -370,6 +471,237 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
             {testResult.image.ok ? "✓ " : "✗ "}
             {testResult.image.message}
           </div>
+        )}
+
+        {/* ===== 风格库（经验文档） ===== */}
+        <div style={sectionTitleStyle}>🎨 风格库（风格指南）</div>
+        <div style={{ color: "#777", fontSize: 12, margin: "4px 0 8px" }}>
+          导入设计师总结的风格 MD，生成图片时可在面板中选择；Agent 对话也会按需引用
+        </div>
+
+        {/* 风格列表 */}
+        {experiences.length === 0 && !importDraft && (
+          <div style={{ color: "#666", fontSize: 12, padding: "6px 0" }}>
+            暂无风格，点击下方按钮导入第一个
+          </div>
+        )}
+        {experiences.map((exp) =>
+          // 编辑态：名称/描述表单（保存调 PUT，改正文需删了重导）
+          editDraft?.id === exp.id ? (
+            <div
+              key={exp.id}
+              style={{
+                marginTop: 6,
+                padding: 10,
+                background: "rgba(167,139,250,0.06)",
+                borderRadius: 6,
+                border: "1px solid rgba(167,139,250,0.25)",
+              }}
+            >
+              <label style={labelStyle}>风格名称</label>
+              <input
+                style={inputStyle}
+                value={editDraft.name}
+                onChange={(e) => setEditDraft({ ...editDraft, name: e.target.value })}
+                autoFocus
+              />
+              <label style={labelStyle}>一句话描述（Agent 按此判断何时使用）</label>
+              <input
+                style={inputStyle}
+                value={editDraft.description}
+                onChange={(e) => setEditDraft({ ...editDraft, description: e.target.value })}
+                placeholder="如：低饱和暖色、晕染、留白，适合儿童绘本"
+              />
+              <div style={{ display: "flex", gap: 8, marginTop: 10, justifyContent: "flex-end" }}>
+                <button
+                  onClick={() => setEditDraft(null)}
+                  disabled={editSaving}
+                  style={{
+                    ...inputStyle,
+                    width: "auto",
+                    padding: "7px 12px",
+                    cursor: "pointer",
+                    background: "transparent",
+                    color: "#999",
+                  }}
+                >
+                  取消
+                </button>
+                <button
+                  onClick={handleEditSave}
+                  disabled={editSaving || !editDraft.name.trim()}
+                  style={{
+                    ...inputStyle,
+                    width: "auto",
+                    padding: "7px 12px",
+                    cursor: "pointer",
+                    background: "rgba(167,139,250,0.25)",
+                    color: "#eee",
+                  }}
+                >
+                  {editSaving ? "保存中..." : "保存"}
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div
+              key={exp.id}
+              style={{
+                display: "flex",
+                alignItems: "flex-start",
+                gap: 8,
+                padding: "7px 10px",
+                marginTop: 6,
+                background: "rgba(255,255,255,0.04)",
+                borderRadius: 6,
+                border: "1px solid rgba(255,255,255,0.08)",
+              }}
+            >
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ color: "#ddd", fontSize: 13, fontWeight: 600 }}>
+                  {exp.name}
+                </div>
+                <div style={{ color: "#888", fontSize: 12, marginTop: 2, wordBreak: "break-word" }}>
+                  {exp.description || "（无描述，Agent 判断匹配时可能不准，建议补一句适用场景）"}
+                </div>
+              </div>
+              <button
+                onClick={() =>
+                  setEditDraft({ id: exp.id, name: exp.name, description: exp.description })
+                }
+                style={{
+                  background: "transparent",
+                  border: "none",
+                  color: "#a78bfa",
+                  fontSize: 12,
+                  cursor: "pointer",
+                  padding: "2px 4px",
+                  whiteSpace: "nowrap",
+                }}
+                title={`编辑《${exp.name}》的名称/描述`}
+              >
+                编辑
+              </button>
+              <button
+                onClick={() => handleDeleteExp(exp.id, exp.name)}
+                style={{
+                  background: "transparent",
+                  border: "none",
+                  color: "#f87171",
+                  fontSize: 12,
+                  cursor: "pointer",
+                  padding: "2px 4px",
+                  whiteSpace: "nowrap",
+                }}
+                title={`删除《${exp.name}》`}
+              >
+                删除
+              </button>
+            </div>
+          )
+        )}
+
+        {/* 导入表单：选文件后出现，名称/描述可编辑 */}
+        {importDraft ? (
+          <div
+            style={{
+              marginTop: 10,
+              padding: 10,
+              background: "rgba(167,139,250,0.06)",
+              borderRadius: 6,
+              border: "1px solid rgba(167,139,250,0.25)",
+            }}
+          >
+            <label style={labelStyle}>风格名称</label>
+            <input
+              style={inputStyle}
+              value={importDraft.name}
+              onChange={(e) => setImportDraft({ ...importDraft, name: e.target.value })}
+              placeholder="如：赛博朋克海报"
+            />
+            <label style={labelStyle}>一句话描述（Agent 按此判断何时使用）</label>
+            <input
+              style={inputStyle}
+              value={importDraft.description}
+              onChange={(e) => setImportDraft({ ...importDraft, description: e.target.value })}
+              placeholder="如：霓虹、雨夜、高对比、科技感，适合未来题材海报"
+            />
+            <div
+              style={{
+                marginTop: 8,
+                maxHeight: 120,
+                overflowY: "auto",
+                padding: "6px 8px",
+                background: "rgba(0,0,0,0.25)",
+                borderRadius: 6,
+                color: "#999",
+                fontSize: 11,
+                whiteSpace: "pre-wrap",
+                wordBreak: "break-word",
+              }}
+            >
+              {importDraft.content.slice(0, 500)}
+              {importDraft.content.length > 500 ? "\n…" : ""}
+            </div>
+            <div style={{ display: "flex", gap: 8, marginTop: 10, justifyContent: "flex-end" }}>
+              <button
+                onClick={() => setImportDraft(null)}
+                disabled={importing}
+                style={{
+                  ...inputStyle,
+                  width: "auto",
+                  padding: "7px 12px",
+                  cursor: "pointer",
+                  background: "transparent",
+                  color: "#999",
+                }}
+              >
+                取消
+              </button>
+              <button
+                onClick={handleImport}
+                disabled={importing || !importDraft.name.trim()}
+                style={{
+                  ...inputStyle,
+                  width: "auto",
+                  padding: "7px 12px",
+                  cursor: "pointer",
+                  background: "rgba(167,139,250,0.25)",
+                  color: "#eee",
+                }}
+              >
+                {importing ? "导入中..." : "确认导入"}
+              </button>
+            </div>
+          </div>
+        ) : (
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            disabled={importing}
+            style={{
+              ...inputStyle,
+              marginTop: 10,
+              cursor: "pointer",
+              background: "rgba(255,255,255,0.08)",
+              color: "#ddd",
+            }}
+          >
+            📁 导入风格 MD 文件
+          </button>
+        )}
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".md,.markdown,.txt"
+          style={{ display: "none" }}
+          onChange={(e) => {
+            const f = e.target.files?.[0];
+            e.target.value = ""; // 允许重复选同一个文件
+            handlePickFile(f);
+          }}
+        />
+        {expNotice && (
+          <div style={{ color: "#a78bfa", fontSize: 12, marginTop: 8 }}>{expNotice}</div>
         )}
 
         {/* 提示信息 */}

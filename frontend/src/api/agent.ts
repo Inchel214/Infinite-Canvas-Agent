@@ -74,6 +74,7 @@ export async function generateImageStream(
     y: number;
     node_id?: string;
     node_ids?: string[];
+    experience_id?: string;
   },
   handlers: StreamEvents
 ): Promise<void> {
@@ -140,12 +141,13 @@ export async function generateImage(
   prompt: string,
   size = "2K",
   x?: number,
-  y?: number
+  y?: number,
+  experienceId?: string
 ): Promise<DirectResponse> {
   const res = await fetch(`${API_BASE}/canvas/${canvasId}/generate`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ prompt, size, x, y }),
+    body: JSON.stringify({ prompt, size, x, y, experience_id: experienceId || undefined }),
   });
   if (!res.ok) {
     throw new Error(`${res.status}`);
@@ -159,12 +161,20 @@ export async function composeImages(
   prompt = "",
   size = "2K",
   x?: number,
-  y?: number
+  y?: number,
+  experienceId?: string
 ): Promise<DirectResponse> {
   const res = await fetch(`${API_BASE}/canvas/${canvasId}/compose`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ node_ids: nodeIds, prompt, size, x, y }),
+    body: JSON.stringify({
+      node_ids: nodeIds,
+      prompt,
+      size,
+      x,
+      y,
+      experience_id: experienceId || undefined,
+    }),
   });
   if (!res.ok) {
     throw new Error(`${res.status}`);
@@ -178,12 +188,20 @@ export async function variateImage(
   prompt = "",
   size = "2K",
   x?: number,
-  y?: number
+  y?: number,
+  experienceId?: string
 ): Promise<DirectResponse> {
   const res = await fetch(`${API_BASE}/canvas/${canvasId}/variate`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ node_id: nodeId, prompt, size, x, y }),
+    body: JSON.stringify({
+      node_id: nodeId,
+      prompt,
+      size,
+      x,
+      y,
+      experience_id: experienceId || undefined,
+    }),
   });
   if (!res.ok) {
     throw new Error(`${res.status}`);
@@ -197,12 +215,20 @@ export async function editImage(
   prompt: string,
   size = "2K",
   x?: number,
-  y?: number
+  y?: number,
+  experienceId?: string
 ): Promise<DirectResponse> {
   const res = await fetch(`${API_BASE}/canvas/${canvasId}/edit`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ node_id: nodeId, prompt, size, x, y }),
+    body: JSON.stringify({
+      node_id: nodeId,
+      prompt,
+      size,
+      x,
+      y,
+      experience_id: experienceId || undefined,
+    }),
   });
   if (!res.ok) {
     throw new Error(`${res.status}`);
@@ -278,6 +304,25 @@ export async function deleteNodes(
     throw new Error(`${res.status}`);
   }
   return res.json();
+}
+
+// 批量移动节点（多选整组拖拽，单次撤销点）
+export async function moveNodes(
+  canvasId: string,
+  moves: { nodeId: string; x: number; y: number }[]
+): Promise<CanvasState> {
+  const res = await fetch(`${API_BASE}/canvas/${canvasId}/nodes/move`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      moves: moves.map((m) => ({ node_id: m.nodeId, x: m.x, y: m.y })),
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`${res.status}`);
+  }
+  const data = await res.json();
+  return data.canvas;
 }
 
 // 撤销最近一次操作，无历史可撤销时后端返回 success:false
@@ -450,4 +495,67 @@ export async function testSettings(
     throw new Error(err.detail || `${res.status}`);
   }
   return res.json();
+}
+
+// ===== 风格库（经验文档）：设计师沉淀的风格指南，生图时确定性拼接 =====
+
+export interface ExperienceMeta {
+  id: string;
+  name: string;
+  description: string;
+}
+
+// 列出风格（后端每次热扫描目录，手动放文件也生效）
+export async function listExperiences(): Promise<ExperienceMeta[]> {
+  const res = await fetch(`${API_BASE}/experiences`);
+  if (!res.ok) {
+    throw new Error(`${res.status}`);
+  }
+  const data = await res.json();
+  return data.experiences;
+}
+
+// 导入风格 MD（name/description/正文），立即生效
+export async function addExperience(
+  name: string,
+  description: string,
+  content: string
+): Promise<ExperienceMeta> {
+  const res = await fetch(`${API_BASE}/experiences`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, description, content }),
+  });
+  if (!res.ok) {
+    const msg = await res.text().catch(() => "");
+    throw new Error(msg || `${res.status}`);
+  }
+  const data = await res.json();
+  return data.experience;
+}
+
+// 编辑风格名称/描述（不改正文）
+export async function updateExperience(
+  id: string,
+  patch: { name?: string; description?: string }
+): Promise<ExperienceMeta> {
+  const res = await fetch(`${API_BASE}/experiences/${id}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) {
+    const msg = await res.text().catch(() => "");
+    throw new Error(msg || `${res.status}`);
+  }
+  const data = await res.json();
+  return data.experience;
+}
+
+// 删除风格
+export async function deleteExperience(id: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/experiences/${id}`, { method: "DELETE" });
+  if (!res.ok) {
+    throw new Error(`${res.status}`);
+  }
 }
