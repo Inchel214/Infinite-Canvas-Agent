@@ -329,6 +329,13 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
   const [draggingContainer, setDraggingContainer] = useState<{ id: string; offsetX: number; offsetY: number } | null>(null);
   const [generatingContainerId, setGeneratingContainerId] = useState<string | null>(null);
   const [genProgress, setGenProgress] = useState(0);
+  // 最近点击（激活）的容器 id：点击容器后按 Esc 直接关闭该容器
+  const activeContainerIdRef = useRef<string | null>(null);
+  // Esc 处理器（固定依赖的 keydown effect）读最新生成中容器的镜像
+  const generatingContainerIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    generatingContainerIdRef.current = generatingContainerId;
+  }, [generatingContainerId]);
   const [localStatusMsg, setLocalStatusMsg] = useState<string | null>(null);
   const containerSeqRef = useRef(0);
   // 画布内复制/粘贴的剪贴板（存节点副本，Ctrl+V 粘贴到画布）
@@ -363,12 +370,18 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
     });
   }, [canvasState]);
 
-  // Esc：关闭菜单 / 清空选择 / 取消连线
+  // Esc：关闭激活容器 / 关闭菜单 / 清空选择 / 取消连线
   // Delete/Backspace：删除选中节点
   // Ctrl+C / Cmd+C：复制选中图片到系统剪贴板（可在文件管理器粘贴为 PNG）
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
+        // 点击过的容器：Esc 直接关闭（生成中的除外，避免误关丢进度）
+        const ac = activeContainerIdRef.current;
+        if (ac && ac !== generatingContainerIdRef.current) {
+          activeContainerIdRef.current = null;
+          setContainers((prev) => prev.filter((c) => c.id !== ac));
+        }
         setMenu(null);
         setEditPanel(null);
         setSelectedIds(new Set());
@@ -527,6 +540,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
   }, []);
 
   const removeContainer = useCallback((id: string) => {
+    // 同步清掉激活标记（该容器被 × 删除后 Esc 不应再作用于它）
+    if (activeContainerIdRef.current === id) activeContainerIdRef.current = null;
     setContainers((prev) => prev.filter((c) => c.id !== id));
   }, []);
 
@@ -779,6 +794,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
     if (e.button !== 0) return;
     // 只在点击背景时启动
     if (e.target === e.currentTarget || (e.target as HTMLElement).dataset.role === "world") {
+      // 点到空白处：容器不再是"激活"状态（Esc 不再关闭它）
+      activeContainerIdRef.current = null;
       if (e.shiftKey || isSpacePressedRef.current) {
         // 平移
         setIsPanning(true);
@@ -954,6 +971,9 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
     if (e.button !== 0) return;
     e.stopPropagation();
     e.preventDefault();
+
+    // 点击图片节点：容器不再是"激活"状态（Esc 不再关闭它）
+    activeContainerIdRef.current = null;
 
     const container = containerRef.current;
     if (!container) return;
@@ -1581,6 +1601,9 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
             }
             onRemove={() => removeContainer(c.id)}
             onGenerate={() => handleContainerGenerate(c)}
+            onActivate={() => {
+              activeContainerIdRef.current = c.id;
+            }}
           />
         ))}
 
@@ -2751,7 +2774,8 @@ function ImageNode({
 }
 
 /**
- * 容器边缘/四角拉伸柄：平时隐形热区，悬停淡入紫色指示（与面板拉伸柄同风格）。
+ * 容器边缘/四角拉伸柄：纯隐形热区，仅以光标形状作为反馈
+ * （悬停高亮会遮挡关闭按钮等界面元素，故不做视觉指示）。
  * thickness 为世界坐标值（调用方按 zoom 补偿，保证屏幕热区恒定）。
  */
 function ContainerResizeHandle({
@@ -2763,13 +2787,11 @@ function ContainerResizeHandle({
   thickness: number;
   onDown: (e: React.MouseEvent, dir: string) => void;
 }) {
-  const [hover, setHover] = useState(false);
   const corner = thickness * 2; // 角柄方形热区稍大更好抓
   const style: React.CSSProperties = {
     position: "absolute",
     zIndex: 30,
-    background: hover ? "rgba(196,181,253,0.4)" : "transparent",
-    transition: "background 0.15s ease",
+    background: "transparent",
   };
   if (dir === "n")
     Object.assign(style, { top: -thickness / 2, left: corner, right: corner, height: thickness, cursor: "ns-resize" });
@@ -2787,14 +2809,7 @@ function ContainerResizeHandle({
     Object.assign(style, { bottom: -thickness / 2, right: -thickness / 2, width: corner, height: corner, cursor: "nwse-resize" });
   else if (dir === "sw")
     Object.assign(style, { bottom: -thickness / 2, left: -thickness / 2, width: corner, height: corner, cursor: "nesw-resize" });
-  return (
-    <div
-      style={style}
-      onMouseEnter={() => setHover(true)}
-      onMouseLeave={() => setHover(false)}
-      onMouseDown={(e) => onDown(e, dir)}
-    />
-  );
+  return <div style={style} onMouseDown={(e) => onDown(e, dir)} />;
 }
 
 /**
@@ -2813,6 +2828,7 @@ function PendingContainerNode({
   onRemoveRef,
   onRemove,
   onGenerate,
+  onActivate,
 }: {
   container: PendingContainer;
   nodes: CanvasNode[];
@@ -2826,6 +2842,7 @@ function PendingContainerNode({
   onRemoveRef: (nodeId: string) => void;
   onRemove: () => void;
   onGenerate: () => void;
+  onActivate: () => void;
 }) {
   const refNodes = container.refIds
     .map((rid) => nodes.find((n) => n.id === rid))
@@ -2950,7 +2967,10 @@ function PendingContainerNode({
         transition: "opacity 0.32s ease, transform 0.32s ease",
         pointerEvents: container.exiting ? "none" : "auto",
       }}
-      onMouseDown={(e) => e.stopPropagation()}
+      onMouseDown={(e) => {
+        e.stopPropagation();
+        onActivate();
+      }}
       onContextMenu={(e) => e.preventDefault()}
     >
       {/* 标题栏（拖动手柄） */}
@@ -2973,6 +2993,9 @@ function PendingContainerNode({
           onMouseDown={(e) => e.stopPropagation()}
           title="删除容器"
           style={{
+            // 提升到拉伸柄（zIndex 30）之上：右上角柄不遮挡关闭按钮的点击
+            position: "relative",
+            zIndex: 40,
             width: 28,
             height: 28,
             display: "flex",
