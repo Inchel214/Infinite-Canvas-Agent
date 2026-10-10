@@ -6,6 +6,8 @@ import type { CanvasSummary } from "../types/canvas";
 
 interface CanvasPickerPanelProps {
   currentCanvasId: string | null;
+  // 各画布生图任务状态（红点）：canvas_id -> { generating, pending }，App 轮询维护
+  badges: Record<string, { generating: number; pending: number }>;
   onClose: () => void;
   // 切换到指定画布，返回是否成功
   onSwitch: (id: string) => Promise<boolean>;
@@ -28,6 +30,7 @@ function relTime(ts: number): string {
 
 export function CanvasPickerPanel({
   currentCanvasId,
+  badges,
   onClose,
   onSwitch,
   onCreate,
@@ -235,6 +238,7 @@ export function CanvasPickerPanel({
             const isCurrent = c.canvas_id === currentCanvasId;
             const isRenaming = renamingId === c.canvas_id;
             const isConfirming = confirmDeleteId === c.canvas_id;
+            const badge = badges[c.canvas_id] || { generating: 0, pending: 0 };
             return (
               <div
                 key={c.canvas_id}
@@ -288,17 +292,51 @@ export function CanvasPickerPanel({
                           overflow: "hidden",
                           textOverflow: "ellipsis",
                           whiteSpace: "nowrap",
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 6,
                         }}
                       >
-                        {c.name}
+                        <span
+                          style={{
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                          }}
+                        >
+                          {c.name}
+                        </span>
                         {isCurrent && (
-                          <span style={{ color: "#818cf8", fontSize: 11, marginLeft: 6 }}>
-                            当前
+                          <span style={{ color: "#818cf8", fontSize: 11 }}>当前</span>
+                        )}
+                        {badge.pending > 0 && (
+                          <span
+                            title={`${badge.pending} 张新生成的图片待查看`}
+                            style={{
+                              flexShrink: 0,
+                              minWidth: 16,
+                              height: 16,
+                              padding: "0 4px",
+                              borderRadius: 8,
+                              background: "#e5484d",
+                              color: "#fff",
+                              fontSize: 10,
+                              fontWeight: 600,
+                              lineHeight: "16px",
+                              textAlign: "center",
+                            }}
+                          >
+                            {badge.pending > 99 ? "99+" : badge.pending}
                           </span>
                         )}
                       </div>
                       <div style={{ fontSize: 11, color: "#777", marginTop: 2 }}>
                         {c.node_count} 张图 · {relTime(c.updated_at)}
+                        {badge.generating > 0 && (
+                          <span style={{ color: "#a5b4fc", marginLeft: 6 }}>
+                            · 生成中 {badge.generating} 张…
+                          </span>
+                        )}
                       </div>
                     </>
                   )}

@@ -27,6 +27,10 @@ export interface CanvasSummary {
   name: string;
   node_count: number;
   updated_at: number;
+  /** 进行中生图任务数（后端 tasks 注册表） */
+  generating?: number;
+  /** 未查看的新生成图片数（红点数字） */
+  pending?: number;
 }
 
 export interface AgentStep {

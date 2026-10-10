@@ -94,7 +94,12 @@ def create_canvas():
 
 @router.get("/canvas", summary="列出所有画布摘要")
 def list_canvases():
-    return deps.store.list_canvases()
+    # 合并生图任务状态：前端据此显示画布红点（生成中 / 未查看新图）
+    from app.tools import tasks as task_registry
+
+    return [
+        {**c, **task_registry.summary(c["canvas_id"])} for c in deps.store.list_canvases()
+    ]
 
 
 @router.get("/canvas/{canvas_id}", summary="获取画布状态")
@@ -132,6 +137,10 @@ def delete_canvas(canvas_id: str):
         deps.store.delete_canvas(canvas_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    # 清理该画布的生图任务跟踪（红点状态）
+    from app.tools import tasks as task_registry
+
+    task_registry.drop(canvas_id)
     # 级联清理该画布的 Agent 对话历史
     deps.chat_sessions.delete(canvas_id)
     return {"success": True, "message": "已删除画布"}
@@ -268,6 +277,14 @@ def undo_canvas(canvas_id: str):
         current = deps.store.get_canvas(canvas_id)
         return {"success": False, "message": "无可撤销操作", "canvas": current.to_dict()}
     return {"success": True, "message": "已撤销", "canvas": prev.to_dict()}
+
+
+@router.post("/canvas/{canvas_id}/seen", summary="清除画布未读（切换到该画布时调用）")
+def mark_canvas_seen(canvas_id: str):
+    from app.tools import tasks as task_registry
+
+    task_registry.seen(canvas_id)
+    return {"success": True}
 
 
 @router.post("/canvas/{canvas_id}/arrange", summary="自动整理画布（网格对齐所有图片）")
@@ -444,60 +461,79 @@ def generate_image_stream(canvas_id: str, req: StreamGenRequest):
     gen = deps.manager.generator
 
     def sse():
-        # 流式模式：支持 SSE 的真实 generator 逐预览推送
-        if hasattr(gen, "generate_stream"):
-            yield _sse({"type": "start", "mode": "stream"})
-            try:
-                for evt in gen.generate_stream(
-                    prompt, image_urls=ref_urls, width=width, height=height, size=size
-                ):
-                    if evt["type"] == "preview":
-                        yield _sse(evt)
-                    else:
-                        result = evt["result"]
-                        _add_node(result.image_url, result.width, result.height)
-                        deps.store.save_canvas(state)
-                        yield _sse(
-                            {
-                                "type": "done",
-                                "success": True,
-                                "message": "生成完成",
-                                "canvas": state.to_dict(),
-                            }
-                        )
-                        return
-            except ValueError:
-                # 流式不可用（模型不支持等）→ 回退非流式
-                pass
-            except Exception as e:
-                yield _sse({"type": "done", "success": False, "message": f"生成失败：{e}"})
-                return
+        # 流式路径的任务跟踪：仅跟踪直连 generator 的流式分支；
+        # 估算模式走工具装饰器 tracks_generation 自跟踪，这里不能重复 begin
+        from app.tools import tasks as task_registry
 
-        # 估算模式：无流式能力（Mock / 回退），前端用估算进度条
-        yield _sse({"type": "start", "mode": "estimated"})
-        if req.op == "compose":
-            tool = deps.tool_manager.get("compose_images")
-            result = tool.run(
-                state, node_ids=req.node_ids or [], prompt=req.prompt, size=size, x=req.x, y=req.y
+        # 跟踪哨兵：正常完成/失败/回退时已 end；finally 兜底客户端断开（GeneratorExit）泄漏
+        tracking = {"on": False}
+
+        def _end_tracked(success: bool) -> None:
+            if tracking["on"]:
+                tracking["on"] = False
+                task_registry.end(canvas_id, success=success)
+
+        try:
+            # 流式模式：支持 SSE 的真实 generator 逐预览推送
+            if hasattr(gen, "generate_stream"):
+                task_registry.begin(canvas_id)
+                tracking["on"] = True
+                yield _sse({"type": "start", "mode": "stream"})
+                try:
+                    for evt in gen.generate_stream(
+                        prompt, image_urls=ref_urls, width=width, height=height, size=size
+                    ):
+                        if evt["type"] == "preview":
+                            yield _sse(evt)
+                        else:
+                            result = evt["result"]
+                            _add_node(result.image_url, result.width, result.height)
+                            deps.store.save_canvas(state)
+                            _end_tracked(True)
+                            yield _sse(
+                                {
+                                    "type": "done",
+                                    "success": True,
+                                    "message": "生成完成",
+                                    "canvas": state.to_dict(),
+                                }
+                            )
+                            return
+                except ValueError:
+                    # 流式不可用（模型不支持等）→ 平衡计数后回退非流式（工具装饰器重新跟踪）
+                    _end_tracked(False)
+                except Exception as e:
+                    _end_tracked(False)
+                    yield _sse({"type": "done", "success": False, "message": f"生成失败：{e}"})
+                    return
+
+            # 估算模式：无流式能力（Mock / 回退），前端用估算进度条
+            yield _sse({"type": "start", "mode": "estimated"})
+            if req.op == "compose":
+                tool = deps.tool_manager.get("compose_images")
+                result = tool.run(
+                    state, node_ids=req.node_ids or [], prompt=req.prompt, size=size, x=req.x, y=req.y
+                )
+            elif req.op == "variate":
+                tool = deps.tool_manager.get("variate_image")
+                result = tool.run(
+                    state, node_id=req.node_id or "", prompt=req.prompt, size=size, x=req.x, y=req.y
+                )
+            else:
+                tool = deps.tool_manager.get("generate_image")
+                result = tool.run(state, prompt=prompt, size=size, x=req.x, y=req.y)
+            if result.success:
+                deps.store.save_canvas(result.state)
+            yield _sse(
+                {
+                    "type": "done",
+                    "success": result.success,
+                    "message": result.message,
+                    "canvas": result.state.to_dict(),
+                }
             )
-        elif req.op == "variate":
-            tool = deps.tool_manager.get("variate_image")
-            result = tool.run(
-                state, node_id=req.node_id or "", prompt=req.prompt, size=size, x=req.x, y=req.y
-            )
-        else:
-            tool = deps.tool_manager.get("generate_image")
-            result = tool.run(state, prompt=prompt, size=size, x=req.x, y=req.y)
-        if result.success:
-            deps.store.save_canvas(result.state)
-        yield _sse(
-            {
-                "type": "done",
-                "success": result.success,
-                "message": result.message,
-                "canvas": result.state.to_dict(),
-            }
-        )
+        finally:
+            _end_tracked(False)
 
     return StreamingResponse(sse(), media_type="text/event-stream")
 

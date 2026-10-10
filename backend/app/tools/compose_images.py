@@ -6,7 +6,8 @@ import uuid
 from app.canvas.state import CanvasNode, CanvasState
 from app.image.base import BaseImageGenerator
 from app.tools.base import BaseTool, ToolResult
-from app.tools.layout import next_position
+from app.tools.layout import next_position_near
+from app.tools.tasks import tracks_generation
 
 
 class ComposeImagesTool(BaseTool):
@@ -34,6 +35,7 @@ class ComposeImagesTool(BaseTool):
     def __init__(self, image_generator: BaseImageGenerator):
         self.image_generator = image_generator
 
+    @tracks_generation
     def run(self, state: CanvasState, **kwargs) -> ToolResult:
         node_ids: list[str] = kwargs.get("node_ids", [])
         prompt = kwargs.get("prompt", "")
@@ -49,13 +51,15 @@ class ComposeImagesTool(BaseTool):
                 state=state,
             )
 
-        # 位置：用户指定则用用户值，否则自动布局
+        # 位置：用户指定则用用户值，否则在参考图组包围盒中心附近就近找空白
         width = max(n.width for n in sources)
         height = max(n.height for n in sources)
         x = float(kwargs.get("x", 100))
         y = float(kwargs.get("y", 100))
         if x == 100 and y == 100:
-            x, y = next_position(state, width, height)
+            cx = (min(n.x for n in sources) + max(n.x + n.width for n in sources)) / 2
+            cy = (min(n.y for n in sources) + max(n.y + n.height for n in sources)) / 2
+            x, y = next_position_near(state, width, height, cx, cy)
 
         urls = [n.image_url for n in sources]
 

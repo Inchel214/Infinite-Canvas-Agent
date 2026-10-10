@@ -13,6 +13,8 @@ import {
   deleteNodes,
   generateImage,
   arrangeCanvas,
+  listCanvases,
+  markCanvasSeen,
   getSettings,
   getProviders,
   type AppSettingsData,
@@ -31,6 +33,8 @@ function App() {
   const [showPicker, setShowPicker] = useState(false);
   const [settings, setSettings] = useState<AppSettingsData | null>(null);
   const [providers, setProviders] = useState<Record<string, ProviderPreset>>({});
+  // 各画布生图任务状态（红点）：canvas_id -> { generating, pending }
+  const [badges, setBadges] = useState<Record<string, { generating: number; pending: number }>>({});
   // 守卫用：异步回调校验画布身份时读最新值（不经 React state 闭包）
   const canvasIdRef = useRef<string | null>(null);
 
@@ -56,18 +60,20 @@ function App() {
     setCanvasState(next);
   }, []);
 
-  // 切换到指定画布（画布管理面板调用），返回是否成功
+  // 切换到指定画布（画布管理面板调用），返回是否成功；切换 = 打开会话，清除该画布未读红点
   const switchCanvas = useCallback(async (id: string): Promise<boolean> => {
     try {
       const state = await getCanvas(id);
       applyCanvasId(id, state);
+      markCanvasSeen(id);
+      setBadges((prev) => ({ ...prev, [id]: { generating: prev[id]?.generating ?? 0, pending: 0 } }));
       return true;
     } catch {
       return false;
     }
   }, [applyCanvasId]);
 
-  // 新建画布并切换过去，返回新画布 id（失败返回 null）
+  // 新建画布并切换过去，返回新画布 id（失败 null）
   const createNewCanvas = useCallback(async (): Promise<string | null> => {
     try {
       const id = await createCanvas();
@@ -121,6 +127,40 @@ function App() {
       }
     })();
   }, []);
+
+  // 红点轮询：定期拉取各画布生图状态（生成中/未读新图）。
+  // 当前画布的 pending 静默清除（用户正看着，不产生"未读"）
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const list = await listCanvases();
+        if (cancelled) return;
+        const next: Record<string, { generating: number; pending: number }> = {};
+        for (const c of list) {
+          next[c.canvas_id] = { generating: c.generating ?? 0, pending: c.pending ?? 0 };
+        }
+        // 当前画布的未读静默清掉（用户就在这个画布上），本地同步置零避免红点闪烁
+        const currentId = canvasIdRef.current;
+        if (currentId && next[currentId]) {
+          if (next[currentId].pending > 0) markCanvasSeen(currentId);
+          next[currentId] = { ...next[currentId], pending: 0 };
+        }
+        setBadges(next);
+      } catch {
+        // 后端未启动时静默失败，下轮重试
+      }
+    };
+    void poll();
+    const timer = window.setInterval(poll, 2500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  // 顶栏红点总数：未查看的新图（生成中不算未读，只算状态提示）
+  const totalPending = Object.values(badges).reduce((s, b) => s + b.pending, 0);
 
   // 服务商显示名（徽标用）
   const providerName = (key: string): string =>
@@ -238,7 +278,31 @@ function App() {
           }}
           title="切换 / 新建 / 管理画布"
         >
-          <span style={{ fontSize: 15 }}>🗂</span>
+          <span style={{ fontSize: 15, position: "relative" }}>
+            🗂
+            {totalPending > 0 && (
+              <span
+                style={{
+                  position: "absolute",
+                  top: -4,
+                  right: -8,
+                  minWidth: 16,
+                  height: 16,
+                  padding: "0 4px",
+                  borderRadius: 8,
+                  background: "#e5484d",
+                  color: "#fff",
+                  fontSize: 10,
+                  fontWeight: 600,
+                  lineHeight: "16px",
+                  textAlign: "center",
+                  boxShadow: "0 0 4px rgba(229,72,77,0.6)",
+                }}
+              >
+                {totalPending > 99 ? "99+" : totalPending}
+              </span>
+            )}
+          </span>
           <span
             style={{
               overflow: "hidden",
@@ -307,6 +371,7 @@ function App() {
       {showPicker && (
         <CanvasPickerPanel
           currentCanvasId={canvasId}
+          badges={badges}
           onClose={() => setShowPicker(false)}
           onSwitch={switchCanvas}
           onCreate={createNewCanvas}

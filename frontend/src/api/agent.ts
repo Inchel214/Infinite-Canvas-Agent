@@ -310,6 +310,15 @@ export async function listCanvases(): Promise<CanvasSummary[]> {
   return res.json();
 }
 
+// 清除画布未读红点（切换到该画布 = 打开会话）
+export async function markCanvasSeen(canvasId: string): Promise<void> {
+  try {
+    await fetch(`${API_BASE}/canvas/${canvasId}/seen`, { method: "POST" });
+  } catch {
+    // 静默失败：红点下次轮询自然刷新
+  }
+}
+
 export async function renameCanvas(
   canvasId: string,
   name: string
