@@ -5,7 +5,7 @@ import json
 from dataclasses import dataclass, field
 
 from app.agent.llm import BaseLLM, LLMResponse, ToolCall
-from app.agent.prompts import SYSTEM_PROMPT
+from app.agent.prompts import build_system_prompt
 from app.canvas.state import CanvasState
 from app.canvas.store import BaseStore
 from app.tools.base import ToolManager, ToolResult
@@ -44,7 +44,7 @@ class ReActAgent:
         state = self.store.get_canvas(canvas_id)
         # system + 历史对话 + 当前用户消息（当前消息每步重建画布状态）
         messages: list[dict] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": build_system_prompt()},  # 热加载风格库目录
             *(history or []),
         ]
         user_msg_index = len(messages)

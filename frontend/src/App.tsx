@@ -7,6 +7,7 @@ import {
   createCanvas,
   getCanvas,
   updateNodePosition,
+  moveNodes,
   composeImages,
   variateImage,
   editImage,
@@ -174,23 +175,23 @@ function App() {
     try {
       if (action.type === "compose") {
         // 进行中状态显示在被操作图片的边界框上（Canvas processing），顶部不再提示
-        const res = await composeImages(canvasId, action.nodeIds, action.prompt, action.size, action.x, action.y);
+        const res = await composeImages(canvasId, action.nodeIds, action.prompt, action.size, action.x, action.y, action.experienceId);
         applyCanvasState(res.canvas);
         setStatusMsg(res.message);
         return res.success;
       } else if (action.type === "variate") {
-        const res = await variateImage(canvasId, action.nodeId, action.prompt, action.size, action.x, action.y);
+        const res = await variateImage(canvasId, action.nodeId, action.prompt, action.size, action.x, action.y, action.experienceId);
         applyCanvasState(res.canvas);
         setStatusMsg(res.message);
         return res.success;
       } else if (action.type === "edit") {
-        const res = await editImage(canvasId, action.nodeId, action.prompt, action.size, action.x, action.y);
+        const res = await editImage(canvasId, action.nodeId, action.prompt, action.size, action.x, action.y, action.experienceId);
         applyCanvasState(res.canvas);
         setStatusMsg(res.message);
         return res.success;
       } else if (action.type === "generate") {
         setStatusMsg("正在生成图片...");
-        const res = await generateImage(canvasId, action.prompt, action.size, action.x, action.y);
+        const res = await generateImage(canvasId, action.prompt, action.size, action.x, action.y, action.experienceId);
         applyCanvasState(res.canvas);
         setStatusMsg(res.message);
         return res.success;
@@ -237,6 +238,15 @@ function App() {
           if (!canvasId) return;
           try {
             const newCanvas = await updateNodePosition(canvasId, nodeId, x, y);
+            applyCanvasState(newCanvas);
+          } catch {
+            // 静默失败，不影响用户操作
+          }
+        }}
+        onNodesMoved={async (moves) => {
+          if (!canvasId || moves.length === 0) return;
+          try {
+            const newCanvas = await moveNodes(canvasId, moves);
             applyCanvasState(newCanvas);
           } catch {
             // 静默失败，不影响用户操作

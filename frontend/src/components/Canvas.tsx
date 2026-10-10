@@ -1,13 +1,13 @@
 import { useEffect, useRef, useCallback, useState } from "react";
 import type { CanvasState, CanvasNode } from "../types/canvas";
-import { generateImageStream, uploadImageNode, cloneNode, undoCanvas } from "../api/agent";
+import { generateImageStream, uploadImageNode, cloneNode, undoCanvas, listExperiences, type ExperienceMeta } from "../api/agent";
 
-// 右键菜单可触发的操作类型
+// 右键菜单可触发的操作类型（experienceId：风格库选中的风格，直连生图时后端确定性拼接）
 export type CanvasAction =
-  | { type: "compose"; nodeIds: string[]; prompt: string; size: string; x?: number; y?: number }
-  | { type: "variate"; nodeId: string; prompt: string; size: string; x?: number; y?: number }
-  | { type: "edit"; nodeId: string; prompt: string; size: string; x?: number; y?: number }
-  | { type: "generate"; prompt: string; size: string; x: number; y: number }
+  | { type: "compose"; nodeIds: string[]; prompt: string; size: string; x?: number; y?: number; experienceId?: string }
+  | { type: "variate"; nodeId: string; prompt: string; size: string; x?: number; y?: number; experienceId?: string }
+  | { type: "edit"; nodeId: string; prompt: string; size: string; x?: number; y?: number; experienceId?: string }
+  | { type: "generate"; prompt: string; size: string; x: number; y: number; experienceId?: string }
   | { type: "delete"; nodeIds: string[] }
   | { type: "arrange" };
 
@@ -22,6 +22,7 @@ export type PendingContainer = {
   resolution: string;
   prompt: string;
   refIds: string[];     // 连线进来的参考图节点 ID
+  experienceId?: string; // 风格库选中的风格
   error?: string;       // 生成失败提示
   previewUrl?: string;  // 流式生成的中间预览图
   exiting?: boolean;    // 生成完成后正在退场（淡出中）
@@ -246,6 +247,7 @@ type EditPanelState = {
   prompt: string;
   aspect: string;
   resolution: string;
+  experienceId?: string; // 风格库选中的风格
 };
 
 interface CanvasProps {
@@ -253,6 +255,8 @@ interface CanvasProps {
   canvasId: string | null;
   busy?: boolean;
   onNodeMoved?: (nodeId: string, x: number, y: number) => void;
+  // 多选整组拖拽结束：一次性提交所有节点的新位置（后端单次保存 = 单次撤销）
+  onNodesMoved?: (moves: { nodeId: string; x: number; y: number }[]) => void;
   onAction?: (action: CanvasAction) => boolean | void | Promise<boolean | void>;
   onCanvasUpdate?: (state: CanvasState) => void;
 }
@@ -263,7 +267,7 @@ interface CanvasProps {
  * 多选：单击/Ctrl+Shift+点选、空白直接拖动框选、右键菜单直接生成
  * 平移：空格+拖动 / Shift+拖动 / 鼠标中键拖动
  */
-export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onCanvasUpdate }: CanvasProps) {
+export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved, onAction, onCanvasUpdate }: CanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [zoom, setZoom] = useState(0.5);
@@ -302,6 +306,9 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
   const [hoveredNode, setHoveredNode] = useState<string | null>(null);
   // 本地位置覆盖（拖拽时即时更新，不等待 API）
   const [localOverrides, setLocalOverrides] = useState<Record<string, { x: number; y: number }>>({});
+  // 多选整组拖拽：按下多选集合内的图时，记录所有选中节点的原始位置 + 鼠标世界坐标起点
+  const dragGroupOriginsRef = useRef<Record<string, { x: number; y: number }> | null>(null);
+  const dragGroupStartRef = useRef<{ x: number; y: number } | null>(null);
 
   // ===== 多选 / 框选 / 右键菜单 =====
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -311,6 +318,29 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
   // 尺寸选择（宽高比 + 分辨率档位）
   const [aspect, setAspect] = useState<string>("1:1");
   const [resolution, setResolution] = useState<string>("2K");
+
+  // ===== 风格库（经验文档）：直连生图面板可选风格，后端确定性拼接 =====
+  const [experiences, setExperiences] = useState<ExperienceMeta[]>([]);
+  const [menuStyleId, setMenuStyleId] = useState<string>(""); // 右键菜单 compose/variate 输入面板选中
+  const refreshExperiences = useCallback(() => {
+    listExperiences()
+      .then((list) => setExperiences(list))
+      .catch(() => {
+        // 后端不可用时静默忽略（风格下拉退化为"无"）
+      });
+  }, []);
+  // 挂载时 + 每次打开右键菜单时刷新（设置面板导入新风格后立即可选）
+  useEffect(() => {
+    refreshExperiences();
+  }, [refreshExperiences]);
+  useEffect(() => {
+    if (menu) refreshExperiences();
+  }, [menu, refreshExperiences]);
+  // 风格名查找（占位框提示用）
+  const styleNameById = useCallback(
+    (id: string | undefined) => (id ? experiences.find((e) => e.id === id)?.name : undefined),
+    [experiences]
+  );
 
   // ===== 编辑图片框（独立于右键菜单，可与普通菜单并存） =====
   const [editPanel, setEditPanel] = useState<EditPanelState | null>(null);
@@ -846,13 +876,26 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
       const mouseY = e.clientY - rect.top;
       const worldX = (mouseX - pan.x) / zoom;
       const worldY = (mouseY - pan.y) / zoom;
-      setLocalOverrides((prev) => ({
-        ...prev,
-        [draggingNode]: {
-          x: worldX - dragOffset.x,
-          y: worldY - dragOffset.y,
-        },
-      }));
+      const groupOrigins = dragGroupOriginsRef.current;
+      const groupStart = dragGroupStartRef.current;
+      if (groupOrigins && groupStart) {
+        // 多选整组拖拽：所有选中节点按相同位移平移，保持相对布局
+        const dx = worldX - groupStart.x;
+        const dy = worldY - groupStart.y;
+        const next: Record<string, { x: number; y: number }> = {};
+        for (const [id, orig] of Object.entries(groupOrigins)) {
+          next[id] = { x: orig.x + dx, y: orig.y + dy };
+        }
+        setLocalOverrides((prev) => ({ ...prev, ...next }));
+      } else {
+        setLocalOverrides((prev) => ({
+          ...prev,
+          [draggingNode]: {
+            x: worldX - dragOffset.x,
+            y: worldY - dragOffset.y,
+          },
+        }));
+      }
     } else if (isPanning) {
       // rAF 合帧：一帧内多次 mousemove 合并为一次 setPan，避免高频重渲染
       panRafData.current.dx = e.clientX - panStart.current.x;
@@ -927,10 +970,23 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
 
       if (moved) {
         // 真正的拖拽：通知后端
-        const pos = localOverrides[draggingNode];
-        if (pos && onNodeMoved) {
-          onNodeMoved(draggingNode, pos.x, pos.y);
+        const groupOrigins = dragGroupOriginsRef.current;
+        if (groupOrigins) {
+          // 多选整组拖拽：一次性批量提交（后端单次保存 = 单次撤销）
+          const moves: { nodeId: string; x: number; y: number }[] = [];
+          for (const id of Object.keys(groupOrigins)) {
+            const pos = localOverrides[id];
+            if (pos) moves.push({ nodeId: id, x: pos.x, y: pos.y });
+          }
+          if (moves.length > 0) onNodesMoved?.(moves);
+        } else {
+          const pos = localOverrides[draggingNode];
+          if (pos && onNodeMoved) {
+            onNodeMoved(draggingNode, pos.x, pos.y);
+          }
         }
+        dragGroupOriginsRef.current = null;
+        dragGroupStartRef.current = null;
       } else {
         // click（位移 < 4px）：处理选择
         const nodeId = draggingNode;
@@ -964,7 +1020,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
       backgroundDownRef.current = null;
       setIsPanning(false);
     }
-  }, [marquee, draggingNode, localOverrides, onNodeMoved, isPanning, pan, zoom, nodes, connecting, containers, updateContainer, screenToWorld, draggingContainer, createContainer, menu]);
+  }, [marquee, draggingNode, localOverrides, onNodeMoved, onNodesMoved, isPanning, pan, zoom, nodes, connecting, containers, updateContainer, screenToWorld, draggingContainer, createContainer, menu]);
 
   // 图片节点拖拽开始（记录起点用于 click/drag 判定）
   const handleNodeMouseDown = useCallback((e: React.MouseEvent, node: CanvasNode) => {
@@ -988,8 +1044,20 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
       x: worldX - node.x,
       y: worldY - node.y,
     });
+    // 按在多选集合内的图上：整组一起拖（所有选中节点保持相对位置同步平移）
+    if (selectedIds.has(node.id) && selectedIds.size > 1) {
+      const origs: Record<string, { x: number; y: number }> = {};
+      for (const n of nodes) {
+        if (selectedIds.has(n.id)) origs[n.id] = { x: n.x, y: n.y };
+      }
+      dragGroupOriginsRef.current = origs;
+      dragGroupStartRef.current = { x: worldX, y: worldY };
+    } else {
+      dragGroupOriginsRef.current = null;
+      dragGroupStartRef.current = null;
+    }
     setDraggingNode(node.id);
-  }, [pan, zoom]);
+  }, [pan, zoom, selectedIds, nodes]);
 
   // 图片右键：选中（若未选中）并打开普通菜单
   // 编辑框若已打开则保持不变，右键其它图片正常弹出普通菜单（两者并存）
@@ -1085,19 +1153,21 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
     if (menu.mode === "compose" && ids.length >= 2) {
       setMenu(null);
       setPromptInput("");
-      setProcessingBox({ ...box, label: `正在组合 ${ids.length} 张图片...` });
+      const sname = styleNameById(menuStyleId);
+      setProcessingBox({ ...box, label: sname ? `正在按《${sname}》组合...` : `正在组合 ${ids.length} 张图片...` });
       Promise.resolve(
-        onAction({ type: "compose", nodeIds: ids, prompt, size, x: box.x, y: box.y })
+        onAction({ type: "compose", nodeIds: ids, prompt, size, x: box.x, y: box.y, experienceId: menuStyleId || undefined })
       ).finally(() => setProcessingBox(null));
     } else if (menu.mode === "variate" && ids.length === 1) {
       setMenu(null);
       setPromptInput("");
-      setProcessingBox({ ...box, label: "正在生成变体..." });
+      const sname = styleNameById(menuStyleId);
+      setProcessingBox({ ...box, label: sname ? `正在按《${sname}》生成变体...` : "正在生成变体..." });
       Promise.resolve(
-        onAction({ type: "variate", nodeId: ids[0], prompt, size, x: box.x, y: box.y })
+        onAction({ type: "variate", nodeId: ids[0], prompt, size, x: box.x, y: box.y, experienceId: menuStyleId || undefined })
       ).finally(() => setProcessingBox(null));
     }
-  }, [onAction, menu, selectedIds, nodes, promptInput, aspect, resolution, buildProcessingBox]);
+  }, [onAction, menu, selectedIds, nodes, promptInput, aspect, resolution, buildProcessingBox, menuStyleId, styleNameById]);
 
   // 编辑框执行：使用编辑框自身的 nodeId 和 prompt（不依赖菜单/选中状态）
   // 点生成 → 面板关闭 → 在新图位置（原图右侧）画占位框显示"正在编辑图片..."
@@ -1109,12 +1179,14 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
     const node = nodes.find((n) => n.id === editPanel.nodeId);
     if (!node) return;
     const box = buildProcessingBox(editPanel.aspect, [node]);
+    const sname = styleNameById(editPanel.experienceId);
+    const expId = editPanel.experienceId;
     setEditPanel(null);
-    setProcessingBox({ ...box, label: "正在编辑图片..." });
+    setProcessingBox({ ...box, label: sname ? `正在按《${sname}》编辑图片...` : "正在编辑图片..." });
     Promise.resolve(
-      onAction({ type: "edit", nodeId: node.id, prompt, size, x: box.x, y: box.y })
+      onAction({ type: "edit", nodeId: node.id, prompt, size, x: box.x, y: box.y, experienceId: expId || undefined })
     ).finally(() => setProcessingBox(null));
-  }, [onAction, editPanel, nodes, buildProcessingBox]);
+  }, [onAction, editPanel, nodes, buildProcessingBox, styleNameById]);
 
   const handleDelete = useCallback(() => {
     if (!onAction || selectedIds.size === 0) return;
@@ -1135,20 +1207,32 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
   }, [selectedIds, nodes]);
 
   // 另存为：优先用 File System Access API（弹「保存到…」对话框，可选桌面等任意文件夹），
-  // 不支持/失败时回退普通下载。浏览器剪贴板不允许写「文件引用」格式，
-  // 所以无法直接 Ctrl+V 粘到文件管理器，保存对话框是最接近原生的体验。
+  // 不支持/失败时回退普通下载。两个关键点：
+  // 1. showSaveFilePicker 要求点击后的"瞬态激活"窗口内调用——必须先弹框、后 fetch 图片，
+  //    否则慢 fetch 会把激活拖过期，保存框永远弹不出来（直接静默下载）；
+  // 2. 若上一个保存框未正常结算（被遮挡/失焦），浏览器会拒绝后续所有弹框请求（AbortError），
+  //    此处必须给出可见提示而不是静默返回，刷新页面可恢复。
   const handleSaveImage = useCallback(async () => {
     const id = [...selectedIds][0];
     const node = nodes.find((n) => n.id === id);
     setMenu(null);
     if (!node?.image_url) return;
-    const filename = `canvas-${node.id.slice(0, 8)}.png`;
-    let blob: Blob;
-    try {
-      blob = await (await fetch(node.image_url)).blob();
-    } catch {
-      return;
-    }
+
+    const showMsg = (msg: string) => {
+      setLocalStatusMsg(msg);
+      setTimeout(() => setLocalStatusMsg(null), 2200);
+    };
+
+    // 从 URL 扩展名推断文件名与类型（弹框前就能确定，不依赖 blob.type）
+    const ext = node.image_url.split("?")[0].split(".").pop()?.toLowerCase() ?? "png";
+    const safeExt = ["png", "jpg", "jpeg", "webp", "gif"].includes(ext) ? ext : "png";
+    const mime =
+      safeExt === "png" ? "image/png"
+      : safeExt === "gif" ? "image/gif"
+      : safeExt === "webp" ? "image/webp"
+      : "image/jpeg";
+    const filename = `canvas-${node.id.slice(0, 8)}.${safeExt}`;
+
     const w = window as unknown as {
       showSaveFilePicker?: (opts?: object) => Promise<{
         createWritable: () => Promise<{ write: (b: Blob) => Promise<void>; close: () => Promise<void> }>;
@@ -1156,19 +1240,43 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
     };
     if (w.showSaveFilePicker) {
       try {
+        // 1. 先弹保存框（此刻点击激活必定有效，不受 fetch 快慢影响）
         const handle = await w.showSaveFilePicker({
           suggestedName: filename,
-          types: [{ description: "图片", accept: { [blob.type || "image/png"]: [".png", ".jpg", ".jpeg"] } }],
+          types: [{ description: "图片", accept: { [mime]: [`.${safeExt}`] } }],
         });
+        // 2. 用户选好位置后再取图写盘（fetch 不需要用户激活）
+        let blob: Blob;
+        try {
+          blob = await (await fetch(node.image_url)).blob();
+        } catch {
+          showMsg("图片加载失败，无法保存");
+          return;
+        }
         const ws = await handle.createWritable();
-        await ws.write(blob);
-        await ws.close();
+        try {
+          await ws.write(blob);
+        } finally {
+          await ws.close(); // 写入失败也必须释放文件锁，否则同名文件再也存不进
+        }
         return;
       } catch (e) {
         const err = e as { name?: string };
-        if (err?.name === "AbortError") return; // 用户取消
-        // 其他错误（权限等）回退下载
+        if (err?.name === "AbortError") {
+          // 真取消 / 上一个保存框还没关闭（浏览器会拒绝重复弹框）——给可见反馈，不再静默
+          showMsg("已取消保存");
+          return;
+        }
+        // 其他错误（权限等）走下方回退下载
       }
+    }
+    // 回退：普通下载（不弹保存框，文件进入浏览器下载文件夹）
+    let blob: Blob;
+    try {
+      blob = await (await fetch(node.image_url)).blob();
+    } catch {
+      showMsg("图片加载失败，无法保存");
+      return;
     }
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
@@ -1177,6 +1285,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
     a.click();
     a.remove();
     URL.revokeObjectURL(a.href);
+    showMsg("已下载到浏览器下载文件夹");
   }, [selectedIds, nodes]);
 
   // 空白右键：打开「新建容器」菜单
@@ -1238,6 +1347,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
             y: c.y,
             node_id: op === "variate" ? c.refIds[0] : undefined,
             node_ids: op === "compose" ? c.refIds : undefined,
+            experience_id: c.experienceId || undefined,
           },
           {
             onStart: (mode) => {
@@ -1372,6 +1482,9 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
           box-shadow: 0 0 10px rgba(99,102,241,.55);
         }
         .ica-fitview-btn:active { transform: scale(0.95); }
+        /* 风格下拉：原生 select 的选项列表由系统渲染，需全局样式改深色（与设置面板一致） */
+        .ic-select { appearance: none; -webkit-appearance: none; cursor: pointer; }
+        .ic-select option { background: #26264a; color: #eee; }
       `}</style>
       {/* 网格背景 */}
       <div
@@ -1588,6 +1701,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
             isDragActive={draggingContainer?.id === c.id}
             isConnectTarget={!!connecting}
             progress={generatingContainerId === c.id ? genProgress : 0}
+            experiences={experiences}
             onHeaderMouseDown={(e) => {
               if (e.button !== 0) return;
               e.stopPropagation();
@@ -1717,6 +1831,9 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
           resolution={resolution}
           onAspectChange={setAspect}
           onResolutionChange={setResolution}
+          experiences={experiences}
+          styleId={menuStyleId}
+          onStyleChange={setMenuStyleId}
           onMenuAction={handleMenuAction}
           onExecute={handleExecute}
           onDelete={handleDelete}
@@ -1742,6 +1859,9 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
           resolution={editPanel.resolution}
           onAspectChange={(v) => setEditPanel((p) => (p ? { ...p, aspect: v } : p))}
           onResolutionChange={(v) => setEditPanel((p) => (p ? { ...p, resolution: v } : p))}
+          experiences={experiences}
+          styleId={editPanel.experienceId ?? ""}
+          onStyleChange={(v) => setEditPanel((p) => (p ? { ...p, experienceId: v || undefined } : p))}
           onExecute={handleEditPanelExecute}
           onClose={() => setEditPanel(null)}
           onMove={(nx, ny) => setEditPanel((p) => (p ? { ...p, x: nx, y: ny } : p))}
@@ -1928,6 +2048,48 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onAction, onC
   );
 }
 
+// 风格下拉（风格库为空时隐藏；深色底浅字，选中后把风格全文拼接进生成提示词）
+function StyleSelect({
+  experiences,
+  value,
+  onChange,
+}: {
+  experiences: ExperienceMeta[];
+  value: string;
+  onChange: (v: string) => void;
+}) {
+  if (experiences.length === 0) return null;
+  return (
+    <div style={{ marginTop: 8 }}>
+      <div style={{ fontSize: 13, color: "rgba(255,255,255,0.6)", marginBottom: 4 }}>风格</div>
+      <select
+        className="ic-select"
+        style={{
+          width: "100%",
+          boxSizing: "border-box",
+          background: "rgba(255,255,255,0.06)",
+          border: "1px solid rgba(255,255,255,0.12)",
+          borderRadius: 6,
+          color: "#eee",
+          fontSize: 13,
+          padding: "7px 10px",
+          outline: "none",
+        }}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        title="选中后，该风格指南全文会拼接进生成提示词"
+      >
+        <option value="">无（自由发挥）</option>
+        {experiences.map((e) => (
+          <option key={e.id} value={e.id}>
+            {e.name}
+          </option>
+        ))}
+      </select>
+    </div>
+  );
+}
+
 /**
  * 右键上下文菜单：操作列表 / prompt 输入框两种形态
  */
@@ -1944,6 +2106,9 @@ const ContextMenu = ({
   resolution,
   onAspectChange,
   onResolutionChange,
+  experiences,
+  styleId,
+  onStyleChange,
   onMenuAction,
   onExecute,
   onDelete,
@@ -1964,6 +2129,9 @@ const ContextMenu = ({
   resolution: string;
   onAspectChange: (v: string) => void;
   onResolutionChange: (v: string) => void;
+  experiences: ExperienceMeta[];
+  styleId: string;
+  onStyleChange: (v: string) => void;
   onMenuAction: (mode: "compose" | "variate" | "edit") => void;
   onExecute: () => void;
   onDelete: () => void;
@@ -2217,6 +2385,9 @@ const ContextMenu = ({
             </div>
           </div>
 
+          {/* 风格选择（风格库为空时隐藏） */}
+          <StyleSelect experiences={experiences} value={styleId} onChange={onStyleChange} />
+
           <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
             <button
               onClick={onExecute}
@@ -2271,6 +2442,9 @@ const EditPanel = ({
   resolution,
   onAspectChange,
   onResolutionChange,
+  experiences,
+  styleId,
+  onStyleChange,
   onExecute,
   onClose,
   onMove,
@@ -2286,6 +2460,9 @@ const EditPanel = ({
   resolution: string;
   onAspectChange: (v: string) => void;
   onResolutionChange: (v: string) => void;
+  experiences: ExperienceMeta[];
+  styleId: string;
+  onStyleChange: (v: string) => void;
   onExecute: () => void;
   onClose: () => void;
   onMove: (x: number, y: number) => void;
@@ -2522,6 +2699,9 @@ const EditPanel = ({
             ))}
           </div>
         </div>
+
+        {/* 风格选择（风格库为空时隐藏） */}
+        <StyleSelect experiences={experiences} value={styleId} onChange={onStyleChange} />
 
         <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
           <button
@@ -2823,6 +3003,7 @@ function PendingContainerNode({
   isDragActive,
   isConnectTarget,
   progress,
+  experiences,
   onHeaderMouseDown,
   onChange,
   onRemoveRef,
@@ -2837,6 +3018,7 @@ function PendingContainerNode({
   isDragActive: boolean;
   isConnectTarget: boolean;
   progress: number;
+  experiences: ExperienceMeta[];
   onHeaderMouseDown: (e: React.MouseEvent) => void;
   onChange: (patch: Partial<PendingContainer>) => void;
   onRemoveRef: (nodeId: string) => void;
@@ -3130,6 +3312,13 @@ function PendingContainerNode({
           ))}
         </div>
       </div>
+
+      {/* 风格选择（风格库为空时隐藏） */}
+      <StyleSelect
+        experiences={experiences}
+        value={container.experienceId ?? ""}
+        onChange={(v) => onChange({ experienceId: v || undefined })}
+      />
 
       {/* 描述 */}
       <textarea

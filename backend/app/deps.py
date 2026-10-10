@@ -15,6 +15,7 @@ from app.tools.edit_image import EditImageTool
 from app.tools.generate_image import GenerateImageTool
 from app.tools.list_nodes import ListNodesTool
 from app.tools.move_node import MoveNodeTool
+from app.tools.read_experience import ReadExperienceTool
 from app.tools.variate_image import VariateImageTool
 
 # 单例组件：文件持久化存储，刷新/重启后画布状态不丢
@@ -36,6 +37,8 @@ tool_manager.register(ComposeImagesTool(GeneratorProxy(manager)))
 tool_manager.register(MoveNodeTool())
 tool_manager.register(DeleteNodeTool())
 tool_manager.register(ListNodesTool())
+# 风格库读取（Agent 按需读风格指南全文）
+tool_manager.register(ReadExperienceTool())
 
 agent = ReActAgent(
     llm=LLMProxy(manager),
