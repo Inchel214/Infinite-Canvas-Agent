@@ -39,6 +39,34 @@ const ASPECT_RATIOS = [
 
 const RESOLUTIONS = ["1K", "2K", "4K"] as const;
 
+// 下载前必须拿到完整的图片 Blob。短暂的本地后端抖动会自动重试，
+// 且空响应/错误页不会被当成图片写入磁盘。
+async function fetchImageBlob(url: string, attempts = 3): Promise<Blob> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      const response = await fetch(url, { cache: attempt === 0 ? "default" : "reload" });
+      if (!response.ok) {
+        throw new Error(`图片请求失败 (${response.status})`);
+      }
+      const blob = await response.blob();
+      if (blob.size === 0) {
+        throw new Error("图片内容为空");
+      }
+      if (blob.type && !blob.type.startsWith("image/")) {
+        throw new Error(`返回内容不是图片 (${blob.type})`);
+      }
+      return blob;
+    } catch (error) {
+      lastError = error;
+      if (attempt + 1 < attempts) {
+        await new Promise((resolve) => window.setTimeout(resolve, 180 * (attempt + 1)));
+      }
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error("图片加载失败");
+}
+
 // 容器外框尺寸：外矩形直接呈现待生成图片的形状比例（替代内部尺寸预览框）
 // 横型比例：高度贴内容最小高，宽度按比例放大；竖型比例：宽度贴内容最小宽，高度按比例放大
 const CONTAINER_MIN_W = 300; // 控件（按钮/输入框）所需最小宽度
@@ -1235,7 +1263,11 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
 
     const w = window as unknown as {
       showSaveFilePicker?: (opts?: object) => Promise<{
-        createWritable: () => Promise<{ write: (b: Blob) => Promise<void>; close: () => Promise<void> }>;
+        createWritable: () => Promise<{
+          write: (b: Blob) => Promise<void>;
+          close: () => Promise<void>;
+          abort?: () => Promise<void>;
+        }>;
       }>;
     };
     if (w.showSaveFilePicker) {
@@ -1248,7 +1280,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         // 2. 用户选好位置后再取图写盘（fetch 不需要用户激活）
         let blob: Blob;
         try {
-          blob = await (await fetch(node.image_url)).blob();
+          blob = await fetchImageBlob(node.image_url);
         } catch {
           showMsg("图片加载失败，无法保存");
           return;
@@ -1256,8 +1288,17 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         const ws = await handle.createWritable();
         try {
           await ws.write(blob);
-        } finally {
-          await ws.close(); // 写入失败也必须释放文件锁，否则同名文件再也存不进
+          // 只有完整写入后才 close 并提交文件；写入失败时 close 会把空临时文件提交到磁盘。
+          await ws.close();
+          showMsg("图片已保存");
+        } catch (error) {
+          // abort 会丢弃未提交写入，也不会覆盖已有文件。
+          try {
+            await ws.abort?.();
+          } catch {
+            // 保留原始写入错误，下方回退到普通下载。
+          }
+          throw error;
         }
         return;
       } catch (e) {
@@ -1273,7 +1314,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     // 回退：普通下载（不弹保存框，文件进入浏览器下载文件夹）
     let blob: Blob;
     try {
-      blob = await (await fetch(node.image_url)).blob();
+      blob = await fetchImageBlob(node.image_url);
     } catch {
       showMsg("图片加载失败，无法保存");
       return;
@@ -1284,7 +1325,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     document.body.appendChild(a);
     a.click();
     a.remove();
-    URL.revokeObjectURL(a.href);
+    // 下载由浏览器异步读取 Blob URL；立即 revoke 会在部分浏览器中竞态生成 0 字节文件。
+    window.setTimeout(() => URL.revokeObjectURL(a.href), 60_000);
     showMsg("已下载到浏览器下载文件夹");
   }, [selectedIds, nodes]);
 
