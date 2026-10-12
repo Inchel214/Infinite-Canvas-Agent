@@ -14,9 +14,9 @@ export type CanvasAction =
 // 待生成图片容器（右键空白创建，接收连线作为参考图）
 export type PendingContainer = {
   id: string;
-  x: number;            // 世界坐标
+  x: number;            // 世界坐标（左上角）
   y: number;
-  w: number;            // 世界宽（创建时按缩放补偿，可手动拉伸）
+  w: number;            // 世界宽（创建时按 1/zoom 换算，屏幕上恒为基准大小）
   h: number;            // 世界高
   aspect: string;
   resolution: string;
@@ -67,39 +67,11 @@ async function fetchImageBlob(url: string, attempts = 3): Promise<Blob> {
   throw lastError instanceof Error ? lastError : new Error("图片加载失败");
 }
 
-// 容器外框尺寸：外矩形直接呈现待生成图片的形状比例（替代内部尺寸预览框）
-// 横型比例：高度贴内容最小高，宽度按比例放大；竖型比例：宽度贴内容最小宽，高度按比例放大
-const CONTAINER_MIN_W = 300; // 控件（按钮/输入框）所需最小宽度
-const CONTAINER_MIN_H = 360; // 控件所需最小高度
-
-function containerOuterSize(aspectKey: string): { w: number; h: number } {
-  const ratio = ASPECT_RATIOS.find((r) => r.key === aspectKey) ?? ASPECT_RATIOS[0];
-  if (ratio.w >= ratio.h) {
-    const h = CONTAINER_MIN_H;
-    return { w: Math.round((h * ratio.w) / ratio.h), h };
-  }
-  const w = CONTAINER_MIN_W;
-  return { w, h: Math.round((w * ratio.h) / ratio.w) };
-}
-
-// 创建容器时的尺寸（与相机视觉自适应）：zoom < 1 时按 1/zoom 放大世界尺寸，
-// 保证画布缩小查看时容器在屏幕上仍有基准大小、控件可交互；zoom >= 1 保持基准
-function containerCreateSize(aspectKey: string, zoom: number): { w: number; h: number } {
-  const base = containerOuterSize(aspectKey);
-  const k = 1 / Math.min(1, zoom);
-  return { w: Math.round(base.w * k), h: Math.round(base.h * k) };
-}
-
-// 切换宽高比时保持容器当前整体缩放（含相机自适应与手动拉伸），仅形状随新比例变化
-function containerSizeForAspect(
-  c: { w: number; h: number; aspect: string },
-  nextAspect: string
-): { w: number; h: number } {
-  const oldBase = containerOuterSize(c.aspect);
-  const newBase = containerOuterSize(nextAspect);
-  const scale = Math.max(c.w / oldBase.w, c.h / oldBase.h);
-  return { w: Math.round(newBase.w * scale), h: Math.round(newBase.h * scale) };
-}
+// 容器面板基准尺寸（屏幕像素）：创建时按 1/zoom 换算为世界尺寸——
+// 任何相机视野下创建，屏幕上都呈现同样大小、字体同样清晰；
+// 创建后作为画布元素与图片同律缩放（固定在画布坐标上，无相对运动）
+const CONTAINER_BASE_W = 340; // 控件（比例按钮一行 5 个）所需宽度
+const CONTAINER_BASE_H = 520; // 无参考图/风格时控件自然高度；内容多时靠 minHeight 自然生长
 
 // 按比例 + 分辨率档位计算 size 字符串（如 "2048x1152"）
 function calcSize(ratioKey: string, res: string): string {
@@ -374,10 +346,24 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   const [editPanel, setEditPanel] = useState<EditPanelState | null>(null);
   const editPanelRef = useRef<HTMLDivElement>(null);
   // 生成中占位框：编辑/变体/组合执行时，在新图将要出现的位置预先画出矩形框，
-  // 框内显示"正在编辑图片..."等状态；完成后新图淡入该位置
-  const [processingBox, setProcessingBox] = useState<{
-    x: number; y: number; w: number; h: number; label: string;
-  } | null>(null);
+  // 框内显示"正在编辑图片..."等状态；完成后新图淡入该位置。
+  // 数组形式支持多张图同时编辑：每个操作绑定自己的占位框，完成时只移除自己的
+  const [processingBoxes, setProcessingBoxes] = useState<
+    { id: number; x: number; y: number; w: number; h: number; label: string }[]
+  >([]);
+  const processingSeqRef = useRef(0);
+  // 添加占位框（返回 id），操作结束时用 removeProcessingBox(id) 只清掉自己
+  const addProcessingBox = useCallback(
+    (box: { x: number; y: number; w: number; h: number }, label: string) => {
+      const id = ++processingSeqRef.current;
+      setProcessingBoxes((prev) => [...prev, { ...box, id, label }]);
+      return id;
+    },
+    []
+  );
+  const removeProcessingBox = useCallback((id: number) => {
+    setProcessingBoxes((prev) => prev.filter((b) => b.id !== id));
+  }, []);
   // 测量编辑框实际高度（连线终点垂直居中用）
   const [editPanelH, setEditPanelH] = useState(420);
 
@@ -575,16 +561,17 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   );
 
   // 创建待生成容器（居中于世界坐标 wx/wy 处，可带初始参考图）：
-  // 尺寸与相机视觉自适应——缩放较小时按 1/zoom 放大世界尺寸，屏幕上保持基准大小
+  // 世界尺寸 = 基准/zoom，任何视野下创建时屏幕上都呈 340×520、字体清晰
   const createContainer = useCallback((wx: number, wy: number, refId?: string) => {
     containerSeqRef.current += 1;
-    const size = containerCreateSize("1:1", zoom);
+    const w = Math.round(CONTAINER_BASE_W / zoom);
+    const h = Math.round(CONTAINER_BASE_H / zoom);
     const c: PendingContainer = {
       id: `pending-${Date.now()}-${containerSeqRef.current}`,
-      x: Math.round(wx - size.w / 2),
-      y: Math.round(wy - size.h / 2),
-      w: size.w,
-      h: size.h,
+      x: Math.round(wx - w / 2),
+      y: Math.round(wy - h / 2),
+      w,
+      h,
       aspect: "1:1",
       resolution: "2K",
       prompt: "",
@@ -940,7 +927,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   }, [connecting, draggingContainer, draggingNode, isPanning, pan, zoom, dragOffset, screenToWorld]);
 
   const handleMouseUp = useCallback((e: React.MouseEvent) => {
-    // 连线结束：判断是否命中容器（命中范围覆盖容器整个可视区域）
+    // 连线结束：判断是否命中容器（命中范围覆盖容器整个可视区域，世界坐标判定）
     if (connecting) {
       const w = screenToWorld(e.clientX, e.clientY);
       const hit = containers.find(
@@ -1182,20 +1169,20 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       setMenu(null);
       setPromptInput("");
       const sname = styleNameById(menuStyleId);
-      setProcessingBox({ ...box, label: sname ? `正在按《${sname}》组合...` : `正在组合 ${ids.length} 张图片...` });
+      const boxId = addProcessingBox(box, sname ? `正在按《${sname}》组合...` : `正在组合 ${ids.length} 张图片...`);
       Promise.resolve(
         onAction({ type: "compose", nodeIds: ids, prompt, size, x: box.x, y: box.y, experienceId: menuStyleId || undefined })
-      ).finally(() => setProcessingBox(null));
+      ).finally(() => removeProcessingBox(boxId));
     } else if (menu.mode === "variate" && ids.length === 1) {
       setMenu(null);
       setPromptInput("");
       const sname = styleNameById(menuStyleId);
-      setProcessingBox({ ...box, label: sname ? `正在按《${sname}》生成变体...` : "正在生成变体..." });
+      const boxId = addProcessingBox(box, sname ? `正在按《${sname}》生成变体...` : "正在生成变体...");
       Promise.resolve(
         onAction({ type: "variate", nodeId: ids[0], prompt, size, x: box.x, y: box.y, experienceId: menuStyleId || undefined })
-      ).finally(() => setProcessingBox(null));
+      ).finally(() => removeProcessingBox(boxId));
     }
-  }, [onAction, menu, selectedIds, nodes, promptInput, aspect, resolution, buildProcessingBox, menuStyleId, styleNameById]);
+  }, [onAction, menu, selectedIds, nodes, promptInput, aspect, resolution, buildProcessingBox, menuStyleId, styleNameById, addProcessingBox, removeProcessingBox]);
 
   // 编辑框执行：使用编辑框自身的 nodeId 和 prompt（不依赖菜单/选中状态）
   // 点生成 → 面板关闭 → 在新图位置（原图右侧）画占位框显示"正在编辑图片..."
@@ -1210,11 +1197,11 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     const sname = styleNameById(editPanel.experienceId);
     const expId = editPanel.experienceId;
     setEditPanel(null);
-    setProcessingBox({ ...box, label: sname ? `正在按《${sname}》编辑图片...` : "正在编辑图片..." });
+    const boxId = addProcessingBox(box, sname ? `正在按《${sname}》编辑图片...` : "正在编辑图片...");
     Promise.resolve(
       onAction({ type: "edit", nodeId: node.id, prompt, size, x: box.x, y: box.y, experienceId: expId || undefined })
-    ).finally(() => setProcessingBox(null));
-  }, [onAction, editPanel, nodes, buildProcessingBox, styleNameById]);
+    ).finally(() => removeProcessingBox(boxId));
+  }, [onAction, editPanel, nodes, buildProcessingBox, styleNameById, addProcessingBox, removeProcessingBox]);
 
   const handleDelete = useCallback(() => {
     if (!onAction || selectedIds.size === 0) return;
@@ -1612,7 +1599,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
               })
             )}
 
-          {/* 容器的待生成参考连线（虚线） */}
+          {/* 容器的待生成参考连线（虚线），目标为容器世界矩形 */}
           {containers.map((c) => {
             const tgtRect: BBox = { x: c.x, y: c.y, width: c.w, height: c.h };
             return c.refIds.map((rid) => {
@@ -1732,13 +1719,12 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
           />
         ))}
 
-        {/* 待生成图片容器 */}
+        {/* 待生成图片容器：world 层渲染，与图片同律缩放（固定在画布坐标上，无相对运动） */}
         {containers.map((c) => (
           <PendingContainerNode
             key={c.id}
             container={c}
             nodes={nodes}
-            zoom={zoom}
             isGenerating={generatingContainerId === c.id}
             isDragActive={draggingContainer?.id === c.id}
             isConnectTarget={!!connecting}
@@ -1753,7 +1739,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
             }}
             onChange={(patch) => updateContainer(c.id, patch)}
             onRemoveRef={(rid) =>
-              updateContainer(c.id, { refIds: c.refIds.filter((r) => r !== rid) })
+              updateContainer(c.id, { refIds: c.refIds.filter((rr) => rr !== rid) })
             }
             onRemove={() => removeContainer(c.id)}
             onGenerate={() => handleContainerGenerate(c)}
@@ -1763,15 +1749,16 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
           />
         ))}
 
-        {/* 生成中占位框：编辑/变体/组合执行时，新图位置的预留矩形 */}
-        {processingBox && (
+        {/* 生成中占位框：编辑/变体/组合执行时，新图位置的预留矩形（支持多张同时生成） */}
+        {processingBoxes.map((box) => (
           <div
+            key={box.id}
             style={{
               position: "absolute",
-              left: processingBox.x,
-              top: processingBox.y,
-              width: processingBox.w,
-              height: processingBox.h,
+              left: box.x,
+              top: box.y,
+              width: box.w,
+              height: box.h,
               border: "2px solid rgba(167,139,250,0.9)",
               borderRadius: 8,
               background: "rgba(167,139,250,0.10)",
@@ -1808,10 +1795,10 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
                 textShadow: "0 1px 8px rgba(0,0,0,0.8)",
               }}
             >
-              {processingBox.label}
+              {box.label}
             </span>
           </div>
-        )}
+        ))}
       </div>
 
       {/* 框选矩形（屏幕坐标） */}
@@ -2102,8 +2089,8 @@ function StyleSelect({
 }) {
   if (experiences.length === 0) return null;
   return (
-    <div style={{ marginTop: 8 }}>
-      <div style={{ fontSize: 13, color: "rgba(255,255,255,0.6)", marginBottom: 4 }}>风格</div>
+    <div style={{ marginTop: 10 }}>
+      <div style={{ fontSize: 14, color: "rgba(255,255,255,0.78)", marginBottom: 6 }}>风格</div>
       <select
         className="ic-select"
         style={{
@@ -2113,8 +2100,8 @@ function StyleSelect({
           border: "1px solid rgba(255,255,255,0.12)",
           borderRadius: 6,
           color: "#eee",
-          fontSize: 13,
-          padding: "7px 10px",
+          fontSize: 15,
+          padding: "9px 10px",
           outline: "none",
         }}
         value={value}
@@ -2997,51 +2984,11 @@ function ImageNode({
 }
 
 /**
- * 容器边缘/四角拉伸柄：纯隐形热区，仅以光标形状作为反馈
- * （悬停高亮会遮挡关闭按钮等界面元素，故不做视觉指示）。
- * thickness 为世界坐标值（调用方按 zoom 补偿，保证屏幕热区恒定）。
- */
-function ContainerResizeHandle({
-  dir,
-  thickness,
-  onDown,
-}: {
-  dir: string;
-  thickness: number;
-  onDown: (e: React.MouseEvent, dir: string) => void;
-}) {
-  const corner = thickness * 2; // 角柄方形热区稍大更好抓
-  const style: React.CSSProperties = {
-    position: "absolute",
-    zIndex: 30,
-    background: "transparent",
-  };
-  if (dir === "n")
-    Object.assign(style, { top: -thickness / 2, left: corner, right: corner, height: thickness, cursor: "ns-resize" });
-  else if (dir === "s")
-    Object.assign(style, { bottom: -thickness / 2, left: corner, right: corner, height: thickness, cursor: "ns-resize" });
-  else if (dir === "e")
-    Object.assign(style, { right: -thickness / 2, top: corner, bottom: corner, width: thickness, cursor: "ew-resize" });
-  else if (dir === "w")
-    Object.assign(style, { left: -thickness / 2, top: corner, bottom: corner, width: thickness, cursor: "ew-resize" });
-  else if (dir === "ne")
-    Object.assign(style, { top: -thickness / 2, right: -thickness / 2, width: corner, height: corner, cursor: "nesw-resize" });
-  else if (dir === "nw")
-    Object.assign(style, { top: -thickness / 2, left: -thickness / 2, width: corner, height: corner, cursor: "nwse-resize" });
-  else if (dir === "se")
-    Object.assign(style, { bottom: -thickness / 2, right: -thickness / 2, width: corner, height: corner, cursor: "nwse-resize" });
-  else if (dir === "sw")
-    Object.assign(style, { bottom: -thickness / 2, left: -thickness / 2, width: corner, height: corner, cursor: "nesw-resize" });
-  return <div style={style} onMouseDown={(e) => onDown(e, dir)} />;
-}
-
-/**
- * 待生成图片容器：规定宽高，接收参考图连线，生成后原地变真实图片
+ * 待生成图片容器：屏幕恒定尺寸的编辑面板，接收参考图连线，生成后原地变真实图片
  */
 function PendingContainerNode({
   container,
   nodes,
-  zoom,
   isGenerating,
   isDragActive,
   isConnectTarget,
@@ -3056,7 +3003,6 @@ function PendingContainerNode({
 }: {
   container: PendingContainer;
   nodes: CanvasNode[];
-  zoom: number;
   isGenerating: boolean;
   isDragActive: boolean;
   isConnectTarget: boolean;
@@ -3078,83 +3024,25 @@ function PendingContainerNode({
       : refNodes.length === 1
         ? "图生图 · 1 参考图"
         : `多图组合 · ${refNodes.length} 参考图`;
+  // 当前宽高比（迷你形状预览用）
+  const aspectRatio =
+    ASPECT_RATIOS.find((r) => r.key === container.aspect) ?? ASPECT_RATIOS[0];
 
+  // 选项按钮：15px 字号 + 9px 上下内距 ≈ 39px 高的触控目标（Fitts 定律 ≥ 38px 舒适区）
   const smallBtn = (active: boolean): React.CSSProperties => ({
-    padding: "7px 0",
+    padding: "9px 0",
     background: active ? "#a78bfa" : "rgba(255,255,255,0.08)",
-    color: active ? "#1a1a2e" : "rgba(255,255,255,0.8)",
+    color: active ? "#1a1a2e" : "rgba(255,255,255,0.85)",
     border: "none",
     borderRadius: 6,
-    fontSize: 14,
+    fontSize: 15,
     cursor: "pointer",
     fontWeight: active ? 600 : 400,
   });
 
-  // ===== 左右上下 + 四角拉伸：世界坐标随动（dx/dy 除以 zoom），屏幕恒定热区 =====
-  const [resizeDir, setResizeDir] = useState<string | null>(null);
-  const resizeStartRef = useRef<{ mx: number; my: number; x: number; y: number; w: number; h: number } | null>(null);
-
-  const onHandleDown = (e: React.MouseEvent, dir: string) => {
-    if (e.button !== 0) return;
-    e.stopPropagation();
-    e.preventDefault();
-    resizeStartRef.current = { mx: e.clientX, my: e.clientY, x: container.x, y: container.y, w: container.w, h: container.h };
-    setResizeDir(dir);
-  };
-
-  useEffect(() => {
-    if (!resizeDir) return;
-    const cursor =
-      resizeDir === "n" || resizeDir === "s"
-        ? "ns-resize"
-        : resizeDir === "e" || resizeDir === "w"
-          ? "ew-resize"
-          : resizeDir === "ne" || resizeDir === "sw"
-            ? "nesw-resize"
-            : "nwse-resize";
-    const prevCursor = document.body.style.cursor;
-    document.body.style.cursor = cursor;
-    const onMove = (e: MouseEvent) => {
-      const s = resizeStartRef.current;
-      if (!s) return;
-      const dx = (e.clientX - s.mx) / zoom;
-      const dy = (e.clientY - s.my) / zoom;
-      // 下限：屏幕上不小于基准尺寸（与创建时的相机自适应一致）
-      const min = containerCreateSize(container.aspect, zoom);
-      let { x, y, w, h } = s;
-      if (resizeDir.includes("e")) w = s.w + dx;
-      if (resizeDir.includes("w")) {
-        w = s.w - dx;
-        x = s.x + dx;
-      }
-      if (resizeDir.includes("s")) h = s.h + dy;
-      if (resizeDir.includes("n")) {
-        h = s.h - dy;
-        y = s.y + dy;
-      }
-      // 越界回夹时保持对侧边缘不动
-      if (w < min.w) {
-        if (resizeDir.includes("w")) x = s.x + (s.w - min.w);
-        w = min.w;
-      }
-      if (h < min.h) {
-        if (resizeDir.includes("n")) y = s.y + (s.h - min.h);
-        h = min.h;
-      }
-      onChange({ x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(h) });
-    };
-    const onUp = () => setResizeDir(null);
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
-    return () => {
-      document.body.style.cursor = prevCursor;
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-    };
-  }, [resizeDir, zoom, container.aspect, onChange]);
-
-  // 拉伸柄热区厚度：屏幕恒定（约 12px），世界值随 zoom 补偿，并按容器尺寸封顶
-  const handleT = Math.max(5, Math.min(12 / zoom, Math.min(container.w, container.h) / 10));
+  // 创建时刻的视野换算系数：面板按自然尺寸(340×520)排版后整体放大 1/zoom，
+  // 任何视野下创建时屏幕呈现都与基准 UI 完全一致；创建后随相机与图片同律缩放
+  const k = container.w / CONTAINER_BASE_W;
 
   return (
     <div
@@ -3163,9 +3051,11 @@ function PendingContainerNode({
         position: "absolute",
         left: container.x,
         top: container.y,
-        // 外矩形呈现待生成图片的形状比例；w/h 创建时相机自适应、可手动拉伸
-        width: container.w,
-        minHeight: container.h,
+        // 自然尺寸排版 + transform 统一缩放：世界占位为 c.w/c.h（画布坐标固定），
+        // 屏幕视觉在创建时刻恒为基准 UI（340×520、字体清晰）；transform 在下方退场块统一设置
+        width: CONTAINER_BASE_W,
+        minHeight: CONTAINER_BASE_H,
+        transformOrigin: "0 0",
         display: "flex",
         flexDirection: "column",
         background: isGenerating
@@ -3185,10 +3075,9 @@ function PendingContainerNode({
         padding: 12,
         zIndex: 20,
         backdropFilter: "blur(2px)",
-        // 退场：淡出 + 轻微缩小，与图片入场动画重叠
+        // 退场：淡出 + 轻微缩小，与图片入场动画重叠（基于 0 0 原点，快速淡出中不影响观感）
         opacity: container.exiting ? 0 : 1,
-        transform: container.exiting ? "scale(0.95)" : "scale(1)",
-        transformOrigin: "center center",
+        transform: `scale(${k * (container.exiting ? 0.96 : 1)})`,
         transition: "opacity 0.32s ease, transform 0.32s ease",
         pointerEvents: container.exiting ? "none" : "auto",
       }}
@@ -3210,7 +3099,7 @@ function PendingContainerNode({
           userSelect: "none",
         }}
       >
-        <span style={{ fontSize: 15, fontWeight: 600, color: "#c4b5fd" }}>
+        <span style={{ fontSize: 17, fontWeight: 600, color: "#c4b5fd" }}>
           📦 图片容器 · {modeLabel}
         </span>
         <button
@@ -3221,8 +3110,8 @@ function PendingContainerNode({
             // 提升到拉伸柄（zIndex 30）之上：右上角柄不遮挡关闭按钮的点击
             position: "relative",
             zIndex: 40,
-            width: 28,
-            height: 28,
+            width: 30,
+            height: 30,
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
@@ -3230,8 +3119,8 @@ function PendingContainerNode({
             background: "transparent",
             borderRadius: 6,
             cursor: "pointer",
-            color: "rgba(255,255,255,0.5)",
-            fontSize: 16,
+            color: "rgba(255,255,255,0.55)",
+            fontSize: 18,
             lineHeight: 1,
             transition: "background 0.15s ease, color 0.15s ease",
           }}
@@ -3241,7 +3130,7 @@ function PendingContainerNode({
           }}
           onMouseLeave={(e) => {
             e.currentTarget.style.background = "transparent";
-            e.currentTarget.style.color = "rgba(255,255,255,0.5)";
+            e.currentTarget.style.color = "rgba(255,255,255,0.55)";
           }}
         >
           ×
@@ -3250,7 +3139,7 @@ function PendingContainerNode({
 
       {/* 参考图缩略 */}
       {refNodes.length > 0 && (
-        <div style={{ display: "flex", gap: 6, marginTop: 8, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
           {refNodes.map((n) => (
             <div key={n.id} style={{ position: "relative" }}>
               <img
@@ -3258,10 +3147,10 @@ function PendingContainerNode({
                 alt={n.content || "ref"}
                 draggable={false}
                 style={{
-                  width: 36,
-                  height: 36,
+                  width: 44,
+                  height: 44,
                   objectFit: "cover",
-                  borderRadius: 6,
+                  borderRadius: 8,
                   border: "1px solid rgba(167,139,250,0.6)",
                 }}
               />
@@ -3271,10 +3160,10 @@ function PendingContainerNode({
                 title="断开此参考图"
                 style={{
                   position: "absolute",
-                  top: -8,
-                  right: -8,
-                  width: 22,
-                  height: 22,
+                  top: -9,
+                  right: -9,
+                  width: 24,
+                  height: 24,
                   display: "flex",
                   alignItems: "center",
                   justifyContent: "center",
@@ -3283,7 +3172,7 @@ function PendingContainerNode({
                   borderRadius: "50%",
                   background: "#f87171",
                   color: "white",
-                  fontSize: 12,
+                  fontSize: 13,
                   lineHeight: 1,
                   cursor: "pointer",
                   fontWeight: 700,
@@ -3306,32 +3195,52 @@ function PendingContainerNode({
         </div>
       )}
 
-      {/* 宽高比（右侧显示输出像素尺寸） */}
-      <div style={{ marginTop: 10 }}>
+      {/* 宽高比（右侧：迷你形状预览 + 输出像素尺寸） */}
+      <div style={{ marginTop: 12 }}>
         <div
           style={{
             display: "flex",
             justifyContent: "space-between",
             alignItems: "center",
-            marginBottom: 4,
+            marginBottom: 6,
           }}
         >
-          <span style={{ fontSize: 13, color: "rgba(255,255,255,0.6)" }}>宽高比</span>
-          <span
-            style={{
-              fontSize: 12,
-              color: "rgba(255,255,255,0.45)",
-              fontVariantNumeric: "tabular-nums",
-            }}
-          >
-            {calcSize(container.aspect, container.resolution)}
-          </span>
+          <span style={{ fontSize: 14, color: "rgba(255,255,255,0.78)" }}>宽高比</span>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            {/* 迷你形状预览：直观呈现最终图片的比例（替代旧版外框整体形变） */}
+            <span
+              style={{
+                display: "inline-block",
+                width:
+                  aspectRatio.w >= aspectRatio.h
+                    ? 34
+                    : Math.round((34 * aspectRatio.w) / aspectRatio.h),
+                height:
+                  aspectRatio.w >= aspectRatio.h
+                    ? Math.round((34 * aspectRatio.h) / aspectRatio.w)
+                    : 34,
+                border: "1.5px solid #a78bfa",
+                borderRadius: 3,
+                background: "rgba(167,139,250,0.22)",
+                transition: "width 0.15s ease, height 0.15s ease",
+              }}
+            />
+            <span
+              style={{
+                fontSize: 13,
+                color: "rgba(255,255,255,0.7)",
+                fontVariantNumeric: "tabular-nums",
+              }}
+            >
+              {calcSize(container.aspect, container.resolution)}
+            </span>
+          </div>
         </div>
         <div style={{ display: "flex", gap: 4 }}>
           {ASPECT_RATIOS.map((r) => (
             <button
               key={r.key}
-              onClick={() => onChange({ aspect: r.key, ...containerSizeForAspect(container, r.key) })}
+              onClick={() => onChange({ aspect: r.key })}
               style={{ flex: 1, ...smallBtn(container.aspect === r.key) }}
             >
               {r.key}
@@ -3341,8 +3250,8 @@ function PendingContainerNode({
       </div>
 
       {/* 分辨率 */}
-      <div style={{ marginTop: 8 }}>
-        <div style={{ fontSize: 13, color: "rgba(255,255,255,0.6)", marginBottom: 4 }}>分辨率</div>
+      <div style={{ marginTop: 10 }}>
+        <div style={{ fontSize: 14, color: "rgba(255,255,255,0.78)", marginBottom: 6 }}>分辨率</div>
         <div style={{ display: "flex", gap: 4 }}>
           {RESOLUTIONS.map((res) => (
             <button
@@ -3384,14 +3293,14 @@ function PendingContainerNode({
           width: "100%",
           boxSizing: "border-box",
           flex: 1,
-          minHeight: 100,
-          marginTop: 10,
+          minHeight: 232,
+          marginTop: 12,
           padding: "10px 12px",
           background: "rgba(0,0,0,0.25)",
           border: "1px solid rgba(167,139,250,0.5)",
           borderRadius: 6,
           color: "white",
-          fontSize: 16,
+          fontSize: 17,
           lineHeight: 1.6,
           outline: "none",
           resize: "none",
@@ -3409,13 +3318,13 @@ function PendingContainerNode({
         disabled={isGenerating}
         style={{
           width: "100%",
-          marginTop: 10,
-          padding: "11px 0",
+          marginTop: 12,
+          padding: "12px 0",
           background: isGenerating ? "rgba(167,139,250,0.4)" : "#a78bfa",
           color: "#1a1a2e",
           border: "none",
           borderRadius: 8,
-          fontSize: 16,
+          fontSize: 17,
           fontWeight: 700,
           cursor: isGenerating ? "not-allowed" : "pointer",
         }}
@@ -3423,13 +3332,7 @@ function PendingContainerNode({
         {isGenerating ? `生成中 ${Math.round(progress)}%` : "⚡ 生成"}
       </button>
 
-      {/* 左右上下 + 四角拉伸柄：隐形热区，悬停淡入紫色指示 */}
-      {!container.exiting &&
-        (["n", "s", "e", "w", "ne", "nw", "se", "sw"] as const).map((dir) => (
-          <ContainerResizeHandle key={dir} dir={dir} thickness={handleT} onDown={onHandleDown} />
-        ))}
-
-      {/* 生成中覆盖层：整个容器（外矩形即图片形状）显示流式预览与进度 */}
+      {/* 生成中覆盖层：整个面板显示流式预览与进度 */}
       {isGenerating && (
         <div
           style={{
@@ -3470,7 +3373,7 @@ function PendingContainerNode({
             style={{
               position: "relative",
               zIndex: 1,
-              fontSize: 30,
+              fontSize: 34,
               fontWeight: 700,
               color: "#c4b5fd",
               fontVariantNumeric: "tabular-nums",
@@ -3485,9 +3388,9 @@ function PendingContainerNode({
               position: "relative",
               zIndex: 1,
               width: "72%",
-              height: 6,
+              height: 8,
               background: "rgba(0,0,0,0.45)",
-              borderRadius: 3,
+              borderRadius: 4,
               overflow: "hidden",
             }}
           >
@@ -3496,7 +3399,7 @@ function PendingContainerNode({
                 width: `${progress}%`,
                 height: "100%",
                 background: "linear-gradient(90deg, #a78bfa, #c4b5fd)",
-                borderRadius: 3,
+                borderRadius: 4,
                 transition: "width 0.15s linear",
               }}
             />
@@ -3505,7 +3408,7 @@ function PendingContainerNode({
             style={{
               position: "relative",
               zIndex: 1,
-              fontSize: 12,
+              fontSize: 14,
               textShadow: container.previewUrl ? "0 1px 8px rgba(0,0,0,0.9)" : "none",
             }}
           >
