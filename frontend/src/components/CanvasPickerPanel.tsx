@@ -38,6 +38,9 @@ export function CanvasPickerPanel({
 }: CanvasPickerPanelProps) {
   const [canvases, setCanvases] = useState<CanvasSummary[]>([]);
   const [loading, setLoading] = useState(true);
+  // 首次加载失败（后端重启/瞬时不可用）：与"真的没有画布"区分开，
+  // 提供重试入口而不是误导性的"还没有画布"
+  const [loadFailed, setLoadFailed] = useState(false);
   // 正在重命名的画布 id + 输入值
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
@@ -49,20 +52,25 @@ export function CanvasPickerPanel({
   const refresh = useCallback(async (): Promise<CanvasSummary[]> => {
     const list = await listCanvases();
     setCanvases(list);
+    setLoadFailed(false);
     return list;
   }, []);
 
-  useEffect(() => {
-    (async () => {
-      try {
-        await refresh();
-      } catch {
-        // 后端未启动时面板显示空列表
-      } finally {
-        setLoading(false);
-      }
-    })();
+  const handleInitialLoad = useCallback(async () => {
+    setLoading(true);
+    try {
+      await refresh();
+    } catch {
+      // 首次加载失败：保留已有列表（可能为空），显示重试提示而非"还没有画布"
+      setLoadFailed(true);
+    } finally {
+      setLoading(false);
+    }
   }, [refresh]);
+
+  useEffect(() => {
+    void handleInitialLoad();
+  }, [handleInitialLoad]);
 
   // 卸载时清理确认计时器
   useEffect(() => {
@@ -135,7 +143,12 @@ export function CanvasPickerPanel({
   };
 
   const handleSwitch = async (id: string) => {
-    if (busy || id === currentCanvasId) return;
+    if (busy) return;
+    // 点的就是当前画布：无切换可做，直接收起面板
+    if (id === currentCanvasId) {
+      onClose();
+      return;
+    }
     setBusy(true);
     try {
       const ok = await onSwitch(id);
@@ -231,7 +244,15 @@ export function CanvasPickerPanel({
           }}
         >
           {loading && <div style={{ color: "#888", fontSize: 13 }}>加载中...</div>}
-          {!loading && canvases.length === 0 && (
+          {!loading && loadFailed && (
+            <div
+              onClick={() => void handleInitialLoad()}
+              style={{ color: "#fbbf24", fontSize: 13, cursor: "pointer", userSelect: "none" }}
+            >
+              画布列表加载失败（服务可能重启中）· 点击重试
+            </div>
+          )}
+          {!loading && !loadFailed && canvases.length === 0 && (
             <div style={{ color: "#888", fontSize: 13 }}>还没有画布</div>
           )}
           {canvases.map((c) => {

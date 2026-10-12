@@ -269,13 +269,39 @@ interface CanvasProps {
  */
 export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved, onAction, onCanvasUpdate }: CanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const [pan, setPan] = useState({ x: 0, y: 0 });
-  const [zoom, setZoom] = useState(0.5);
+  // 相机视角存档：每个画布记住用户上次停留的视角（localStorage），切回/刷新时还原。
+  // 否则切画布时组件重挂载、视角重置到世界原点——内容不在原点附近时就表现为"画布空白不显示"
+  const camKey = canvasId ? `ica:cam:${canvasId}` : null;
+  const savedCam = useRef<{ x: number; y: number; z: number } | null>(null);
+  if (savedCam.current === null && camKey) {
+    try {
+      const raw = localStorage.getItem(camKey);
+      if (raw) {
+        const c = JSON.parse(raw) as { x?: number; y?: number; z?: number };
+        if (Number.isFinite(c.x) && Number.isFinite(c.y) && Number.isFinite(c.z) && (c.z as number) > 0) {
+          savedCam.current = { x: c.x as number, y: c.y as number, z: c.z as number };
+        }
+      }
+    } catch {
+      // 存档损坏时忽略，退回默认视角
+    }
+  }
+  const [pan, setPan] = useState(savedCam.current ? { x: savedCam.current.x, y: savedCam.current.y } : { x: 0, y: 0 });
+  const [zoom, setZoom] = useState(savedCam.current ? savedCam.current.z : 0.5);
   // pan/zoom 的 ref 镜像：原生 wheel 监听里读最新值，避免闭包过期
   const panRef = useRef(pan);
   panRef.current = pan;
   const zoomRef = useRef(zoom);
   zoomRef.current = zoom;
+  // 视角变化即持久化（pan 拖拽已 rAF 合帧，写入频率可控）
+  useEffect(() => {
+    if (!camKey) return;
+    try {
+      localStorage.setItem(camKey, JSON.stringify({ x: pan.x, y: pan.y, z: zoom }));
+    } catch {
+      // 隐私模式等写入失败时忽略，仅本次会话生效
+    }
+  }, [camKey, pan, zoom]);
   const [isPanning, setIsPanning] = useState(false);
   const panStart = useRef({ x: 0, y: 0, panX: 0, panY: 0 });
   const prevNodeCount = useRef(0);
@@ -745,6 +771,15 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     });
   }, [nodes]);
 
+  // 首次进入视角：无存档时适配一次全部节点——让"自动适配"关闭的用户
+  // 切画布/首次打开也能看到内容（否则视角停在原点，内容不在原点附近=一片空白）
+  const didInitialViewRef = useRef(false);
+  useEffect(() => {
+    if (didInitialViewRef.current || nodes.length === 0) return;
+    didInitialViewRef.current = true;
+    if (!savedCam.current) fitAllNodes();
+  }, [nodes.length, fitAllNodes]);
+
   // 自动适配：节点数量变化时缩放到合适大小（受 autoFit 开关控制）
   useEffect(() => {
     if (nodes.length === 0) return;
@@ -754,7 +789,10 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       return;
     }
     if (nodes.length === prevNodeCount.current) return;
+    const firstRun = prevNodeCount.current === 0;
     prevNodeCount.current = nodes.length;
+    // 挂载时已还原存档视角：首次计数变化不再自动适配，尊重用户上次停留的视角
+    if (firstRun && savedCam.current) return;
     fitAllNodes();
   }, [canvasState, autoFit, fitAllNodes, nodes.length]);
 

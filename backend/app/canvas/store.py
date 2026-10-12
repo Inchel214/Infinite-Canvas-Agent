@@ -169,11 +169,29 @@ class FileStore(InMemoryStore):
         return copy.deepcopy(state)
 
     def _write_canvas(self, state: CanvasState) -> None:
-        """写回画布快照；用于正常保存与无撤销点的数据迁移。"""
+        """写回画布快照；用于正常保存与无撤销点的数据迁移。
+
+        原子写：先写 .tmp 再 os.replace 替换。直接覆写主文件时，
+        并发的列表轮询（list_canvases glob 读同一文件）会读到写了一半的
+        JSON 而把该画布从列表里静默剔除——表现为"画布管理里有时不显示画布"。
+        """
         path = self._canvas_path(state.canvas_id)
+        tmp = path.with_suffix(".json.tmp")
         try:
-            with path.open("w", encoding="utf-8") as f:
+            with tmp.open("w", encoding="utf-8") as f:
                 json.dump(state.to_dict(), f, ensure_ascii=False)
+        except OSError:
+            return
+        # Windows 下目标文件被并发读者瞬间占用会 PermissionError，短暂重试
+        for _ in range(6):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                time.sleep(0.02)
+        # 放弃本次落盘（内存仍是新版本，下次保存再写）；清理残留临时文件
+        try:
+            tmp.unlink()
         except OSError:
             pass
 
@@ -222,7 +240,16 @@ class FileStore(InMemoryStore):
                         "updated_at": data.get("updated_at", 0),
                     }
             except (json.JSONDecodeError, OSError):
-                # 损坏文件跳过，不影响其他画布列出
+                # 读失败/半截文件：回退内存版本（若有），绝不静默缺项——
+                # 列表里少一个画布比显示旧数据更让用户困惑
+                state = self._canvases.get(cid)
+                if state is not None:
+                    seen[cid] = {
+                        "canvas_id": cid,
+                        "name": state.name or f"画布 {cid[:6]}",
+                        "node_count": len(state.nodes),
+                        "updated_at": state.updated_at,
+                    }
                 continue
         # 内存中存在但磁盘没有的（理论上不会出现，防御性保留）
         for cid, state in self._canvases.items():
