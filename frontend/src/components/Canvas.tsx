@@ -1,6 +1,6 @@
 import { useEffect, useRef, useCallback, useState } from "react";
 import type { CanvasState, CanvasNode } from "../types/canvas";
-import { generateImageStream, uploadImageNode, cloneNode, undoCanvas, listExperiences, type ExperienceMeta } from "../api/agent";
+import { generateImageStream, uploadImageNode, cloneNode, undoCanvas, listExperiences, revealImageFile, type ExperienceMeta } from "../api/agent";
 
 // 右键菜单可触发的操作类型（experienceId：风格库选中的风格，直连生图时后端确定性拼接）
 export type CanvasAction =
@@ -71,7 +71,7 @@ async function fetchImageBlob(url: string, attempts = 3): Promise<Blob> {
 // 任何相机视野下创建，屏幕上都呈现同样大小、字体同样清晰；
 // 创建后作为画布元素与图片同律缩放（固定在画布坐标上，无相对运动）
 const CONTAINER_BASE_W = 340; // 控件（比例按钮一行 5 个）所需宽度
-const CONTAINER_BASE_H = 520; // 无参考图/风格时控件自然高度；内容多时靠 minHeight 自然生长
+const CONTAINER_BASE_H = 600; // 控件自然高度（实测 598：17px 字号 + 描述框 minHeight 232 的固定行高总和）；基准须≥自然高度，否则可视边框超出世界盒/拉伸柄错位
 
 // 按比例 + 分辨率档位计算 size 字符串（如 "2048x1152"）
 function calcSize(ratioKey: string, res: string): string {
@@ -561,15 +561,32 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   );
 
   // 创建待生成容器（居中于世界坐标 wx/wy 处，可带初始参考图）：
-  // 世界尺寸 = 基准/zoom，任何视野下创建时屏幕上都呈 340×520、字体清晰
+  // 世界尺寸 = 基准/zoom，任何视野下创建时屏幕上都呈 340×600、字体清晰；
+  // 位置尽量钳制在当前相机视野内（仅创建时算一次，之后仍是固定画布元素，与图片同律缩放）
   const createContainer = useCallback((wx: number, wy: number, refId?: string) => {
     containerSeqRef.current += 1;
     const w = Math.round(CONTAINER_BASE_W / zoom);
     const h = Math.round(CONTAINER_BASE_H / zoom);
+    let x = Math.round(wx - w / 2);
+    let y = Math.round(wy - h / 2);
+    // 可视区域（世界坐标）：排除右侧聊天面板与底部工具按钮行
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (rect) {
+      const chat = document.querySelector<HTMLElement>('[data-role="chat-panel"]');
+      const usableR = (chat ? chat.getBoundingClientRect().left - 8 : rect.right - 8) - rect.left;
+      const usableB = rect.height - 56; // 底部工具按钮行高约 48px
+      const vl = -pan.x / zoom;
+      const vt = -pan.y / zoom;
+      const vr = (usableR - pan.x) / zoom;
+      const vb = (usableB - pan.y) / zoom;
+      // 放得下则钳进视野（尽量贴近原点击点）；放不下（窗口过小）则左上角对齐
+      x = vr - vl >= w ? Math.min(Math.max(x, vl + 8 / zoom), vr - w) : vl;
+      y = vb - vt >= h ? Math.min(Math.max(y, vt + 8 / zoom), vb - h) : vt;
+    }
     const c: PendingContainer = {
       id: `pending-${Date.now()}-${containerSeqRef.current}`,
-      x: Math.round(wx - w / 2),
-      y: Math.round(wy - h / 2),
+      x,
+      y,
       w,
       h,
       aspect: "1:1",
@@ -578,7 +595,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       refIds: refId ? [refId] : [],
     };
     setContainers((prev) => [...prev, c]);
-  }, [zoom]);
+  }, [zoom, pan]);
 
   const updateContainer = useCallback((id: string, patch: Partial<PendingContainer>) => {
     setContainers((prev) => prev.map((c) => (c.id === id ? { ...c, ...patch } : c)));
@@ -1317,6 +1334,24 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     showMsg("已下载到浏览器下载文件夹");
   }, [selectedIds, nodes]);
 
+  // 打开所在文件夹：调后端用系统文件管理器定位该图片文件（图片以文件形式存于 backend/data/images）
+  const handleRevealImage = useCallback(async () => {
+    const id = [...selectedIds][0];
+    const node = nodes.find((n) => n.id === id);
+    setMenu(null);
+    if (!node?.image_url) return;
+    const showMsg = (msg: string) => {
+      setLocalStatusMsg(msg);
+      setTimeout(() => setLocalStatusMsg(null), 2200);
+    };
+    try {
+      const r = await revealImageFile(node.image_url);
+      showMsg(r.message);
+    } catch (e) {
+      showMsg(`打开文件夹失败：${(e as Error).message}`);
+    }
+  }, [selectedIds, nodes]);
+
   // 空白右键：打开「新建容器」菜单
   const handleBackgroundContextMenu = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -1725,6 +1760,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
             key={c.id}
             container={c}
             nodes={nodes}
+            zoom={zoom}
             isGenerating={generatingContainerId === c.id}
             isDragActive={draggingContainer?.id === c.id}
             isConnectTarget={!!connecting}
@@ -1868,6 +1904,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
           onDelete={handleDelete}
           onCopyImage={handleCopyImage}
           onSaveImage={handleSaveImage}
+          onRevealImage={handleRevealImage}
           onCreateContainer={handleCreateContainer}
           onClose={() => setMenu(null)}
         />
@@ -2143,6 +2180,7 @@ const ContextMenu = ({
   onDelete,
   onCopyImage,
   onSaveImage,
+  onRevealImage,
   onCreateContainer,
   onClose,
 }: {
@@ -2166,6 +2204,7 @@ const ContextMenu = ({
   onDelete: () => void;
   onCopyImage: () => void;
   onSaveImage: () => void;
+  onRevealImage: () => void;
   onCreateContainer: () => void;
   onClose: () => void;
 }) => {
@@ -2318,6 +2357,10 @@ const ContextMenu = ({
               <div style={itemStyle} onMouseEnter={hoverBg} onMouseLeave={hoverOut} onClick={onSaveImage}>
                 <span>💾 另存为...</span>
                 <span style={{ fontSize: 11, color: "rgba(255,255,255,0.35)" }}>下载 PNG</span>
+              </div>
+              <div style={itemStyle} onMouseEnter={hoverBg} onMouseLeave={hoverOut} onClick={onRevealImage}>
+                <span>📂 打开所在文件夹</span>
+                <span style={{ fontSize: 11, color: "rgba(255,255,255,0.35)" }}>定位文件</span>
               </div>
             </>
           )}
@@ -2984,11 +3027,52 @@ function ImageNode({
 }
 
 /**
- * 待生成图片容器：屏幕恒定尺寸的编辑面板，接收参考图连线，生成后原地变真实图片
+ * 容器边缘/四角拉伸柄：纯隐形热区，仅以光标形状作为反馈
+ * （悬停高亮会遮挡关闭按钮等界面元素，故不做视觉指示）。
+ * thickness 为面板本地坐标值（调用方按 s×zoom 补偿，保证屏幕热区恒定）。
+ */
+function ContainerResizeHandle({
+  dir,
+  thickness,
+  onDown,
+}: {
+  dir: string;
+  thickness: number;
+  onDown: (e: React.MouseEvent, dir: string) => void;
+}) {
+  const corner = thickness * 2; // 角柄方形热区稍大更好抓
+  const style: React.CSSProperties = {
+    position: "absolute",
+    zIndex: 30,
+    background: "transparent",
+  };
+  if (dir === "n")
+    Object.assign(style, { top: -thickness / 2, left: corner, right: corner, height: thickness, cursor: "ns-resize" });
+  else if (dir === "s")
+    Object.assign(style, { bottom: -thickness / 2, left: corner, right: corner, height: thickness, cursor: "ns-resize" });
+  else if (dir === "e")
+    Object.assign(style, { right: -thickness / 2, top: corner, bottom: corner, width: thickness, cursor: "ew-resize" });
+  else if (dir === "w")
+    Object.assign(style, { left: -thickness / 2, top: corner, bottom: corner, width: thickness, cursor: "ew-resize" });
+  else if (dir === "ne")
+    Object.assign(style, { top: -thickness / 2, right: -thickness / 2, width: corner, height: corner, cursor: "nesw-resize" });
+  else if (dir === "nw")
+    Object.assign(style, { top: -thickness / 2, left: -thickness / 2, width: corner, height: corner, cursor: "nwse-resize" });
+  else if (dir === "se")
+    Object.assign(style, { bottom: -thickness / 2, right: -thickness / 2, width: corner, height: corner, cursor: "nwse-resize" });
+  else if (dir === "sw")
+    Object.assign(style, { bottom: -thickness / 2, left: -thickness / 2, width: corner, height: corner, cursor: "nesw-resize" });
+  return <div style={style} onMouseDown={(e) => onDown(e, dir)} />;
+}
+
+/**
+ * 待生成图片容器：画布原生元素（世界坐标渲染、随相机缩放），
+ * 面板内容按自然尺寸排版后整体 scale(s)——创建时刻屏幕上恒为基准 UI
  */
 function PendingContainerNode({
   container,
   nodes,
+  zoom,
   isGenerating,
   isDragActive,
   isConnectTarget,
@@ -3003,6 +3087,7 @@ function PendingContainerNode({
 }: {
   container: PendingContainer;
   nodes: CanvasNode[];
+  zoom: number;
   isGenerating: boolean;
   isDragActive: boolean;
   isConnectTarget: boolean;
@@ -3040,9 +3125,75 @@ function PendingContainerNode({
     fontWeight: active ? 600 : 400,
   });
 
-  // 创建时刻的视野换算系数：面板按自然尺寸(340×520)排版后整体放大 1/zoom，
-  // 任何视野下创建时屏幕呈现都与基准 UI 完全一致；创建后随相机与图片同律缩放
-  const k = container.w / CONTAINER_BASE_W;
+  // 内容统一缩放系数：取两轴换算比的较小者。字体与纵向间距只随 s 缩放（字形不变形），
+  // 较长的一轴由 width:100%/flex 控件自然重排补足——逐轴拉伸时描述框变宽/变高而文字不变形
+  const s = Math.min(container.w / CONTAINER_BASE_W, container.h / CONTAINER_BASE_H);
+
+  // ===== 拉伸：边柄逐轴拉伸（重排不变形），角柄整体等比缩放 =====
+  const [resizeDir, setResizeDir] = useState<string | null>(null);
+  const resizeStartRef = useRef<{ mx: number; my: number; x: number; y: number; w: number; h: number } | null>(null);
+
+  const onHandleDown = (e: React.MouseEvent, dir: string) => {
+    if (e.button !== 0) return;
+    e.stopPropagation();
+    e.preventDefault();
+    resizeStartRef.current = { mx: e.clientX, my: e.clientY, x: container.x, y: container.y, w: container.w, h: container.h };
+    setResizeDir(dir);
+  };
+
+  useEffect(() => {
+    if (!resizeDir) return;
+    const cursor =
+      resizeDir === "n" || resizeDir === "s"
+        ? "ns-resize"
+        : resizeDir === "e" || resizeDir === "w"
+          ? "ew-resize"
+          : resizeDir === "ne" || resizeDir === "sw"
+            ? "nesw-resize"
+            : "nwse-resize";
+    const prevCursor = document.body.style.cursor;
+    document.body.style.cursor = cursor;
+    const MIN_W = 240 / zoom; // 拉伸下限：屏幕上仍可读
+    const MIN_H = 160 / zoom;
+    const onMove = (e: MouseEvent) => {
+      const s0 = resizeStartRef.current;
+      if (!s0) return;
+      const dx = (e.clientX - s0.mx) / zoom;
+      const dy = (e.clientY - s0.my) / zoom;
+      let w = s0.w;
+      let h = s0.h;
+      if (resizeDir === "e") w = s0.w + dx;
+      else if (resizeDir === "w") w = s0.w - dx;
+      else if (resizeDir === "s") h = s0.h + dy;
+      else if (resizeDir === "n") h = s0.h - dy;
+      else {
+        // 角柄：等比缩放（内容整体缩放保持比例），取两轴中变化较大者保证跟手
+        const fx = (s0.w + (resizeDir.includes("e") ? dx : -dx)) / s0.w;
+        const fy = (s0.h + (resizeDir.includes("s") ? dy : -dy)) / s0.h;
+        const f = Math.max(fx, fy);
+        w = s0.w * f;
+        h = s0.h * f;
+      }
+      if (w < MIN_W) w = MIN_W;
+      if (h < MIN_H) h = MIN_H;
+      let { x, y } = s0;
+      // 拉伸时对侧边/角固定不动
+      if (resizeDir.includes("w")) x = s0.x + s0.w - w;
+      if (resizeDir.includes("n")) y = s0.y + s0.h - h;
+      onChange({ x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(h) });
+    };
+    const onUp = () => setResizeDir(null);
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      document.body.style.cursor = prevCursor;
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [resizeDir, zoom, onChange]);
+
+  // 拉伸柄热区厚度：屏幕恒定（约 12px），面板本地值按 s×zoom 补偿，并按面板尺寸封顶
+  const handleT = Math.max(5, Math.min(12 / (s * zoom), Math.min(container.w / s, container.h / s) / 10));
 
   return (
     <div
@@ -3051,33 +3202,15 @@ function PendingContainerNode({
         position: "absolute",
         left: container.x,
         top: container.y,
-        // 自然尺寸排版 + transform 统一缩放：世界占位为 c.w/c.h（画布坐标固定），
-        // 屏幕视觉在创建时刻恒为基准 UI（340×520、字体清晰）；transform 在下方退场块统一设置
-        width: CONTAINER_BASE_W,
-        minHeight: CONTAINER_BASE_H,
-        transformOrigin: "0 0",
-        display: "flex",
-        flexDirection: "column",
-        background: isGenerating
-          ? "rgba(167,139,250,0.18)"
-          : "rgba(167,139,250,0.08)",
-        border: isDragActive
-          ? "2px dashed #c4b5fd"
-          : isConnectTarget
-            ? "2px solid rgba(196,181,253,0.95)"
-            : "2px dashed rgba(167,139,250,0.8)",
-        borderRadius: 12,
-        boxShadow: isGenerating
-          ? "0 0 30px rgba(167,139,250,0.5)"
-          : isConnectTarget
-            ? "0 0 24px rgba(196,181,253,0.55)"
-            : "0 4px 20px rgba(0,0,0,0.3)",
-        padding: 12,
+        // 外框 = 世界占位 c.w×c.h（画布坐标固定，与图片同律缩放），仅负责占位/事件/退场动画；
+        // 视觉样式（边框/背景/圆角）在下方 inner 上——随 s 缩放，创建时刻屏幕边框恒为 2px 清晰
+        width: container.w,
+        minHeight: container.h,
         zIndex: 20,
-        backdropFilter: "blur(2px)",
-        // 退场：淡出 + 轻微缩小，与图片入场动画重叠（基于 0 0 原点，快速淡出中不影响观感）
+        // 退场：淡出 + 轻微缩小（0 0 原点），与图片入场动画重叠
+        transformOrigin: "0 0",
         opacity: container.exiting ? 0 : 1,
-        transform: `scale(${k * (container.exiting ? 0.96 : 1)})`,
+        transform: container.exiting ? "scale(0.96)" : "scale(1)",
         transition: "opacity 0.32s ease, transform 0.32s ease",
         pointerEvents: container.exiting ? "none" : "auto",
       }}
@@ -3087,6 +3220,36 @@ function PendingContainerNode({
       }}
       onContextMenu={(e) => e.preventDefault()}
     >
+      {/* 内层：自然尺寸排版 + 统一 scale(s)。宽度/高度按两轴实际比例铺满外框，
+          逐轴拉伸时 s 不变（文字不变形），width:100%/flex 控件重排补足拉伸量。
+          边框/背景/圆角在此层——随 s 缩放，创建时刻屏幕边框恒为 2px，任何视野下创建都清晰 */}
+      <div
+        style={{
+          transform: `scale(${s})`,
+          transformOrigin: "0 0",
+          width: container.w / s,
+          minHeight: container.h / s,
+          display: "flex",
+          flexDirection: "column",
+          padding: 12,
+          boxSizing: "border-box",
+          background: isGenerating
+            ? "rgba(167,139,250,0.18)"
+            : "rgba(167,139,250,0.08)",
+          border: isDragActive
+            ? "2px dashed #c4b5fd"
+            : isConnectTarget
+              ? "2px solid rgba(196,181,253,0.95)"
+              : "2px dashed rgba(167,139,250,0.8)",
+          borderRadius: 12,
+          boxShadow: isGenerating
+            ? "0 0 30px rgba(167,139,250,0.5)"
+            : isConnectTarget
+              ? "0 0 24px rgba(196,181,253,0.55)"
+              : "0 4px 20px rgba(0,0,0,0.3)",
+          backdropFilter: "blur(2px)",
+        }}
+      >
       {/* 标题栏（拖动手柄） */}
       <div
         onMouseDown={onHeaderMouseDown}
@@ -3332,6 +3495,12 @@ function PendingContainerNode({
         {isGenerating ? `生成中 ${Math.round(progress)}%` : "⚡ 生成"}
       </button>
 
+      {/* 左右上下 + 四角拉伸柄：隐形热区（仅光标反馈），拖动整体等比缩放面板 */}
+      {!container.exiting &&
+        (["n", "s", "e", "w", "ne", "nw", "se", "sw"] as const).map((dir) => (
+          <ContainerResizeHandle key={dir} dir={dir} thickness={handleT} onDown={onHandleDown} />
+        ))}
+
       {/* 生成中覆盖层：整个面板显示流式预览与进度 */}
       {isGenerating && (
         <div
@@ -3424,6 +3593,7 @@ function PendingContainerNode({
           </span>
         </div>
       )}
+      </div>
     </div>
   );
 }

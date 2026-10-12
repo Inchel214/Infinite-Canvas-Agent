@@ -303,6 +303,7 @@ export function ChatPanel({ canvasId, onCanvasUpdate }: ChatPanelProps) {
 
   return (
     <div
+      data-role="chat-panel"
       style={{
         position: "fixed",
         top: 68,

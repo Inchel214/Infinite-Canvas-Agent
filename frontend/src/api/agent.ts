@@ -393,6 +393,24 @@ export async function deleteCanvas(
   return res.json();
 }
 
+// ===== 图片文件定位 =====
+
+// 调后端在系统文件管理器中打开图片所在文件夹（Windows 高亮选中该文件）
+export async function revealImageFile(
+  url: string
+): Promise<{ success: boolean; message: string }> {
+  const res = await fetch(`${API_BASE}/reveal-image`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: `${res.status}` }));
+    throw new Error(err.detail || `${res.status}`);
+  }
+  return res.json();
+}
+
 // ===== 大模型服务商设置 =====
 
 export interface LLMSettings {

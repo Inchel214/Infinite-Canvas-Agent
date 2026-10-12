@@ -1,5 +1,7 @@
 """REST API 路由"""
 import json
+import subprocess
+import sys
 import uuid
 from typing import List, Optional
 
@@ -979,3 +981,42 @@ def list_models(req: ModelsQueryRequest):
         "source": "none",
         "message": "该服务商未提供模型列表接口，请手动输入模型名称",
     }
+
+
+# ===== 打开图片所在文件夹（系统文件管理器定位该文件） =====
+
+class RevealImageRequest(BaseModel):
+    url: str  # 画布节点的 image_url（本服务托管的 /images/ 地址）
+
+
+@router.post("/reveal-image", summary="在系统文件管理器中打开图片所在文件夹并定位该文件")
+def reveal_image(req: RevealImageRequest):
+    from app.image.files import IMAGES_DIR, is_local_image_url
+
+    url = req.url
+    if not is_local_image_url(url):
+        raise HTTPException(status_code=400, detail="该图片不在本地存储（远程图片或尚未落盘）")
+
+    # 文件名安全校验：与 local_url_to_data_url 同规则，杜绝路径穿越
+    name = url.rsplit("/", 1)[-1]
+    if not name or "/" in name or "\\" in name or ".." in name:
+        raise HTTPException(status_code=400, detail=f"非法图片地址: {url}")
+
+    path = (IMAGES_DIR / name).resolve()
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="本地图片文件不存在（可能已被清理）")
+
+    try:
+        if sys.platform == "win32":
+            # explorer /select：打开所在文件夹并高亮选中该文件
+            subprocess.Popen(["explorer", "/select,", str(path)])
+        elif sys.platform == "darwin":
+            # macOS Finder：选中该文件
+            subprocess.Popen(["open", "-R", str(path)])
+        else:
+            # Linux 无统一"定位"命令，退化为打开所在目录
+            subprocess.Popen(["xdg-open", str(path.parent)])
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"无法打开文件管理器: {e}")
+
+    return {"success": True, "message": f"已在文件管理器中定位 {name}"}
