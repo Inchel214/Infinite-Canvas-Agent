@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import os
 import uuid
 from pathlib import Path
@@ -80,6 +81,65 @@ def to_sendable_ref(url: str) -> str:
     if is_local_image_url(url):
         return local_url_to_data_url(url)
     return url
+
+
+def image_display_size(url: str, max_edge: int = 400) -> tuple[int, int] | None:
+    """读取图片真实宽高，等比缩放为画布节点尺寸。
+
+    支持画布持久化后的本地 /images URL 与未落盘的 data URL。
+    JPEG 按 EXIF 方向校正，保证与浏览器显示方向一致。
+    """
+    try:
+        from PIL import Image, ImageOps
+
+        if url.startswith("data:image/"):
+            _, _, b64 = url.partition(",")
+            source = io.BytesIO(base64.b64decode(b64))
+        elif is_local_image_url(url):
+            name = url.rsplit("/", 1)[-1]
+            if not name or "/" in name or "\\" in name or ".." in name:
+                return None
+            source = IMAGES_DIR / name
+        else:
+            return None
+
+        with Image.open(source) as im:
+            oriented = ImageOps.exif_transpose(im)
+            real_w, real_h = int(oriented.width), int(oriented.height)
+        if real_w <= 0 or real_h <= 0:
+            return None
+        scale = max_edge / max(real_w, real_h)
+        return max(1, round(real_w * scale)), max(1, round(real_h * scale))
+    except (ValueError, OSError, ImportError):
+        return None
+
+
+def normalize_state_image_sizes(
+    state: CanvasState,
+    cache: dict[str, tuple[int, int]] | None = None,
+) -> int:
+    """把图片节点修正为真实宽高比，返回修正数量。
+
+    cache 使同一图片只解析一次；后续 GET/撤销只做常数时间比对。
+    """
+    changed = 0
+    for node in state.nodes.values():
+        url = node.image_url
+        if node.type != "image" or not url:
+            continue
+        expected = cache.get(url) if cache is not None else None
+        if expected is None:
+            expected = image_display_size(url)
+            if expected is not None and cache is not None:
+                cache[url] = expected
+        if expected is None:
+            continue
+        width, height = expected
+        if node.width != width or node.height != height:
+            node.width = width
+            node.height = height
+            changed += 1
+    return changed
 
 
 def materialize_state_images(state: CanvasState) -> int:

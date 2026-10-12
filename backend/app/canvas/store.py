@@ -9,7 +9,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 
 from app.canvas.state import CanvasState, create_canvas
-from app.image.files import materialize_state_images
+from app.image.files import materialize_state_images, normalize_state_image_sizes
 
 # 历史栈最大长度（避免无限制增长占用内存）
 _MAX_HISTORY = 50
@@ -118,6 +118,8 @@ class FileStore(InMemoryStore):
             data_dir = str(Path(__file__).resolve().parent.parent.parent / "data" / "canvases")
         self._data_dir = Path(data_dir)
         self._data_dir.mkdir(parents=True, exist_ok=True)
+        # image_url -> 画布显示尺寸：避免每次 GET 都重复解析图片文件
+        self._image_size_cache: dict[str, tuple[int, int]] = {}
 
     def _canvas_path(self, canvas_id: str) -> Path:
         # 用 canvas_id 作为文件名（uuid，安全）
@@ -151,39 +153,47 @@ class FileStore(InMemoryStore):
     def get_canvas(self, canvas_id: str) -> CanvasState:
         # 优先内存，其次磁盘（懒加载，支持后端重启后恢复）
         if canvas_id in self._canvases:
+            state = self._canvases[canvas_id]
+            if normalize_state_image_sizes(state, self._image_size_cache):
+                state.version += 1
+                self._write_canvas(state)
             # 返回深拷贝：调用方修改不影响内存中的"旧状态"，保证 undo 历史正确
-            return copy.deepcopy(self._canvases[canvas_id])
+            return copy.deepcopy(state)
         state = self._load_from_disk(canvas_id)
         if state is None:
             raise ValueError(f"画布不存在: {canvas_id}")
+        if normalize_state_image_sizes(state, self._image_size_cache):
+            state.version += 1
+            self._write_canvas(state)
         self._canvases[canvas_id] = state
         return copy.deepcopy(state)
 
-    def save_canvas(self, state: CanvasState) -> None:
-        # base64 节点图片落盘为文件，画布 JSON 只存 http URL（KB 级）
-        materialize_state_images(state)
-        super().save_canvas(state)
-        # 写入磁盘，确保刷新/重启后可恢复
+    def _write_canvas(self, state: CanvasState) -> None:
+        """写回画布快照；用于正常保存与无撤销点的数据迁移。"""
         path = self._canvas_path(state.canvas_id)
         try:
             with path.open("w", encoding="utf-8") as f:
                 json.dump(state.to_dict(), f, ensure_ascii=False)
         except OSError:
-            # 磁盘写入失败不影响内存中的状态
             pass
+
+    def save_canvas(self, state: CanvasState) -> None:
+        # base64 节点图片落盘为文件，画布 JSON 只存 http URL（KB 级）
+        materialize_state_images(state)
+        # 生成服务未返回可靠尺寸时，以最终图片真实比例为准
+        normalize_state_image_sizes(state, self._image_size_cache)
+        super().save_canvas(state)
+        # 写入磁盘，确保刷新/重启后可恢复
+        self._write_canvas(state)
 
     def undo(self, canvas_id: str) -> CanvasState | None:
         prev = super().undo(canvas_id)
         if prev is not None:
             # 历史快照可能含旧 base64，落盘前同样物化为文件
             materialize_state_images(prev)
+            normalize_state_image_sizes(prev, self._image_size_cache)
             # 同步写回磁盘，保持内存/磁盘一致
-            path = self._canvas_path(canvas_id)
-            try:
-                with path.open("w", encoding="utf-8") as f:
-                    json.dump(prev.to_dict(), f, ensure_ascii=False)
-            except OSError:
-                pass
+            self._write_canvas(prev)
         return prev
 
     def list_canvases(self) -> list[dict]:

@@ -2883,7 +2883,8 @@ function ImageNode({
           style={{
             width: "100%",
             height: "100%",
-            objectFit: "cover",
+            // 后端会按真实比例修正节点；修正前/远程图读取失败时也保证内容不被裁切
+            objectFit: "contain",
             borderRadius: 8,
             boxShadow: isSelected
               ? "0 0 0 2px #6366f1, 0 8px 40px rgba(99,102,241,0.6)"
