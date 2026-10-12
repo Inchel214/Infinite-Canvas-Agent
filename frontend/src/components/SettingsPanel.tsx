@@ -5,6 +5,7 @@ import {
   saveSettings,
   resetSettings,
   testSettings,
+  listModels,
   listExperiences,
   addExperience,
   updateExperience,
@@ -12,6 +13,7 @@ import {
   type AppSettingsData,
   type LLMSettings,
   type ImageSettings,
+  type ModelsQueryResult,
   type ProviderPreset,
   type TestResult,
   type ExperienceMeta,
@@ -62,6 +64,133 @@ const sectionTitleStyle: React.CSSProperties = {
   color: "#ddd",
   margin: "18px 0 2px",
 };
+
+// 模型名称字段：输入框 + 查询按钮，查询成功后下方弹出深色候选列表点选
+function ModelField(props: {
+  value: string;
+  onChange: (v: string) => void;
+  fetchModels: () => Promise<ModelsQueryResult>;
+  placeholder?: string;
+}) {
+  const [models, setModels] = useState<string[]>([]);
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [hint, setHint] = useState("");
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+
+  // 点击组件外部收起候选列表
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [open]);
+
+  const handleQuery = async () => {
+    setLoading(true);
+    setHint("");
+    try {
+      const res = await props.fetchModels();
+      setModels(res.models);
+      if (res.models.length > 0) {
+        setOpen(true);
+        setHint(res.message || `已获取 ${res.models.length} 个模型，点击选择`);
+      } else {
+        setOpen(false);
+        setHint(res.message || "未查询到模型，请手动输入");
+      }
+    } catch (e) {
+      setModels([]);
+      setOpen(false);
+      setHint("查询失败：" + (e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div ref={wrapRef} style={{ position: "relative" }}>
+      <div style={{ display: "flex", gap: 6 }}>
+        <input
+          style={{ ...inputStyle, flex: 1 }}
+          placeholder={props.placeholder || "模型 ID"}
+          value={props.value}
+          onChange={(e) => props.onChange(e.target.value)}
+        />
+        <button
+          onClick={handleQuery}
+          disabled={loading}
+          title="查询该服务商的可用模型列表"
+          style={{
+            ...inputStyle,
+            width: "auto",
+            padding: "7px 10px",
+            cursor: "pointer",
+            whiteSpace: "nowrap",
+            background: "rgba(167,139,250,0.2)",
+            borderColor: "rgba(167,139,250,0.35)",
+            color: "#cfc6f7",
+          }}
+        >
+          {loading ? "查询中…" : "⟳ 查询"}
+        </button>
+      </div>
+      {hint && (
+        <div style={{ fontSize: 11, color: "#888", marginTop: 3 }}>{hint}</div>
+      )}
+      {open && models.length > 0 && (
+        <div
+          style={{
+            position: "absolute",
+            top: "100%",
+            left: 0,
+            right: 0,
+            maxHeight: 220,
+            overflowY: "auto",
+            background: "#232342",
+            border: "1px solid rgba(255,255,255,0.18)",
+            borderRadius: 6,
+            marginTop: 2,
+            zIndex: 100,
+            boxShadow: "0 8px 24px rgba(0,0,0,0.55)",
+          }}
+        >
+          {models.map((m) => (
+            <div
+              key={m}
+              onClick={() => {
+                props.onChange(m);
+                setOpen(false);
+              }}
+              title={m}
+              style={{
+                padding: "7px 10px",
+                color: "#ddd",
+                fontSize: 12,
+                cursor: "pointer",
+                whiteSpace: "nowrap",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+              }}
+              onMouseEnter={(e) =>
+                (e.currentTarget.style.background = "rgba(167,139,250,0.15)")
+              }
+              onMouseLeave={(e) =>
+                (e.currentTarget.style.background = "transparent")
+              }
+            >
+              {m}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
   const [providers, setProviders] = useState<Record<string, ProviderPreset>>({});
@@ -390,11 +519,17 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
               onChange={(e) => setLlm({ ...llm, base_url: e.target.value })}
             />
             <label style={labelStyle}>模型名称</label>
-            <input
-              style={inputStyle}
-              placeholder="模型 ID"
+            <ModelField
               value={llm.model}
-              onChange={(e) => setLlm({ ...llm, model: e.target.value })}
+              onChange={(v) => setLlm({ ...llm, model: v })}
+              fetchModels={() =>
+                listModels({
+                  kind: "llm",
+                  provider: llm.provider,
+                  api_key: llm.api_key,
+                  base_url: llm.base_url,
+                })
+              }
             />
           </>
         )}
@@ -445,21 +580,31 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
               onChange={(e) => setImage({ ...image, base_url: e.target.value })}
             />
             <label style={labelStyle}>模型名称（编辑 / 变体 / 组合用）</label>
-            <input
-              style={inputStyle}
-              placeholder="模型 ID"
+            <ModelField
               value={image.model}
-              onChange={(e) => setImage({ ...image, model: e.target.value })}
+              onChange={(v) => setImage({ ...image, model: v })}
+              fetchModels={() =>
+                listModels({
+                  kind: "image",
+                  provider: image.provider,
+                  api_key: image.api_key,
+                  base_url: image.base_url,
+                })
+              }
             />
             {providers[image.provider]?.image_api === "ark" && (
               <>
                 <label style={labelStyle}>流式模型（图片容器生成用，留空回退非流式）</label>
-                <input
-                  style={inputStyle}
-                  placeholder="模型 ID"
+                <ModelField
                   value={image.stream_model}
-                  onChange={(e) =>
-                    setImage({ ...image, stream_model: e.target.value })
+                  onChange={(v) => setImage({ ...image, stream_model: v })}
+                  fetchModels={() =>
+                    listModels({
+                      kind: "image",
+                      provider: image.provider,
+                      api_key: image.api_key,
+                      base_url: image.base_url,
+                    })
                   }
                 />
               </>

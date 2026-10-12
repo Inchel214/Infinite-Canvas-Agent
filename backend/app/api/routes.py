@@ -872,3 +872,110 @@ def test_settings(req: SettingsRequest):
                 result["image"] = {"ok": False, "message": f"连接失败: {e}"}
 
     return result
+
+
+# ===== 模型名称查询（服务商 /models 接口优先，Ark 回退内置常见列表） =====
+
+class ModelsQueryRequest(BaseModel):
+    kind: str = "llm"            # "llm" | "image"（image 时 stream_model 也用同一列表）
+    provider: str = ""
+    api_key: str = ""
+    base_url: str = ""
+
+
+# 火山方舟未开放 GET /models 列表接口，回退到内置常见模型（模型迭代后可按需增补）
+ARK_FALLBACK_MODELS: dict[str, list[str]] = {
+    "llm": [
+        "doubao-seed-2-1-pro-260915",
+        "doubao-seed-1-6-250615",
+        "doubao-seed-1-6-flash-250715",
+        "doubao-seed-1-6-thinking-250615",
+        "deepseek-v3-250324",
+        "deepseek-r1-250528",
+    ],
+    "image": [
+        "doubao-seedream-5-0-pro-260628",
+        "doubao-seedream-5-0-lite-260708",
+        "doubao-seedream-4-0-250920",
+        "doubao-seededit-3-0-i2i-250628",
+    ],
+}
+
+# /models 常返回全家桶（含 embedding/音频等），黑名单过滤提升选择体验
+_MODEL_ID_BLACKLIST = ("embedding", "rerank", "whisper", "tts", "moderation", "audio")
+
+
+def _extract_model_ids(resp: requests.Response) -> list[str]:
+    """解析 OpenAI 兼容 /models 响应：{"data": [{"id": ...}]} 或直接数组"""
+    try:
+        data = resp.json()
+    except ValueError:
+        return []
+    items = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return []
+    ids = []
+    for item in items:
+        mid = item.get("id") if isinstance(item, dict) else item
+        if isinstance(mid, str) and mid and not any(k in mid.lower() for k in _MODEL_ID_BLACKLIST):
+            ids.append(mid)
+    return sorted(set(ids))
+
+
+@router.post("/models", summary="查询服务商可用模型名称列表（供下拉选择）")
+def list_models(req: ModelsQueryRequest):
+    if req.kind not in ("llm", "image"):
+        raise HTTPException(status_code=400, detail="kind 必须为 llm 或 image")
+    if req.provider in ("", "mock"):
+        raise HTTPException(status_code=400, detail="请先选择服务商")
+    if req.provider not in PROVIDER_PRESETS:
+        raise HTTPException(status_code=400, detail=f"未知的服务商: {req.provider}")
+
+    # key 传回脱敏占位符（含 ****）或留空时，复用已保存的真实 key（服务商未变时）
+    api_key = req.api_key
+    if "****" in api_key or not api_key:
+        saved = deps.manager.settings.image if req.kind == "image" else deps.manager.settings.llm
+        api_key = saved.api_key if saved.provider == req.provider else ""
+    base_url = req.base_url or (PROVIDER_PRESETS[req.provider].get("base_url") or "")
+
+    # 火山方舟未开放 /models 列表接口（且对未知路径也返回 401，无法区分 key 有效性），
+    # 直接返回内置常见模型，无需 key 即可选择
+    if req.provider == "ark":
+        return {
+            "models": ARK_FALLBACK_MODELS[req.kind],
+            "source": "preset",
+            "message": "火山方舟未开放模型列表接口，以下为内置常见模型（以控制台实际开通为准）",
+        }
+
+    if not api_key:
+        raise HTTPException(status_code=400, detail="请先填写 API Key")
+    if not base_url:
+        raise HTTPException(status_code=400, detail="请先填写 Base URL")
+
+    try:
+        session = requests.Session()
+        session.trust_env = False
+        resp = session.get(
+            f"{base_url.rstrip('/')}/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=30,
+            proxies={"http": None, "https": None},
+        )
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"连接失败: {e}")
+
+    if resp.status_code in (401, 403):
+        raise HTTPException(status_code=400, detail="API Key 无效或无权限")
+    if resp.status_code == 200:
+        models = _extract_model_ids(resp)
+        if models:
+            return {"models": models, "source": "api"}
+    elif resp.status_code not in (404, 405):
+        raise HTTPException(status_code=502, detail=f"HTTP {resp.status_code}: {_err_snippet(resp)}")
+
+    # 列表接口不可用（404/405 或返回空）：提示手动输入
+    return {
+        "models": [],
+        "source": "none",
+        "message": "该服务商未提供模型列表接口，请手动输入模型名称",
+    }

@@ -497,6 +497,32 @@ export async function testSettings(
   return res.json();
 }
 
+// ===== 模型名称查询：选完服务商后拉取可用模型列表，供下拉选择 =====
+
+export interface ModelsQueryResult {
+  models: string[];
+  source: "api" | "preset" | "none"; // api=接口查询 preset=内置列表(Ark) none=不支持
+  message?: string;
+}
+
+export async function listModels(payload: {
+  kind: "llm" | "image";
+  provider: string;
+  api_key: string;
+  base_url: string;
+}): Promise<ModelsQueryResult> {
+  const res = await fetch(`${API_BASE}/models`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: `${res.status}` }));
+    throw new Error(err.detail || `${res.status}`);
+  }
+  return res.json();
+}
+
 // ===== 风格库（经验文档）：设计师沉淀的风格指南，生图时确定性拼接 =====
 
 export interface ExperienceMeta {
