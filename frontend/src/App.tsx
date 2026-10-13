@@ -75,9 +75,9 @@ function App() {
   }, [applyCanvasId]);
 
   // 新建画布并切换过去，返回新画布 id（失败 null）
-  const createNewCanvas = useCallback(async (): Promise<string | null> => {
+  const createNewCanvas = useCallback(async (name?: string): Promise<string | null> => {
     try {
-      const id = await createCanvas();
+      const id = await createCanvas(name);
       const state = await getCanvas(id);
       applyCanvasId(id, state);
       return id;

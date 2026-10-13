@@ -11,8 +11,8 @@ interface CanvasPickerPanelProps {
   onClose: () => void;
   // 切换到指定画布，返回是否成功
   onSwitch: (id: string) => Promise<boolean>;
-  // 新建画布并切换，返回新画布 id（失败 null）
-  onCreate: () => Promise<string | null>;
+  // 新建画布并切换，返回新画布 id（失败 null）；name 为空则后端自动编号
+  onCreate: (name?: string) => Promise<string | null>;
   // 操作反馈（走 App 的 statusMsg 机制，2.2s 自动淡出）
   onStatus: (msg: string) => void;
 }
@@ -46,6 +46,9 @@ export function CanvasPickerPanel({
   const [renameValue, setRenameValue] = useState("");
   // 删除二步确认：第一次点 🗑 变成确认按钮，3 秒未确认自动还原
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  // 新建画布：先填名字（留空则自动编号）
+  const [creating, setCreating] = useState(false);
+  const [createValue, setCreateValue] = useState("");
   const [busy, setBusy] = useState(false);
   const confirmTimer = useRef<number | null>(null);
 
@@ -166,17 +169,20 @@ export function CanvasPickerPanel({
 
   const handleCreate = async () => {
     if (busy) return;
+    const name = createValue.trim();
     setBusy(true);
     try {
-      const id = await onCreate();
+      const id = await onCreate(name || undefined);
       if (id) {
-        onStatus("已新建画布");
+        onStatus(name ? `已新建画布「${name}」` : "已新建画布");
         onClose();
       } else {
         onStatus("新建失败");
       }
     } finally {
       setBusy(false);
+      setCreating(false);
+      setCreateValue("");
     }
   };
 
@@ -419,24 +425,94 @@ export function CanvasPickerPanel({
           })}
         </div>
 
-        {/* 新建按钮 */}
-        <button
-          onClick={handleCreate}
-          disabled={busy}
-          style={{
-            marginTop: 12,
-            width: "100%",
-            padding: "9px 0",
-            borderRadius: 8,
-            border: "none",
-            background: "rgba(99,102,241,0.85)",
-            color: "#fff",
-            fontSize: 13,
-            cursor: busy ? "wait" : "pointer",
-          }}
-        >
-          ＋ 新建画布
-        </button>
+        {/* 新建按钮：点击先填名字（留空自动编号） */}
+        {creating ? (
+          <div
+            style={{
+              marginTop: 12,
+              display: "flex",
+              gap: 8,
+              alignItems: "center",
+            }}
+          >
+            <input
+              autoFocus
+              value={createValue}
+              disabled={busy}
+              placeholder="画布名称（可留空）"
+              onChange={(e) => setCreateValue(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void handleCreate();
+                if (e.key === "Escape") {
+                  setCreating(false);
+                  setCreateValue("");
+                }
+              }}
+              style={{
+                flex: 1,
+                minWidth: 0,
+                background: "rgba(255,255,255,0.08)",
+                border: "1px solid rgba(99,102,241,0.6)",
+                borderRadius: 8,
+                color: "#eee",
+                fontSize: 13,
+                padding: "8px 10px",
+                outline: "none",
+              }}
+            />
+            <button
+              onClick={() => void handleCreate()}
+              disabled={busy}
+              style={{
+                padding: "8px 14px",
+                borderRadius: 8,
+                border: "none",
+                background: "rgba(99,102,241,0.85)",
+                color: "#fff",
+                fontSize: 13,
+                cursor: busy ? "wait" : "pointer",
+                flexShrink: 0,
+              }}
+            >
+              {busy ? "创建中…" : "创建"}
+            </button>
+            <span
+              onClick={() => {
+                if (busy) return;
+                setCreating(false);
+                setCreateValue("");
+              }}
+              style={{
+                color: "#888",
+                fontSize: 13,
+                cursor: busy ? "wait" : "pointer",
+                userSelect: "none",
+                flexShrink: 0,
+                padding: "0 2px",
+              }}
+            >
+              ✕
+            </span>
+          </div>
+        ) : (
+          <button
+            onClick={() => setCreating(true)}
+            disabled={busy}
+            style={{
+              marginTop: 12,
+              width: "100%",
+              padding: "9px 0",
+              borderRadius: 8,
+              border: "none",
+              background: "rgba(99,102,241,0.85)",
+              color: "#fff",
+              fontSize: 13,
+              cursor: busy ? "wait" : "pointer",
+            }}
+          >
+            ＋ 新建画布
+          </button>
+        )}
       </div>
     </div>
   );

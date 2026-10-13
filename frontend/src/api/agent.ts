@@ -11,8 +11,12 @@ export interface DirectResponse {
   canvas: CanvasState;
 }
 
-export async function createCanvas(): Promise<string> {
-  const res = await fetch(`${API_BASE}/canvas`, { method: "POST" });
+export async function createCanvas(name?: string): Promise<string> {
+  const res = await fetch(`${API_BASE}/canvas`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: name || "" }),
+  });
   const data = await res.json();
   return data.canvas_id;
 }

@@ -105,10 +105,16 @@ def _sse(obj: dict) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 
+class CanvasCreateIn(BaseModel):
+    """创建画布：可自定义名称，留空则自动编号"""
+    name: str = ""
+
+
 @router.post("/canvas", summary="创建新画布")
-def create_canvas():
+def create_canvas(body: Optional[CanvasCreateIn] = None):
     # 默认名按现有数量递增，避免都叫"未命名"
-    default_name = f"画布 {len(deps.store.list_canvases()) + 1}"
+    custom = (body.name or "").strip() if body else ""
+    default_name = custom if custom else f"画布 {len(deps.store.list_canvases()) + 1}"
     state = deps.store.create_canvas(default_name)
     return {"canvas_id": state.canvas_id, "name": state.name}
 
