@@ -48,7 +48,8 @@ class ComposeRequest(BaseModel):
     size: str = "2K"
     x: Optional[float] = None
     y: Optional[float] = None
-    experience_id: Optional[str] = None  # 风格库：选中后读全文拼接进 prompt
+    experience_ids: Optional[List[str]] = None  # 风格库（多选）：选中后读全文拼接进 prompt
+    experience_id: Optional[str] = None  # 兼容旧字段（单选）
 
 
 class VariateRequest(BaseModel):
@@ -57,6 +58,7 @@ class VariateRequest(BaseModel):
     size: str = "2K"
     x: Optional[float] = None
     y: Optional[float] = None
+    experience_ids: Optional[List[str]] = None
     experience_id: Optional[str] = None
 
 
@@ -66,6 +68,7 @@ class EditRequest(BaseModel):
     size: str = "2K"
     x: Optional[float] = None
     y: Optional[float] = None
+    experience_ids: Optional[List[str]] = None
     experience_id: Optional[str] = None
 
 
@@ -74,6 +77,7 @@ class GenerateRequest(BaseModel):
     size: str = "2K"
     x: Optional[float] = None
     y: Optional[float] = None
+    experience_ids: Optional[List[str]] = None
     experience_id: Optional[str] = None
 
 
@@ -85,6 +89,7 @@ class StreamGenRequest(BaseModel):
     y: float = 100
     node_id: Optional[str] = None
     node_ids: Optional[List[str]] = None
+    experience_ids: Optional[List[str]] = None
     experience_id: Optional[str] = None
 
 
@@ -103,6 +108,14 @@ class ExperienceUpdate(BaseModel):
 
 def _sse(obj: dict) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+
+def _apply_styles(req, prompt: str) -> str:
+    """风格库拼接：合并多选 experience_ids 与兼容旧单选 experience_id，逐份全文拼接"""
+    ids = list(req.experience_ids or [])
+    if req.experience_id and req.experience_id not in ids:
+        ids.append(req.experience_id)
+    return experiences.apply_experiences(ids, prompt) if ids else prompt
 
 
 class CanvasCreateIn(BaseModel):
@@ -191,7 +204,7 @@ def compose_images(canvas_id: str, req: ComposeRequest):
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     tool = deps.tool_manager.get("compose_images")
-    prompt = experiences.apply_experience(req.experience_id, req.prompt) if req.experience_id else req.prompt
+    prompt = _apply_styles(req, req.prompt)
     kwargs = {"node_ids": req.node_ids, "prompt": prompt, "size": req.size}
     if req.x is not None:
         kwargs["x"] = req.x
@@ -214,8 +227,7 @@ def variate_image(canvas_id: str, req: VariateRequest):
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     prompt = req.prompt or "基于参考图生成一个高质量的新变体，保持风格一致"
-    if req.experience_id:
-        prompt = experiences.apply_experience(req.experience_id, prompt)
+    prompt = _apply_styles(req, prompt)
     tool = deps.tool_manager.get("variate_image")
     kwargs = {"node_id": req.node_id, "prompt": prompt, "size": req.size}
     if req.x is not None:
@@ -239,7 +251,7 @@ def edit_image(canvas_id: str, req: EditRequest):
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     tool = deps.tool_manager.get("edit_image")
-    prompt = experiences.apply_experience(req.experience_id, req.prompt) if req.experience_id else req.prompt
+    prompt = _apply_styles(req, req.prompt)
     kwargs = {"node_id": req.node_id, "prompt": prompt, "size": req.size}
     if req.x is not None:
         kwargs["x"] = req.x
@@ -376,7 +388,7 @@ def generate_image(canvas_id: str, req: GenerateRequest):
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     tool = deps.tool_manager.get("generate_image")
-    prompt = experiences.apply_experience(req.experience_id, req.prompt) if req.experience_id else req.prompt
+    prompt = _apply_styles(req, req.prompt)
     kwargs = {"prompt": prompt, "size": req.size}
     if req.x is not None:
         kwargs["x"] = req.x
@@ -507,8 +519,7 @@ def generate_image_stream(canvas_id: str, req: StreamGenRequest):
     size = req.size
 
     # 风格库：选中风格后读全文确定性拼接进 prompt（对三种 op 统一生效）
-    if req.experience_id:
-        prompt = experiences.apply_experience(req.experience_id, prompt)
+    prompt = _apply_styles(req, prompt)
 
     def _add_node(image_url: str, w: int, h: int) -> None:
         node = CanvasNode(

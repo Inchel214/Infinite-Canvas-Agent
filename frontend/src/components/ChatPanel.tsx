@@ -6,7 +6,7 @@ import {
   getChatHistory,
   clearChatHistory,
 } from "../api/agent";
-import type { AgentStep, CanvasState } from "../types/canvas";
+import type { AgentStep, CanvasNode, CanvasState } from "../types/canvas";
 
 // 面板内展示条目：历史消息不含 steps（后端只存文本对），本轮对话带工具调用过程
 interface ChatEntry {
@@ -19,6 +19,13 @@ interface ChatEntry {
 
 interface ChatPanelProps {
   canvasId: string | null;
+  // 面板开合（受控，状态在 App：添加引用时可自动弹出）
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  // 右键"添加到对话"引用的图片（App 从画布状态解析）
+  refNodes: CanvasNode[];
+  onRemoveRef: (nodeId: string) => void;
+  onClearRefs: () => void;
   // Agent 操作画布后（生成/移动/删除节点）通知上层刷新画布状态
   onCanvasUpdate: (canvas: CanvasState) => void;
 }
@@ -131,23 +138,15 @@ const mdComponents = {
 const MIN_PANEL_WIDTH = 360;
 const MAX_PANEL_WIDTH = 720;
 
-export function ChatPanel({ canvasId, onCanvasUpdate }: ChatPanelProps) {
-  // 面板开合状态持久化：刷新后保持上次收起/打开状态
-  const [open, setOpen] = useState(() => {
-    try {
-      return localStorage.getItem("chatPanelOpen") !== "0";
-    } catch {
-      return true;
-    }
-  });
-  const toggleOpen = (next: boolean) => {
-    setOpen(next);
-    try {
-      localStorage.setItem("chatPanelOpen", next ? "1" : "0");
-    } catch {
-      /* 忽略隐私模式等写入失败 */
-    }
-  };
+export function ChatPanel({
+  canvasId,
+  open,
+  onOpenChange,
+  refNodes,
+  onRemoveRef,
+  onClearRefs,
+  onCanvasUpdate,
+}: ChatPanelProps) {
   const [entries, setEntries] = useState<ChatEntry[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
@@ -156,7 +155,13 @@ export function ChatPanel({ canvasId, onCanvasUpdate }: ChatPanelProps) {
   const [resizing, setResizing] = useState(false);
   const [hoverHandle, setHoverHandle] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   const resizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
+
+  // 引用变化（右键"添加到对话"）时聚焦输入框，引导用户直接下指令
+  useEffect(() => {
+    if (refNodes.length > 0 && open) inputRef.current?.focus();
+  }, [refNodes.length, open]);
 
   // 左边缘拖拽拉伸：往左拖变宽，往右拖变窄，clamp 到 [MIN, MAX]
   const startResize = (e: React.MouseEvent) => {
@@ -236,6 +241,18 @@ export function ChatPanel({ canvasId, onCanvasUpdate }: ChatPanelProps) {
   const handleSend = async () => {
     const text = input.trim();
     if (!text || !canvasId || sending) return;
+    // 引用块拼进发给 Agent 的 prompt（本地气泡仍显示原文）：
+    // Agent 侧快照与 system prompt 均支持按 #N 定位，自然语言即可关联图片
+    const refBlock =
+      refNodes.length > 0
+        ? refNodes
+            .map((n) => {
+              const label = n.index != null ? `#${n.index}` : n.id.slice(0, 8);
+              const desc = n.content ? `「${n.content.slice(0, 60)}」` : "";
+              return `[引用图片 ${label} ${desc}(node_id=${n.id})]`;
+            })
+            .join("\n") + "\n"
+        : "";
     setInput("");
     setSending(true);
     setEntries((prev) => [
@@ -244,7 +261,7 @@ export function ChatPanel({ canvasId, onCanvasUpdate }: ChatPanelProps) {
     ]);
 
     try {
-      const res = await chatWithAgent(canvasId, text);
+      const res = await chatWithAgent(canvasId, refBlock + text);
       setEntries((prev) => [
         ...prev,
         {
@@ -254,6 +271,8 @@ export function ChatPanel({ canvasId, onCanvasUpdate }: ChatPanelProps) {
           timestamp: Date.now(),
         },
       ]);
+      // 引用已随本条消息消费，发送后清空（一次性引用，避免残留误伤后续指令）
+      onClearRefs();
       // Agent 可能改了画布（生成/移动/删除节点），通知上层刷新
       onCanvasUpdate(res.canvas);
     } catch (e) {
@@ -275,7 +294,7 @@ export function ChatPanel({ canvasId, onCanvasUpdate }: ChatPanelProps) {
   if (!open) {
     return (
       <div
-        onClick={() => toggleOpen(true)}
+        onClick={() => onOpenChange(true)}
         style={{
           position: "fixed",
           right: 20,
@@ -384,7 +403,7 @@ export function ChatPanel({ canvasId, onCanvasUpdate }: ChatPanelProps) {
             {confirmClear ? "确认清空？" : "清空"}
           </span>
           <span
-            onClick={() => toggleOpen(false)}
+            onClick={() => onOpenChange(false)}
             style={{
               color: "#888",
               fontSize: 14,
@@ -559,6 +578,62 @@ export function ChatPanel({ canvasId, onCanvasUpdate }: ChatPanelProps) {
         )}
       </div>
 
+      {/* 引用图片（右键"添加到对话"）：缩略图 chips，发送时随指令注入 Agent 上下文 */}
+      {refNodes.length > 0 && (
+        <div
+          style={{
+            borderTop: "1px solid rgba(255,255,255,0.08)",
+            padding: "8px 10px 4px",
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            flexWrap: "wrap",
+          }}
+        >
+          <span style={{ color: "#888", fontSize: 11, flexShrink: 0 }}>引用</span>
+          {refNodes.map((n) => (
+            <div
+              key={n.id}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+                background: "rgba(99,102,241,0.18)",
+                border: "1px solid rgba(99,102,241,0.5)",
+                borderRadius: 8,
+                padding: "3px 6px 3px 4px",
+                maxWidth: 180,
+              }}
+              title={n.content || "本地图片"}
+            >
+              {n.image_url && (
+                <img
+                  src={n.image_url}
+                  alt={n.content || "引用图"}
+                  style={{ width: 26, height: 26, objectFit: "cover", borderRadius: 4 }}
+                />
+              )}
+              <span style={{ color: "#c7d2fe", fontSize: 12, fontWeight: 600, flexShrink: 0 }}>
+                {n.index != null ? `#${n.index}` : "图"}
+              </span>
+              <span
+                onClick={() => onRemoveRef(n.id)}
+                style={{ color: "#888", fontSize: 12, cursor: "pointer", userSelect: "none", flexShrink: 0 }}
+                title="移除引用"
+              >
+                ✕
+              </span>
+            </div>
+          ))}
+          <span
+            onClick={onClearRefs}
+            style={{ color: "#666", fontSize: 11, cursor: "pointer", userSelect: "none", marginLeft: "auto", flexShrink: 0 }}
+          >
+            清空
+          </span>
+        </div>
+      )}
+
       {/* 输入区 */}
       <div
         style={{
@@ -570,6 +645,7 @@ export function ChatPanel({ canvasId, onCanvasUpdate }: ChatPanelProps) {
         }}
       >
         <textarea
+          ref={inputRef}
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => {

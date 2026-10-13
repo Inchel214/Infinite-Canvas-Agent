@@ -78,7 +78,7 @@ export async function generateImageStream(
     y: number;
     node_id?: string;
     node_ids?: string[];
-    experience_id?: string;
+    experience_ids?: string[];
   },
   handlers: StreamEvents
 ): Promise<void> {
@@ -146,12 +146,12 @@ export async function generateImage(
   size = "2K",
   x?: number,
   y?: number,
-  experienceId?: string
+  experienceIds?: string[]
 ): Promise<DirectResponse> {
   const res = await fetch(`${API_BASE}/canvas/${canvasId}/generate`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ prompt, size, x, y, experience_id: experienceId || undefined }),
+    body: JSON.stringify({ prompt, size, x, y, experience_ids: experienceIds?.length ? experienceIds : undefined }),
   });
   if (!res.ok) {
     throw new Error(`${res.status}`);
@@ -166,7 +166,7 @@ export async function composeImages(
   size = "2K",
   x?: number,
   y?: number,
-  experienceId?: string
+  experienceIds?: string[]
 ): Promise<DirectResponse> {
   const res = await fetch(`${API_BASE}/canvas/${canvasId}/compose`, {
     method: "POST",
@@ -177,7 +177,7 @@ export async function composeImages(
       size,
       x,
       y,
-      experience_id: experienceId || undefined,
+      experience_ids: experienceIds?.length ? experienceIds : undefined,
     }),
   });
   if (!res.ok) {
@@ -193,7 +193,7 @@ export async function variateImage(
   size = "2K",
   x?: number,
   y?: number,
-  experienceId?: string
+  experienceIds?: string[]
 ): Promise<DirectResponse> {
   const res = await fetch(`${API_BASE}/canvas/${canvasId}/variate`, {
     method: "POST",
@@ -204,7 +204,7 @@ export async function variateImage(
       size,
       x,
       y,
-      experience_id: experienceId || undefined,
+      experience_ids: experienceIds?.length ? experienceIds : undefined,
     }),
   });
   if (!res.ok) {
@@ -220,7 +220,7 @@ export async function editImage(
   size = "2K",
   x?: number,
   y?: number,
-  experienceId?: string
+  experienceIds?: string[]
 ): Promise<DirectResponse> {
   const res = await fetch(`${API_BASE}/canvas/${canvasId}/edit`, {
     method: "POST",
@@ -231,7 +231,7 @@ export async function editImage(
       size,
       x,
       y,
-      experience_id: experienceId || undefined,
+      experience_ids: experienceIds?.length ? experienceIds : undefined,
     }),
   });
   if (!res.ok) {

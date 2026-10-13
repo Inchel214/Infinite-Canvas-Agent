@@ -17,6 +17,7 @@ class ListNodesTool(BaseTool):
         nodes = state.list_nodes()
         node_list = [
             {
+                "index": n.index,
                 "id": n.id,
                 "type": n.type,
                 "content": n.content,

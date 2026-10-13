@@ -182,6 +182,21 @@ def apply_experience(exp_id: str, prompt: str) -> str:
     return f"{prompt.strip()}\n\n{style_block}"
 
 
+def apply_experiences(exp_ids: list[str], prompt: str) -> str:
+    """多风格版：按顺序把每份风格指南全文拼接进用户 prompt（无效 ID 自动跳过）"""
+    blocks: list[str] = []
+    for exp_id in exp_ids:
+        exp = read_experience(exp_id)
+        if exp:
+            blocks.append(f"请严格遵循以下风格指南《{exp['name']}》进行创作：\n{exp['content']}")
+    if not blocks:
+        return prompt
+    joined = "\n\n".join(blocks)
+    if not prompt.strip():
+        return joined
+    return f"{prompt.strip()}\n\n{joined}"
+
+
 def catalog_text() -> str:
     """Agent System Prompt 用：风格库目录（仅 id/名称/描述，全文靠 read_experience 按需读）"""
     items = list_experiences()

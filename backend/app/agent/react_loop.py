@@ -131,7 +131,7 @@ class ReActAgent:
         return tool.run(state, **args)
 
     def _resolve_node_id(self, node_id: str, state: CanvasState) -> str | None:
-        """解析特殊节点 ID"""
+        """解析特殊节点 ID：first/all，以及 #N / N / 图N 编号指代"""
         if node_id == "first":
             nodes = state.list_nodes()
             return nodes[0].id if nodes else None
@@ -139,10 +139,28 @@ class ReActAgent:
             # MVP: 删除所有节点时逐个删（这里返回第一个，循环会处理）
             nodes = state.list_nodes()
             return nodes[0].id if nodes else None
+        # 用户说"3号图"时 LLM 可能传 "#3" / "3" / "图3"，按编号映射到节点 ID
+        idx = self._parse_index(node_id)
+        if idx is not None:
+            for n in state.list_nodes():
+                if n.index == idx:
+                    return n.id
+            return None
         return node_id
 
+    @staticmethod
+    def _parse_index(value: str) -> int | None:
+        """把 '#3' / '3' / '图3' / '第3张' 解析为编号 3，其余返回 None"""
+        import re
+
+        m = re.fullmatch(r"#?(\d+)|图#?(\d+)|第(\d+)[张个]?", str(value).strip())
+        if not m:
+            return None
+        num = next(g for g in m.groups() if g is not None)
+        return int(num)
+
     def _resolve_node_ids(self, node_ids: list[str], state: CanvasState) -> list[str]:
-        """解析节点 ID 列表中的特殊值（first/all）"""
+        """解析节点 ID 列表中的特殊值（first/all）与编号指代（#N / 图N）"""
         resolved: list[str] = []
         for nid in node_ids:
             if nid in ("all", "first"):
@@ -153,21 +171,24 @@ class ReActAgent:
                 else:
                     resolved.extend(n.id for n in nodes)
             else:
-                resolved.append(nid)
+                rid = self._resolve_node_id(nid, state)
+                if rid is not None:
+                    resolved.append(rid)
         return resolved
 
     def _build_user_message(self, prompt: str, state: CanvasState) -> str:
         """构建包含画布状态的用户消息"""
         nodes_info = []
-        for i, n in enumerate(state.list_nodes(), 1):
+        for n in state.list_nodes():
+            label = f"图{n.index}" if n.index is not None else "图?"
             if n.type == "image":
                 nodes_info.append(
-                    f"- [图{i}] {n.id}: image prompt='{n.content}' "
+                    f"- [{label}] {n.id}: image prompt='{n.content}' "
                     f"size={n.width}x{n.height} at ({n.x}, {n.y})"
                 )
             else:
                 nodes_info.append(
-                    f"- [图{i}] {n.id}: {n.type} '{n.content}' at ({n.x}, {n.y})"
+                    f"- [{label}] {n.id}: {n.type} '{n.content}' at ({n.x}, {n.y})"
                 )
         canvas_context = "\n".join(nodes_info) if nodes_info else "(空画布)"
         return f"画布当前节点：\n{canvas_context}\n\n用户指令：{prompt}"

@@ -12,3 +12,23 @@ body,
   overflow: hidden;
   font-family: system-ui, "Segoe UI", Roboto, sans-serif;
 }
+
+/* 深色主题细滚动条：编辑框/右键菜单等浮层内部滚动区，避免原生粗条顶出圆角 */
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.22);
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.35);
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.22) transparent;
+}

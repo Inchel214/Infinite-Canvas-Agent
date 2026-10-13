@@ -36,6 +36,24 @@ function App() {
   const [providers, setProviders] = useState<Record<string, ProviderPreset>>({});
   // 各画布生图任务状态（红点）：canvas_id -> { generating, pending }
   const [badges, setBadges] = useState<Record<string, { generating: number; pending: number }>>({});
+  // 对话引用的图片节点 ID（右键"添加到对话"）：随画布切换清空
+  const [chatRefIds, setChatRefIds] = useState<string[]>([]);
+  // ChatPanel 开合提升到 App：添加引用时即使面板收起也能自动弹出
+  const [chatOpen, setChatOpen] = useState(() => {
+    try {
+      return localStorage.getItem("chatPanelOpen") !== "0";
+    } catch {
+      return true;
+    }
+  });
+  const toggleChatOpen = useCallback((next: boolean) => {
+    setChatOpen(next);
+    try {
+      localStorage.setItem("chatPanelOpen", next ? "1" : "0");
+    } catch {
+      /* 忽略隐私模式等写入失败 */
+    }
+  }, []);
   // 守卫用：异步回调校验画布身份时读最新值（不经 React state 闭包）
   const canvasIdRef = useRef<string | null>(null);
 
@@ -43,6 +61,8 @@ function App() {
   const applyCanvasId = useCallback((id: string, state?: CanvasState) => {
     canvasIdRef.current = id;
     setCanvasId(id);
+    // 画布切换：对话引用跟着换画布会指错图，直接清空
+    setChatRefIds([]);
     localStorage.setItem(LAST_CANVAS_KEY, id);
     try {
       const url = new URL(window.location.href);
@@ -175,23 +195,23 @@ function App() {
     try {
       if (action.type === "compose") {
         // 进行中状态显示在被操作图片的边界框上（Canvas processing），顶部不再提示
-        const res = await composeImages(canvasId, action.nodeIds, action.prompt, action.size, action.x, action.y, action.experienceId);
+        const res = await composeImages(canvasId, action.nodeIds, action.prompt, action.size, action.x, action.y, action.experienceIds);
         applyCanvasState(res.canvas);
         setStatusMsg(res.message);
         return res.success;
       } else if (action.type === "variate") {
-        const res = await variateImage(canvasId, action.nodeId, action.prompt, action.size, action.x, action.y, action.experienceId);
+        const res = await variateImage(canvasId, action.nodeId, action.prompt, action.size, action.x, action.y, action.experienceIds);
         applyCanvasState(res.canvas);
         setStatusMsg(res.message);
         return res.success;
       } else if (action.type === "edit") {
-        const res = await editImage(canvasId, action.nodeId, action.prompt, action.size, action.x, action.y, action.experienceId);
+        const res = await editImage(canvasId, action.nodeId, action.prompt, action.size, action.x, action.y, action.experienceIds);
         applyCanvasState(res.canvas);
         setStatusMsg(res.message);
         return res.success;
       } else if (action.type === "generate") {
         setStatusMsg("正在生成图片...");
-        const res = await generateImage(canvasId, action.prompt, action.size, action.x, action.y, action.experienceId);
+        const res = await generateImage(canvasId, action.prompt, action.size, action.x, action.y, action.experienceIds);
         applyCanvasState(res.canvas);
         setStatusMsg(res.message);
         return res.success;
@@ -254,6 +274,11 @@ function App() {
         }}
         onAction={handleAction}
         onCanvasUpdate={applyCanvasState}
+        onAddToChat={(ids) => {
+          // 去重追加引用，并弹出对话面板让用户直接输入指令
+          setChatRefIds((prev) => [...new Set([...prev, ...ids])]);
+          if (!chatOpen) toggleChatOpen(true);
+        }}
       />
 
       {/* 右上角入口：画布管理 + 大模型设置 */}
@@ -393,6 +418,17 @@ function App() {
       <ChatPanel
         key={`chat-${canvasId ?? "none"}`}
         canvasId={canvasId}
+        open={chatOpen}
+        onOpenChange={toggleChatOpen}
+        refNodes={
+          canvasState
+            ? chatRefIds
+                .map((id) => canvasState.nodes[id])
+                .filter((n): n is NonNullable<typeof n> => !!n)
+            : []
+        }
+        onRemoveRef={(nodeId) => setChatRefIds((prev) => prev.filter((id) => id !== nodeId))}
+        onClearRefs={() => setChatRefIds([])}
         onCanvasUpdate={applyCanvasState}
       />
 

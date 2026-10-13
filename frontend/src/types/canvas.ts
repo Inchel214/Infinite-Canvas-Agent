@@ -10,6 +10,8 @@ export interface CanvasNode {
   content: string;
   image_url?: string;
   source_ids?: string[];
+  /** 节点编号（画布内唯一递增，删除不回收）：用户与 Agent 用 #N 指代 */
+  index?: number | null;
 }
 
 export interface CanvasState {
