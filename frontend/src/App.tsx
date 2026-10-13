@@ -54,6 +54,23 @@ function App() {
       /* 忽略隐私模式等写入失败 */
     }
   }, []);
+  // ChatPanel 宽度提升到 App：画布层缩放指示器需据此避让面板
+  const [chatWidth, setChatWidth] = useState<number>(() => {
+    try {
+      const v = Number(localStorage.getItem("chatPanelWidth"));
+      return Number.isFinite(v) && v >= 360 ? v : 360;
+    } catch {
+      return 360;
+    }
+  });
+  const handleChatWidthChange = useCallback((w: number) => {
+    setChatWidth(w);
+    try {
+      localStorage.setItem("chatPanelWidth", String(w));
+    } catch {
+      /* 忽略写入失败 */
+    }
+  }, []);
   // 守卫用：异步回调校验画布身份时读最新值（不经 React state 闭包）
   const canvasIdRef = useRef<string | null>(null);
 
@@ -279,6 +296,7 @@ function App() {
           setChatRefIds((prev) => [...new Set([...prev, ...ids])]);
           if (!chatOpen) toggleChatOpen(true);
         }}
+        chatDockWidth={chatOpen ? chatWidth : 0}
       />
 
       {/* 右上角入口：画布管理 + 大模型设置 */}
@@ -424,6 +442,8 @@ function App() {
         canvasId={canvasId}
         open={chatOpen}
         onOpenChange={toggleChatOpen}
+        width={chatWidth}
+        onWidthChange={handleChatWidthChange}
         refNodes={
           canvasState
             ? chatRefIds

@@ -22,6 +22,9 @@ interface ChatPanelProps {
   // 面板开合（受控，状态在 App：添加引用时可自动弹出）
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  // 面板宽度（受控，状态在 App：画布层的缩放指示器需据此避让）
+  width: number;
+  onWidthChange: (w: number) => void;
   // 右键"添加到对话"引用的图片（App 从画布状态解析）
   refNodes: CanvasNode[];
   onRemoveRef: (nodeId: string) => void;
@@ -142,6 +145,8 @@ export function ChatPanel({
   canvasId,
   open,
   onOpenChange,
+  width,
+  onWidthChange,
   refNodes,
   onRemoveRef,
   onClearRefs,
@@ -151,7 +156,6 @@ export function ChatPanel({
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
-  const [width, setWidth] = useState(MIN_PANEL_WIDTH);
   const [resizing, setResizing] = useState(false);
   const [hoverHandle, setHoverHandle] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
@@ -177,7 +181,7 @@ export function ChatPanel({
       if (!s) return;
       const max = Math.min(MAX_PANEL_WIDTH, window.innerWidth - 100);
       const w = Math.max(MIN_PANEL_WIDTH, Math.min(max, s.startWidth + (s.startX - e.clientX)));
-      setWidth(w);
+      onWidthChange(w);
     };
     const onUp = () => setResizing(false);
     window.addEventListener("mousemove", onMove);
@@ -298,7 +302,7 @@ export function ChatPanel({
         style={{
           position: "fixed",
           right: 20,
-          bottom: 24,
+          bottom: 52, // 让开右下角钉住的缩放百分比指示器（约 24px 高 + 间距）
           width: 56,
           height: 56,
           borderRadius: "50%",

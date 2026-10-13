@@ -304,6 +304,8 @@ interface CanvasProps {
   onCanvasUpdate?: (state: CanvasState) => void;
   // 右键"添加到对话"：把选中图片引用进 ChatPanel，发送时注入 Agent 上下文
   onAddToChat?: (nodeIds: string[]) => void;
+  // 右侧对话面板展开时占据的宽度（含定位边距前的面板净宽）；用于缩放指示器避让
+  chatDockWidth?: number;
 }
 
 /**
@@ -312,7 +314,7 @@ interface CanvasProps {
  * 多选：单击/Ctrl+Shift+点选、空白直接拖动框选、右键菜单直接生成
  * 平移：空格+拖动 / Shift+拖动 / 鼠标中键拖动
  */
-export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved, onAction, onCanvasUpdate, onAddToChat }: CanvasProps) {
+export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved, onAction, onCanvasUpdate, onAddToChat, chatDockWidth = 0 }: CanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   // 相机视角存档：每个画布记住用户上次停留的视角（localStorage），切回/刷新时还原。
   // 否则切画布时组件重挂载、视角重置到世界原点——内容不在原点附近时就表现为"画布空白不显示"
@@ -2217,18 +2219,20 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         </svg>
       </button>
 
-      {/* 缩放指示器 */}
+      {/* 缩放指示器：钉在视口右下角（对话圆按钮已上移避让）；对话面板展开时只做水平避让（贴面板左外缘），纵向永不移动 */}
       <div
         style={{
           position: "absolute",
-          bottom: 80,
-          right: 16,
+          bottom: 16,
+          right: chatDockWidth > 0 ? chatDockWidth + 24 : 16,
           background: "rgba(0,0,0,0.6)",
           color: "#fff",
           padding: "4px 10px",
           borderRadius: 6,
           fontSize: 12,
           pointerEvents: "none",
+          transition: "right 0.18s ease",
+          zIndex: 500,
         }}
       >
         {Math.round(zoom * 100)}%

@@ -492,12 +492,7 @@ def generate_image_stream(canvas_id: str, req: StreamGenRequest):
         if len(sources) < 2:
             raise HTTPException(status_code=400, detail="至少需要 2 张图片才能组合")
         ref_urls = [n.image_url for n in sources]
-        prompt = req.prompt
-        source_descs = [n.content for n in sources if n.content]
-        if source_descs and not prompt:
-            prompt = "融合以下内容生成一张新图：" + "；".join(source_descs)
-        elif source_descs and prompt:
-            prompt = f"{prompt}。参考内容：{'；'.join(source_descs)}"
+        prompt = req.prompt or "融合以上图片的内容，生成一张新图"
         width = max(n.width for n in sources)
         height = max(n.height for n in sources)
     elif req.op == "variate":
@@ -1008,18 +1003,23 @@ class RevealImageRequest(BaseModel):
 
 @router.post("/reveal-image", summary="在系统文件管理器中打开图片所在文件夹并定位该文件")
 def reveal_image(req: RevealImageRequest):
-    from app.image.files import IMAGES_DIR, is_local_image_url
+    from app.image.files import IMAGES_DIR, is_local_image_url, _rel_from_url
 
     url = req.url
     if not is_local_image_url(url):
         raise HTTPException(status_code=400, detail="该图片不在本地存储（远程图片或尚未落盘）")
 
-    # 文件名安全校验：与 local_url_to_data_url 同规则，杜绝路径穿越
-    name = url.rsplit("/", 1)[-1]
-    if not name or "/" in name or "\\" in name or ".." in name:
-        raise HTTPException(status_code=400, detail=f"非法图片地址: {url}")
+    # 解析为 images 下的相对路径：{canvas_id}/{name}（新结构）或 {name}（旧平铺结构），
+    # 同时完成路径穿越校验，不能只取末段文件名，否则会丢掉 canvas_id 子目录。
+    try:
+        rel = _rel_from_url(url)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    path = (IMAGES_DIR / name).resolve()
+    images_root = IMAGES_DIR.resolve()
+    path = (IMAGES_DIR / rel).resolve()
+    if not path.is_relative_to(images_root):
+        raise HTTPException(status_code=400, detail=f"非法图片地址: {url}")
     if not path.is_file():
         raise HTTPException(status_code=404, detail="本地图片文件不存在（可能已被清理）")
 
@@ -1036,4 +1036,4 @@ def reveal_image(req: RevealImageRequest):
     except OSError as e:
         raise HTTPException(status_code=500, detail=f"无法打开文件管理器: {e}")
 
-    return {"success": True, "message": f"已在文件管理器中定位 {name}"}
+    return {"success": True, "message": f"已在文件管理器中定位 {path.name}"}
