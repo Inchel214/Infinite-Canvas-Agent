@@ -24,19 +24,25 @@ _STREAM_DEFAULT_MODEL = "doubao-seedream-4-0-20260415"
 
 # 流式模型（Seedream 5.0 Lite）总像素下限 3686400：不足时等比放大（32 倍数对齐）
 _MIN_PIXELS = 3686400
+# 其余模型（Seedream 4.0 / 5.0 Pro，实测 400 报错信息）总像素下限 921600（≈960x960）
+_BASE_MIN_PIXELS = 921600
 
 
-def _clamp_size(size: str) -> str:
-    if size == "1K":
-        return "2048x2048"
+def _clamp_size(size: str, model: str = "") -> str:
+    # "1K" 显式转像素（Lite 模型达不到下限时由下方面积钳制兜底）；"2K"/"4K" 原样透传（API 原生支持）
+    if size.strip().upper() == "1K":
+        size = "1024x1024"
+    # 钳制阈值按模型区分：5.0 Lite 为 3686400，其余为 921600（无差别套 Lite 阈值会把
+    # 合法的 1024x1024（1K）悄悄放大成 1920x1920，导致分辨率档位与实际图片不符）
+    min_pixels = _MIN_PIXELS if "lite" in model.lower() else _BASE_MIN_PIXELS
     try:
         if "x" in size:
             w, h = (int(v) for v in size.lower().split("x", 1))
-            if w * h < _MIN_PIXELS:
-                scale = (_MIN_PIXELS / (w * h)) ** 0.5
+            if w * h < min_pixels:
+                scale = (min_pixels / (w * h)) ** 0.5
                 w = max(32, -(-int(w * scale) // 32) * 32)  # 向上取整到 32 倍数
                 h = max(32, -(-int(h * scale) // 32) * 32)
-                while w * h < _MIN_PIXELS:  # 对齐后仍不足则继续加
+                while w * h < min_pixels:  # 对齐后仍不足则继续加
                     if w <= h:
                         w += 32
                     else:
@@ -97,7 +103,7 @@ class VolcEngineImageGenerator(BaseImageGenerator):
         body: dict = {
             "model": self.model,
             "prompt": prompt,
-            "size": _clamp_size(size),
+            "size": _clamp_size(size, self.model),
             "response_format": "url",
             "watermark": False,
         }
@@ -157,7 +163,7 @@ class VolcEngineImageGenerator(BaseImageGenerator):
         body: dict = {
             "model": self.stream_model,
             "prompt": prompt,
-            "size": _clamp_size(size),
+            "size": _clamp_size(size, self.stream_model),
             "response_format": "url",
             "watermark": False,
             "stream": True,

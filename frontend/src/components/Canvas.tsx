@@ -117,6 +117,14 @@ function calcSize(ratioKey: string, res: string): string {
   // Seedream 要求 512~4096 且为 32 的倍数
   w = Math.max(512, Math.min(4096, Math.round(w / 32) * 32));
   h = Math.max(512, Math.min(4096, Math.round(h / 32) * 32));
+  // 模型总像素下限 921600（≈960x960，实测 4.0/5.0 Pro）：不足时等比放大（32 倍数对齐），
+  // 保证 UI 计算的尺寸与后端实际发送、图片真实输出一致（如 1K 16:9 → 1280x736）
+  const MIN_AREA = 921600;
+  if (w * h < MIN_AREA) {
+    const s = Math.sqrt(MIN_AREA / (w * h));
+    w = Math.max(32, Math.ceil((w * s) / 32) * 32);
+    h = Math.max(32, Math.ceil((h * s) / 32) * 32);
+  }
   return `${w}x${h}`;
 }
 
