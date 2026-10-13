@@ -9,7 +9,13 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 
 from app.canvas.state import CanvasState, create_canvas
-from app.image.files import materialize_state_images, normalize_state_image_sizes
+from app.image.files import (
+    IMAGES_DIR,
+    _rel_from_url,
+    is_local_image_url,
+    materialize_state_images,
+    normalize_state_image_sizes,
+)
 
 # 历史栈最大长度（避免无限制增长占用内存）
 _MAX_HISTORY = 50
@@ -269,12 +275,63 @@ class FileStore(InMemoryStore):
         exists = path.exists()
         if not exists and canvas_id not in self._canvases:
             raise ValueError(f"画布不存在: {canvas_id}")
+        # 删除前收集该画布引用的本地图片（旧平铺格式），用于级联清理
+        state = self._canvases.get(canvas_id) or self._load_from_disk(canvas_id)
+        referenced = [
+            n.image_url for n in (state.nodes.values() if state else [])
+            if n.image_url and is_local_image_url(n.image_url)
+        ]
         # 清内存与撤销历史
         self._canvases.pop(canvas_id, None)
         self._history.pop(canvas_id, None)
-        # 删磁盘文件（被引用的图片文件不级联删除，属无害孤儿文件）
+        # 删磁盘文件
         if exists:
             try:
                 path.unlink()
+            except OSError:
+                pass
+        # 级联删除图片：整删画布子目录（新归类格式），再删旧平铺格式的引用文件
+        self._delete_canvas_images(canvas_id, referenced)
+
+    def _delete_canvas_images(self, canvas_id: str, referenced_urls: list[str]) -> None:
+        """画布删除后清理其图片文件；失败不阻断删除流程"""
+        import shutil
+
+        # 新格式：images/{canvas_id}/ 整目录
+        canvas_dir = IMAGES_DIR / canvas_id
+        if canvas_dir.is_dir():
+            try:
+                shutil.rmtree(canvas_dir)
+            except OSError:
+                pass
+        # 旧格式：平铺在根目录的引用文件（别的画布未引用才安全删——
+        # 平铺时代图片不区分归属，仅当文件不在任何其他画布 JSON 中时删除）
+        if not referenced_urls:
+            return
+        other_refs: set[str] = set()
+        for p in self._data_dir.glob("*.json"):
+            if p.stem == canvas_id:
+                continue
+            try:
+                with p.open("r", encoding="utf-8") as f:
+                    d = json.load(f)
+                for n in d.get("nodes", {}).values():
+                    u = n.get("image_url") or ""
+                    if u and is_local_image_url(u):
+                        try:
+                            other_refs.add(_rel_from_url(u))
+                        except ValueError:
+                            pass
+            except (json.JSONDecodeError, OSError):
+                continue
+        for url in referenced_urls:
+            try:
+                rel = _rel_from_url(url)
+            except ValueError:
+                continue
+            if rel in other_refs:
+                continue  # 仍被其他画布引用，保留
+            try:
+                (IMAGES_DIR / rel).unlink()
             except OSError:
                 pass

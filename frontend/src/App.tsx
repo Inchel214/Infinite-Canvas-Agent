@@ -410,6 +410,10 @@ function App() {
           onClose={() => setShowPicker(false)}
           onSwitch={switchCanvas}
           onCreate={createNewCanvas}
+          onRename={(id, name) => {
+            // 重命名当前画布时同步顶部按钮显示（否则要等重新加载/切换画布才更新）
+            setCanvasState((s) => (s && s.canvas_id === id ? { ...s, name } : s));
+          }}
           onStatus={setStatusMsg}
         />
       )}

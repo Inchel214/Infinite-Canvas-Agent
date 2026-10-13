@@ -13,6 +13,8 @@ interface CanvasPickerPanelProps {
   onSwitch: (id: string) => Promise<boolean>;
   // 新建画布并切换，返回新画布 id（失败 null）；name 为空则后端自动编号
   onCreate: (name?: string) => Promise<string | null>;
+  // 重命名成功后回调（id + 新名）：若重命名的是当前画布，App 需同步顶部按钮显示
+  onRename: (id: string, name: string) => void;
   // 操作反馈（走 App 的 statusMsg 机制，2.2s 自动淡出）
   onStatus: (msg: string) => void;
 }
@@ -34,6 +36,7 @@ export function CanvasPickerPanel({
   onClose,
   onSwitch,
   onCreate,
+  onRename,
   onStatus,
 }: CanvasPickerPanelProps) {
   const [canvases, setCanvases] = useState<CanvasSummary[]>([]);
@@ -99,6 +102,7 @@ export function CanvasPickerPanel({
       await renameCanvas(renamingId, name);
       setRenamingId(null);
       onStatus("已重命名");
+      onRename(renamingId, name);
       await refresh();
     } catch (e) {
       onStatus("重命名失败：" + (e as Error).message);

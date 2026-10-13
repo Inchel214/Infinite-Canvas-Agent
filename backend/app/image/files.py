@@ -40,15 +40,21 @@ _EXT = {
 _MIME_FROM_EXT = {v: k for k, v in _EXT.items()}
 
 
-def save_data_image(data_url: str) -> str:
-    """base64 data URL → 落盘文件，返回 http URL"""
+def save_data_image(data_url: str, canvas_id: str = "") -> str:
+    """base64 data URL → 落盘到画布子目录，返回 http URL
+
+    图片按画布归类（images/{canvas_id}/），画布删除时可整目录级联清理。
+    canvas_id 为空时落到平铺根目录（兼容无画布上下文的调用）。
+    """
     header, _, b64 = data_url.partition(",")
     mime = header[5:].split(";", 1)[0] or "image/png"
     content = base64.b64decode(b64)
     name = f"{uuid.uuid4().hex}.{_EXT.get(mime, 'png')}"
-    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-    (IMAGES_DIR / name).write_bytes(content)
-    return f"{PUBLIC_BASE}/images/{name}"
+    rel = f"{canvas_id}/{name}" if canvas_id else name
+    target = IMAGES_DIR / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
+    return f"{PUBLIC_BASE}/images/{rel}"
 
 
 def is_local_image_url(url: str) -> bool:
@@ -63,15 +69,36 @@ def is_local_image_url(url: str) -> bool:
     return False
 
 
+def _rel_from_url(url: str) -> str:
+    """本地图片 URL → images 目录下的相对路径（{canvas_id}/{name} 或旧平铺 {name}）"""
+    # 取 /images/ 之后的部分：兼容带端口与不带端口的本地地址
+    for prefix in (
+        f"{PUBLIC_BASE}/images/",
+        "http://127.0.0.1/images/",
+        "http://localhost/images/",
+    ):
+        if url.startswith(prefix):
+            rel = url[len(prefix):]
+            break
+    else:
+        rel = url.rsplit("/images/", 1)[-1]
+    # 安全校验：只允许一段或两段（目录/文件名），禁止穿越
+    parts = rel.split("/")
+    if not rel or "\\" in rel or any(p in ("", ".", "..") for p in parts) or len(parts) > 2:
+        raise ValueError(f"非法图片地址: {url}")
+    return rel
+
+
+def _mime_from_rel(rel: str) -> str:
+    ext = rel.rsplit(".", 1)[-1].lower() if "." in rel else "png"
+    return _MIME_FROM_EXT.get(ext, "image/png")
+
+
 def local_url_to_data_url(url: str) -> str:
     """本地图片 URL → 内联 data URL（供生图 API 参考图使用）"""
-    name = url.rsplit("/", 1)[-1]
-    if not name or "/" in name or "\\" in name or ".." in name:
-        raise ValueError(f"非法图片地址: {url}")
-    ext = name.rsplit(".", 1)[-1].lower() if "." in name else "png"
-    mime = _MIME_FROM_EXT.get(ext, "image/png")
-    content = (IMAGES_DIR / name).read_bytes()
-    return f"data:{mime};base64,{base64.b64encode(content).decode('ascii')}"
+    rel = _rel_from_url(url)
+    content = (IMAGES_DIR / rel).read_bytes()
+    return f"data:{_mime_from_rel(rel)};base64,{base64.b64encode(content).decode('ascii')}"
 
 
 def to_sendable_ref(url: str) -> str:
@@ -96,10 +123,8 @@ def image_display_size(url: str, max_edge: int = 400) -> tuple[int, int] | None:
             _, _, b64 = url.partition(",")
             source = io.BytesIO(base64.b64decode(b64))
         elif is_local_image_url(url):
-            name = url.rsplit("/", 1)[-1]
-            if not name or "/" in name or "\\" in name or ".." in name:
-                return None
-            source = IMAGES_DIR / name
+            rel = _rel_from_url(url)
+            source = IMAGES_DIR / rel
         else:
             return None
 
@@ -143,13 +168,16 @@ def normalize_state_image_sizes(
 
 
 def materialize_state_images(state: CanvasState) -> int:
-    """把画布内 data URL 节点图片落盘为文件（原地替换为 http URL），返回转换数（幂等）"""
+    """把画布内 data URL 节点图片落盘为文件（原地替换为 http URL），返回转换数（幂等）
+
+    落盘到该画布的子目录 images/{canvas_id}/，随画布归类管理。
+    """
     count = 0
     for node in state.nodes.values():
         url = node.image_url
         if url and url.startswith("data:image/"):
             try:
-                node.image_url = save_data_image(url)
+                node.image_url = save_data_image(url, state.canvas_id)
                 count += 1
             except (ValueError, OSError):
                 # 单张落盘失败保留 data URL，不影响保存画布
