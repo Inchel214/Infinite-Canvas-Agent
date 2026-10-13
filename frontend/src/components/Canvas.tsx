@@ -2241,16 +2241,36 @@ function StyleSelect({
 }) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  // 下拉的 fixed 定位（打开时刻按按钮屏幕矩形计算；按钮在缩放的容器面板内时 rect 仍是真实屏幕坐标）
+  const [listPos, setListPos] = useState({ left: 0, top: 0, width: 0, maxH: 208 });
+
+  // 打开时计算定位：portal 到 body + fixed，避免被 EditPanel 内容区 overflow:hidden、
+  // 画布世界层裁剪、容器面板 transform:scale 等任何父级上下文裁剪/缩放
+  useEffect(() => {
+    if (!open || !btnRef.current) return;
+    const r = btnRef.current.getBoundingClientRect();
+    const maxH = Math.max(120, Math.min(208, window.innerHeight - r.bottom - 12));
+    setListPos({ left: r.left, top: r.bottom + 4, width: r.width, maxH });
+  }, [open]);
+
   // 点击组件外部/按 Esc 关闭下拉。
   // 用捕获阶段监听：EditPanel/ContextMenu 根节点对 mousedown stopPropagation（阻止画布拖拽），
   // 冒泡阶段的 document 监听收不到事件，点面板内其他区域时下拉关不掉
   useEffect(() => {
     if (!open) return;
     const onDocDown = (ev: MouseEvent) => {
-      if (rootRef.current && !rootRef.current.contains(ev.target as Node)) setOpen(false);
+      const t = ev.target as Node;
+      if (rootRef.current?.contains(t) || listRef.current?.contains(t)) return;
+      setOpen(false);
     };
     const onKey = (ev: KeyboardEvent) => {
-      if (ev.key === "Escape") setOpen(false);
+      if (ev.key === "Escape") {
+        // 只关下拉：阻止 Esc 继续传播关闭编辑框/菜单/容器
+        ev.stopPropagation();
+        setOpen(false);
+      }
     };
     document.addEventListener("mousedown", onDocDown, true);
     document.addEventListener("keydown", onKey, true);
@@ -2274,9 +2294,10 @@ function StyleSelect({
         : `已选 ${names.length} 个风格`;
 
   return (
-    <div ref={rootRef} style={{ marginTop: 10, position: "relative" }}>
+    <div ref={rootRef} style={{ marginTop: 10 }}>
       <div style={{ fontSize: 14, color: "rgba(255,255,255,0.78)", marginBottom: 6 }}>风格（可多选）</div>
       <button
+        ref={btnRef}
         type="button"
         onClick={() => setOpen((o) => !o)}
         title="选中后，每份风格指南全文会依次拼接进生成提示词"
@@ -2310,20 +2331,21 @@ function StyleSelect({
         </span>
         <span style={{ fontSize: 11, opacity: 0.6, flexShrink: 0 }}>▼</span>
       </button>
-      {open && (
+      {open && createPortal(
         <div
+          ref={listRef}
           style={{
-            position: "absolute",
-            top: "100%",
-            left: 0,
-            right: 0,
-            marginTop: 4,
-            zIndex: 60,
+            position: "fixed",
+            left: listPos.left,
+            top: listPos.top,
+            width: listPos.width,
+            boxSizing: "border-box",
+            zIndex: 1100,
             background: "rgba(20,20,40,0.98)",
             border: "1px solid rgba(167,139,250,0.5)",
             borderRadius: 8,
             boxShadow: "0 8px 24px rgba(0,0,0,0.6)",
-            maxHeight: 208,
+            maxHeight: listPos.maxH,
             overflowY: "auto",
             padding: 4,
           }}
@@ -2378,7 +2400,8 @@ function StyleSelect({
               </div>
             );
           })}
-        </div>
+        </div>,
+        document.body,
       )}
     </div>
   );
