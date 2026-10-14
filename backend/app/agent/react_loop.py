@@ -1,6 +1,7 @@
 """ReAct Agent 循环（自研，预留 LangGraph 迁移点）
 
-执行流程：规划（Plan）→ 逐步执行（Act）→ 失败反思（Reflect）→ 汇总回复。
+执行流程：规划+路由（纯对话 [chat] 前缀单次调用直答；工具任务产出分步计划）
+→ 逐步执行（Act）→ 失败反思（Reflect）→ 汇总回复。
 支持 SSE 事件回调（on_event）与外部停止（RunControl，按 canvas_id 注册，/agent/stop 触发）。
 事件流（token 级打字机）：
   plan_delta（计划逐字）/ delta（思考与回复逐字）/ tool_start / tool_result /
@@ -21,11 +22,17 @@ from app.tools.base import ToolManager, ToolResult
 # 事件回调类型
 EventCallback = Callable[[dict], None]
 
-# 规划阶段附加在用户消息后的指令：让 LLM 先给分步计划再执行
+# 规划阶段附加在用户消息后的指令：工具任务给分步计划；纯对话以 [chat] 开头直接回答
 PLAN_SUFFIX = (
-    "\n\n请先给出完成该任务的简要分步计划（每步一句话，最多 5 步；"
-    "单步任务也请列出这一步）。只输出计划文字本身，不要调用工具。"
+    "\n\n请先判断这个请求，按两种方式之一处理：\n"
+    "1. 若是需要调用工具的画布操作任务（生成、编辑、移动、删除图片、合并、查看节点等），"
+    "请给出简要分步计划（每步一句话，最多 5 步；单步任务也请列出）。只输出计划文字本身，不要调用工具。\n"
+    "2. 若是纯对话（问候、闲聊、知识问答、意见建议等），不需要操作画布，"
+    "请以标记 [chat] 开头回复，直接回答用户。"
 )
+
+# 纯对话标记：规划调用返回以它开头时，跳过计划与 ReAct 循环，单次调用收尾
+CHAT_PREFIX = "[chat]"
 
 # 工具失败后注入 tool 消息的反思提示：驱动 LLM 分析原因并调整方案
 REFLECTION_HINT = (
@@ -125,8 +132,14 @@ class ReActAgent:
 
             steps: list[dict] = []
 
-            # ===== 规划阶段：一次无工具 LLM 调用产出分步计划 =====
-            plan = self._make_plan(messages, user_msg_index, emit)
+            # ===== 规划 + 路由阶段：一次无工具 LLM 调用 =====
+            # 工具任务 → 分步计划（plan_delta 流式，注入上下文）；
+            # 纯对话 → [chat] 前缀直接回答（delta 流式，单次调用收尾，不出计划卡片）
+            plan, chat_answer = self._make_plan(messages, user_msg_index, emit)
+            if chat_answer:
+                steps.append({"type": "response", "content": chat_answer})
+                emit({"type": "response", "content": chat_answer})
+                return AgentResult(success=True, message=chat_answer, state=state, steps=steps)
             if plan:
                 steps.append({"type": "plan", "content": plan})
                 # 计划注入上下文，执行阶段模型能看到自己的计划
@@ -224,28 +237,65 @@ class ReActAgent:
         messages: list[dict],
         user_msg_index: int,
         emit: Callable[[dict], None],
-    ) -> str:
-        """规划阶段：一次无工具 LLM 调用产出分步计划。
+    ) -> tuple[str, str]:
+        """规划 + 路由：一次无工具 LLM 调用完成判断与输出。
 
-        计划同时通过事件推给前端立即展示（用户在工具执行期间能看到路线图）。
-        规划失败/空结果（如 Mock 模式）时静默降级为直接执行，不阻断主流程。
+        返回 (plan, chat_answer)：
+        - 工具任务 → plan 非空（plan_delta 流式推送，注入执行上下文）
+        - 纯对话 → 模型以 [chat] 开头直接回答，chat_answer 非空，
+          调用方可跳过 ReAct 循环单次调用收尾
+        失败/空结果（如 Mock 模式）时静默降级为直接执行，不阻断主流程。
+
+        流式路由：开头几个 chunk 分不清是不是 [chat]，用小状态机——
+        未定时缓冲并匹配前缀，匹配上转 delta，不匹配转 plan_delta。
         """
         plan_messages = list(messages)
         plan_messages[user_msg_index] = {
             "role": "user",
             "content": messages[user_msg_index]["content"] + PLAN_SUFFIX,
         }
+
+        # pending（未定）→ chat（纯对话，文本进 delta）/ plan（计划，文本进 plan_delta）
+        state = {"mode": "pending", "buf": ""}
+
+        def on_text(s: str) -> None:
+            mode = state["mode"]
+            if mode == "chat":
+                emit({"type": "delta", "content": s})
+                return
+            if mode == "plan":
+                emit({"type": "plan_delta", "content": s})
+                return
+            # 未定：累积并尝试匹配 [chat] 前缀（忽略前导空白）
+            buf = (state["buf"] + s).lstrip()
+            state["buf"] = buf
+            if not buf:
+                return  # 目前只有空白，继续等
+            if buf == CHAT_PREFIX:
+                state["mode"] = "chat"
+                return
+            if CHAT_PREFIX.startswith(buf):
+                return  # [chat] 的部分前缀，继续缓冲等下一片
+            if buf.startswith(CHAT_PREFIX):
+                # 整块到达（非流式降级路径常见）：[chat]+正文一次给出
+                state["mode"] = "chat"
+                rest = buf[len(CHAT_PREFIX):]
+                if rest:
+                    emit({"type": "delta", "content": rest})
+                return
+            state["mode"] = "plan"
+            emit({"type": "plan_delta", "content": buf})
+
         try:
-            resp = self.llm.chat_stream(
-                plan_messages,
-                tools=None,
-                on_text=lambda s: emit({"type": "plan_delta", "content": s}),
-            )
-            plan = (resp.content or "").strip()
+            resp = self.llm.chat_stream(plan_messages, tools=None, on_text=on_text)
         except Exception:
             # 规划失败不阻断执行（网络抖动 / Mock 模式等）
-            return ""
-        return plan
+            return "", ""
+        content = (resp.content or "").strip()
+        if content.startswith(CHAT_PREFIX):
+            # 纯对话：直接回答，跳过计划与主循环
+            return "", content[len(CHAT_PREFIX):].strip()
+        return content, ""
 
     @staticmethod
     def _stopped_result(state: CanvasState, steps: list[dict]) -> AgentResult:
