@@ -532,29 +532,37 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         return;
       }
 
-      // Ctrl/Cmd+Z → 撤销
-      if ((e.ctrlKey || e.metaKey) && (e.key === "z" || e.key === "Z") && canvasId) {
+      // Ctrl/Cmd+Z → 撤销（Shift+Z 不拦截，交给 Ctrl+Shift+Z 重做）
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && (e.key === "z" || e.key === "Z") && canvasId) {
         e.preventDefault();
         undoCanvas(canvasId)
           .then((res) => {
-            if (res.success) onCanvasUpdate?.(res.canvas);
+            if (res.success) {
+              onCanvasUpdate?.(res.canvas);
+              setLocalStatusMsg("已撤销");
+            } else {
+              setLocalStatusMsg("无可撤销操作");
+            }
+            setTimeout(() => setLocalStatusMsg(null), 2200);
           })
-          .catch(() => {
-            // 网络错误静默忽略
-          });
+          .catch(() => {});
         return;
       }
 
-      // Ctrl/Cmd+Y → 重做（恢复撤销）
-      if ((e.ctrlKey || e.metaKey) && (e.key === "y" || e.key === "Y") && canvasId) {
+      // Ctrl/Cmd+Y 或 Ctrl/Cmd+Shift+Z → 重做（恢复撤销）
+      if ((e.ctrlKey || e.metaKey) && ((e.key === "y" || e.key === "Y") || (e.shiftKey && (e.key === "z" || e.key === "Z"))) && canvasId) {
         e.preventDefault();
         redoCanvas(canvasId)
           .then((res) => {
-            if (res.success) onCanvasUpdate?.(res.canvas);
+            if (res.success) {
+              onCanvasUpdate?.(res.canvas);
+              setLocalStatusMsg("已重做");
+            } else {
+              setLocalStatusMsg("无可重做操作");
+            }
+            setTimeout(() => setLocalStatusMsg(null), 2200);
           })
-          .catch(() => {
-            // 网络错误静默忽略
-          });
+          .catch(() => {});
         return;
       }
 
