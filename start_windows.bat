@@ -111,7 +111,7 @@ REM ===== 7. 启动服务（两个独立窗口，关闭窗口即停止服务）=
 echo.
 echo 启动服务中...
 cd /d "%~dp0backend"
-start "InfiniteCanvas-后端" cmd /k ".venv\Scripts\python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 2"
+start "InfiniteCanvas-后端" cmd /k ".venv\Scripts\python -m uvicorn app.main:app --host 127.0.0.1 --port 8000"
 cd /d "%~dp0frontend"
 start "InfiniteCanvas-前端" cmd /k "npm run dev"
 cd /d "%~dp0"

@@ -42,6 +42,11 @@ class BaseStore(ABC):
         ...
 
     @abstractmethod
+    def redo(self, canvas_id: str) -> CanvasState | None:
+        """重做最近一次 undo，恢复到撤销前的状态。无可重做时返回 None。"""
+        ...
+
+    @abstractmethod
     def list_canvases(self) -> list[dict]:
         """列出所有画布摘要：[{canvas_id, name, node_count, updated_at}]"""
         ...
@@ -59,11 +64,14 @@ class InMemoryStore(BaseStore):
         self._canvases: dict[str, CanvasState] = {}
         # 每个 canvas_id 对应一份快照栈，按时间顺序，最后入栈的是最近一次保存前的状态
         self._history: dict[str, list[CanvasState]] = {}
+        # redo 栈：undo 时把当前状态压入，redo 时弹出
+        self._redo: dict[str, list[CanvasState]] = {}
 
     def create_canvas(self, name: str = "") -> CanvasState:
         state = create_canvas(name)
         self._canvases[state.canvas_id] = state
         self._history[state.canvas_id] = []
+        self._redo[state.canvas_id] = []
         return state
 
     def get_canvas(self, canvas_id: str) -> CanvasState:
@@ -81,6 +89,8 @@ class InMemoryStore(BaseStore):
             hist.append(copy.deepcopy(self._canvases[cid]))
             if len(hist) > _MAX_HISTORY:
                 hist.pop(0)
+        # 新操作清空 redo 栈（undo 后再操作，redo 历史失效）
+        self._redo[cid] = []
         self._canvases[cid] = state
 
     def undo(self, canvas_id: str) -> CanvasState | None:
@@ -88,9 +98,27 @@ class InMemoryStore(BaseStore):
         if not hist:
             return None
         prev = hist.pop()
+        # 把当前状态压入 redo 栈
+        redo_stack = self._redo.setdefault(canvas_id, [])
+        redo_stack.append(copy.deepcopy(self._canvases[canvas_id]))
+        if len(redo_stack) > _MAX_HISTORY:
+            redo_stack.pop(0)
         # 恢复到内存（不重新入栈，否则无法重做/反复撤销）
         self._canvases[canvas_id] = prev
         return prev
+
+    def redo(self, canvas_id: str) -> CanvasState | None:
+        redo_stack = self._redo.get(canvas_id) or []
+        if not redo_stack:
+            return None
+        nxt = redo_stack.pop()
+        # 把当前状态压回 undo 栈
+        hist = self._history.setdefault(canvas_id, [])
+        hist.append(copy.deepcopy(self._canvases[canvas_id]))
+        if len(hist) > _MAX_HISTORY:
+            hist.pop(0)
+        self._canvases[canvas_id] = nxt
+        return nxt
 
     def list_canvases(self) -> list[dict]:
         summaries = [
@@ -110,6 +138,7 @@ class InMemoryStore(BaseStore):
             raise ValueError(f"画布不存在: {canvas_id}")
         del self._canvases[canvas_id]
         self._history.pop(canvas_id, None)
+        self._redo.pop(canvas_id, None)
 
 
 class FileStore(InMemoryStore):
@@ -147,6 +176,7 @@ class FileStore(InMemoryStore):
         state = create_canvas(name)
         self._canvases[state.canvas_id] = state
         self._history[state.canvas_id] = []
+        self._redo[state.canvas_id] = []
         # 写入磁盘
         path = self._canvas_path(state.canvas_id)
         try:
@@ -220,6 +250,14 @@ class FileStore(InMemoryStore):
             self._write_canvas(prev)
         return prev
 
+    def redo(self, canvas_id: str) -> CanvasState | None:
+        nxt = super().redo(canvas_id)
+        if nxt is not None:
+            materialize_state_images(nxt)
+            normalize_state_image_sizes(nxt, self._image_size_cache)
+            self._write_canvas(nxt)
+        return nxt
+
     def list_canvases(self) -> list[dict]:
         """内存 + 磁盘合并列出所有画布摘要（磁盘文件为全集，内存数据更新）"""
         seen: dict[str, dict] = {}
@@ -281,9 +319,10 @@ class FileStore(InMemoryStore):
             n.image_url for n in (state.nodes.values() if state else [])
             if n.image_url and is_local_image_url(n.image_url)
         ]
-        # 清内存与撤销历史
+        # 清内存与撤销/重做历史
         self._canvases.pop(canvas_id, None)
         self._history.pop(canvas_id, None)
+        self._redo.pop(canvas_id, None)
         # 删磁盘文件
         if exists:
             try:

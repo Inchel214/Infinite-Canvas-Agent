@@ -2,6 +2,7 @@
 import json
 import subprocess
 import sys
+import threading
 import uuid
 from typing import List, Optional
 
@@ -12,7 +13,7 @@ from pydantic import BaseModel
 
 from app import deps
 from app import experiences
-from app.canvas.state import CanvasNode
+from app.canvas.state import CanvasNode, CanvasState
 from app.providers.schema import (
     AppSettings,
     ImageConfig,
@@ -23,6 +24,20 @@ from app.providers.schema import (
 )
 
 router = APIRouter(prefix="/api", tags=["agent"])
+
+# per-canvas 写锁：同步 def 端点跑在线程池，多容器并发生成完成时的
+# "读最新→加节点→保存"若不加锁仍是读-改-写竞态（后完成的覆盖先完成的，静默丢图）
+_canvas_write_locks: dict[str, threading.Lock] = {}
+_locks_guard = threading.Lock()
+
+
+def _canvas_lock(canvas_id: str) -> threading.Lock:
+    with _locks_guard:
+        lk = _canvas_write_locks.get(canvas_id)
+        if lk is None:
+            lk = threading.Lock()
+            _canvas_write_locks[canvas_id] = lk
+        return lk
 
 
 class ChatRequest(BaseModel):
@@ -352,6 +367,18 @@ def undo_canvas(canvas_id: str):
     return {"success": True, "message": "已撤销", "canvas": prev.to_dict()}
 
 
+@router.post("/canvas/{canvas_id}/redo", summary="重做最近一次撤销")
+def redo_canvas(canvas_id: str):
+    try:
+        nxt = deps.store.redo(canvas_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    if nxt is None:
+        current = deps.store.get_canvas(canvas_id)
+        return {"success": False, "message": "无可重做操作", "canvas": current.to_dict()}
+    return {"success": True, "message": "已重做", "canvas": nxt.to_dict()}
+
+
 @router.post("/canvas/{canvas_id}/seen", summary="清除画布未读（切换到该画布时调用）")
 def mark_canvas_seen(canvas_id: str):
     from app.tools import tasks as task_registry
@@ -516,19 +543,27 @@ def generate_image_stream(canvas_id: str, req: StreamGenRequest):
     # 风格库：选中风格后读全文确定性拼接进 prompt（对三种 op 统一生效）
     prompt = _apply_styles(req, prompt)
 
-    def _add_node(image_url: str, w: int, h: int) -> None:
-        node = CanvasNode(
-            id=str(uuid.uuid4()),
-            type="image",
-            x=req.x,
-            y=req.y,
-            width=w,
-            height=h,
-            content=prompt or "生成的图片",
-            image_url=image_url,
-            source_ids=ids,
-        )
-        state.add_node(node)
+    def _add_node(image_url: str, w: int, h: int) -> CanvasState:
+        """并发安全提交：锁内重读最新画布增量添加——多个容器并发生成时互不覆盖丢图。
+
+        不能直接保存请求开头的旧快照：旧快照不含其它并发请求已写入的节点，整体覆盖会丢图；
+        "读最新→加节点→保存"必须整体持锁，否则线程间仍是读-改-写竞态。"""
+        with _canvas_lock(canvas_id):
+            latest = deps.store.get_canvas(canvas_id)
+            node = CanvasNode(
+                id=str(uuid.uuid4()),
+                type="image",
+                x=req.x,
+                y=req.y,
+                width=w,
+                height=h,
+                content=prompt or "生成的图片",
+                image_url=image_url,
+                source_ids=ids,
+            )
+            latest.add_node(node)
+            deps.store.save_canvas(latest)
+        return latest
 
     gen = deps.manager.generator
 
@@ -559,15 +594,14 @@ def generate_image_stream(canvas_id: str, req: StreamGenRequest):
                             yield _sse(evt)
                         else:
                             result = evt["result"]
-                            _add_node(result.image_url, result.width, result.height)
-                            deps.store.save_canvas(state)
+                            latest = _add_node(result.image_url, result.width, result.height)
                             _end_tracked(True)
                             yield _sse(
                                 {
                                     "type": "done",
                                     "success": True,
                                     "message": "生成完成",
-                                    "canvas": state.to_dict(),
+                                    "canvas": latest.to_dict(),
                                 }
                             )
                             return
@@ -594,14 +628,23 @@ def generate_image_stream(canvas_id: str, req: StreamGenRequest):
             else:
                 tool = deps.tool_manager.get("generate_image")
                 result = tool.run(state, prompt=prompt, size=size, x=req.x, y=req.y)
+            final_state = result.state
             if result.success:
-                deps.store.save_canvas(result.state)
+                # 并发安全：锁内只把本次新增节点合并进最新画布（旧快照整体覆盖会丢并发结果）
+                with _canvas_lock(canvas_id):
+                    latest = deps.store.get_canvas(canvas_id)
+                    old_ids = {n.id for n in state.nodes}
+                    for n in result.state.nodes:
+                        if n.id not in old_ids:
+                            latest.add_node(n)
+                    deps.store.save_canvas(latest)
+                    final_state = latest
             yield _sse(
                 {
                     "type": "done",
                     "success": result.success,
                     "message": result.message,
-                    "canvas": result.state.to_dict(),
+                    "canvas": final_state.to_dict(),
                 }
             )
         finally:

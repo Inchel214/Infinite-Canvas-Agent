@@ -340,6 +340,17 @@ export async function undoCanvas(canvasId: string): Promise<DirectResponse> {
   return res.json();
 }
 
+// 重做最近一次撤销，无可重做时后端返回 success:false
+export async function redoCanvas(canvasId: string): Promise<DirectResponse> {
+  const res = await fetch(`${API_BASE}/canvas/${canvasId}/redo`, {
+    method: "POST",
+  });
+  if (!res.ok) {
+    throw new Error(`${res.status}`);
+  }
+  return res.json();
+}
+
 // 自动整理：网格对齐所有图片
 export async function arrangeCanvas(canvasId: string): Promise<DirectResponse> {
   const res = await fetch(`${API_BASE}/canvas/${canvasId}/arrange`, {
