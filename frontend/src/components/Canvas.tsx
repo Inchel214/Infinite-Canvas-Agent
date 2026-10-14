@@ -36,11 +36,23 @@ const ASPECT_RATIOS = [
   { key: "3:4", w: 3, h: 4 },
   { key: "16:9", w: 16, h: 9 },
   { key: "9:16", w: 9, h: 16 },
+  { key: "3:2", w: 3, h: 2 },
+  { key: "2:3", w: 2, h: 3 },
+  { key: "21:9", w: 21, h: 9 },
 ] as const;
+
+// 从 ratioKey 解析宽高比（预设或 "W:H" 自定义格式）
+function parseRatio(ratioKey: string): { w: number; h: number } {
+  const preset = ASPECT_RATIOS.find((r) => r.key === ratioKey);
+  if (preset) return { w: preset.w, h: preset.h };
+  const m = ratioKey.match(/^(\d+):(\d+)$/);
+  if (m) return { w: parseInt(m[1]), h: parseInt(m[2]) };
+  return { w: 1, h: 1 }; // 回退 1:1
+}
 
 const RESOLUTIONS = ["1K", "2K", "4K"] as const;
 
-// 按节点当前宽高比找最接近的预设（编辑图片时默认继承原图比例）
+// 按节点当前宽高比找最接近的预设或返回自定义比例（编辑图片时默认继承原图比例）
 function closestAspectKey(w: number, h: number): string {
   const target = w / h;
   let best: (typeof ASPECT_RATIOS)[number] = ASPECT_RATIOS[0];
@@ -51,6 +63,12 @@ function closestAspectKey(w: number, h: number): string {
       bestDiff = diff;
       best = r;
     }
+  }
+  // 与最接近的预设差距 > 0.05 时，返回简化的 "W:H" 自定义比例
+  if (bestDiff > 0.05) {
+    const gcd = (a: number, b: number): number => (b === 0 ? a : gcd(b, a % b));
+    const g = gcd(w, h) || 1;
+    return `${w / g}:${h / g}`;
   }
   return best.key;
 }
@@ -110,7 +128,7 @@ const CONTAINER_BASE_H = 600; // 控件自然高度（实测 598：17px 字号 +
 
 // 按比例 + 分辨率档位计算 size 字符串（如 "2048x1152"）
 function calcSize(ratioKey: string, res: string): string {
-  const ratio = ASPECT_RATIOS.find((r) => r.key === ratioKey) ?? ASPECT_RATIOS[0];
+  const ratio = parseRatio(ratioKey);
   const long = res === "1K" ? 1024 : res === "4K" ? 4096 : 2048;
   let w = ratio.w >= ratio.h ? long : Math.round((long * ratio.w) / ratio.h);
   let h = ratio.w >= ratio.h ? Math.round((long * ratio.h) / ratio.w) : long;
@@ -1298,7 +1316,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     aspectKey: string,
     srcNodes: CanvasNode[]
   ): { x: number; y: number; w: number; h: number } => {
-    const ratio = ASPECT_RATIOS.find((r) => r.key === aspectKey) ?? ASPECT_RATIOS[0];
+    const ratio = parseRatio(aspectKey);
     const long = 400; // 与后端 _DISPLAY_MAX 一致，新图出现时无缝衔接
     const w = ratio.w >= ratio.h ? long : Math.round((long * ratio.w) / ratio.h);
     const h = ratio.w >= ratio.h ? Math.round((long * ratio.h) / ratio.w) : long;
@@ -2471,6 +2489,139 @@ function StyleSelect({
 }
 
 /**
+ * 宽高比按钮组：两行布局 + 自定义输入
+ * variant: "context" | "edit" | "container" 三套配色
+ */
+function AspectRatioButtons({
+  aspect,
+  onAspectChange,
+  variant,
+}: {
+  aspect: string;
+  onAspectChange: (v: string) => void;
+  variant: "context" | "edit" | "container";
+}) {
+  const [customMode, setCustomMode] = useState(false);
+  const [customW, setCustomW] = useState("");
+  const [customH, setCustomH] = useState("");
+
+  const isPreset = ASPECT_RATIOS.some((r) => r.key === aspect);
+  const isCustom = !isPreset && /^\d+:\d+$/.test(aspect);
+
+  // 配色
+  const activeBg = variant === "context" ? "#6366f1" : "#a78bfa";
+  const activeColor = variant === "container" ? "#1a1a2e" : "white";
+  const inactiveColor = variant === "container" ? "rgba(255,255,255,0.85)" : "rgba(255,255,255,0.6)";
+  const btnFont = variant === "container" ? 15 : 11;
+
+  const btnStyle = (active: boolean): React.CSSProperties => ({
+    flex: 1,
+    padding: variant === "container" ? "9px 0" : "5px 0",
+    background: active ? activeBg : "rgba(255,255,255,0.08)",
+    color: active ? activeColor : inactiveColor,
+    border: "none",
+    borderRadius: variant === "container" ? 6 : 5,
+    fontSize: btnFont,
+    cursor: "pointer",
+    fontWeight: active && variant === "container" ? 600 : 400,
+  });
+
+  const confirmCustom = () => {
+    const w = parseInt(customW);
+    const h = parseInt(customH);
+    if (w > 0 && h > 0) {
+      // 简化 GCD
+      const gcd = (a: number, b: number): number => (b === 0 ? a : gcd(b, a % b));
+      const g = gcd(w, h) || 1;
+      const key = `${w / g}:${h / g}`;
+      onAspectChange(key);
+      setCustomMode(false);
+    }
+  };
+
+  // 自定义输入框（小号，inline）
+  const inputStyle: React.CSSProperties = {
+    width: 32,
+    padding: "3px 0",
+    background: "rgba(255,255,255,0.12)",
+    color: "white",
+    border: "1px solid rgba(255,255,255,0.2)",
+    borderRadius: 4,
+    fontSize: 11,
+    textAlign: "center",
+    outline: "none",
+  };
+
+  return (
+    <>
+      {/* 第一行：5 个常用比例 */}
+      <div style={{ display: "flex", gap: 4 }}>
+        {ASPECT_RATIOS.slice(0, 5).map((r) => (
+          <button key={r.key} onClick={() => onAspectChange(r.key)} style={btnStyle(aspect === r.key)}>
+            {r.key}
+          </button>
+        ))}
+      </div>
+      {/* 第二行：3 个比例 + 自定义 */}
+      <div style={{ display: "flex", gap: 4, marginTop: 4, alignItems: "center" }}>
+        {ASPECT_RATIOS.slice(5).map((r) => (
+          <button key={r.key} onClick={() => onAspectChange(r.key)} style={btnStyle(aspect === r.key)}>
+            {r.key}
+          </button>
+        ))}
+        {customMode ? (
+          <div style={{ display: "flex", gap: 3, alignItems: "center" }}>
+            <input
+              type="text"
+              inputMode="numeric"
+              pattern="\d*"
+              value={customW}
+              onChange={(e) => setCustomW(e.target.value.replace(/\D/g, ""))}
+              onKeyDown={(e) => { if (e.key === "Enter") confirmCustom(); if (e.key === "Escape") setCustomMode(false); }}
+              style={inputStyle}
+              autoFocus
+              placeholder="W"
+            />
+            <span style={{ color: "rgba(255,255,255,0.5)", fontSize: 11 }}>:</span>
+            <input
+              type="text"
+              inputMode="numeric"
+              pattern="\d*"
+              value={customH}
+              onChange={(e) => setCustomH(e.target.value.replace(/\D/g, ""))}
+              onKeyDown={(e) => { if (e.key === "Enter") confirmCustom(); if (e.key === "Escape") setCustomMode(false); }}
+              style={inputStyle}
+              placeholder="H"
+            />
+            <button
+              onClick={confirmCustom}
+              style={{ ...btnStyle(false), flex: "0 0 auto", padding: "5px 8px", fontSize: 10 }}
+            >
+              ✓
+            </button>
+          </div>
+        ) : (
+          <button
+            onClick={() => {
+              if (isCustom) {
+                // 已有自定义值，回填到输入框
+                const [w, h] = aspect.split(":");
+                setCustomW(w);
+                setCustomH(h);
+              }
+              setCustomMode(true);
+            }}
+            style={btnStyle(isCustom)}
+          >
+            {isCustom ? aspect : "自定义"}
+          </button>
+        )}
+      </div>
+    </>
+  );
+}
+
+/**
  * 右键上下文菜单：操作列表 / prompt 输入框两种形态
  */
 const ContextMenu = ({
@@ -2734,26 +2885,7 @@ const ContextMenu = ({
             <div style={{ fontSize: 10, color: "rgba(255,255,255,0.4)", marginBottom: 5 }}>
               宽高比
             </div>
-            <div style={{ display: "flex", gap: 4 }}>
-              {ASPECT_RATIOS.map((r) => (
-                <button
-                  key={r.key}
-                  onClick={() => onAspectChange(r.key)}
-                  style={{
-                    flex: 1,
-                    padding: "5px 0",
-                    background: aspect === r.key ? "#6366f1" : "rgba(255,255,255,0.08)",
-                    color: aspect === r.key ? "white" : "rgba(255,255,255,0.6)",
-                    border: "none",
-                    borderRadius: 5,
-                    fontSize: 11,
-                    cursor: "pointer",
-                  }}
-                >
-                  {r.key}
-                </button>
-              ))}
-            </div>
+            <AspectRatioButtons aspect={aspect} onAspectChange={onAspectChange} variant="context" />
             <div style={{ fontSize: 10, color: "rgba(255,255,255,0.4)", margin: "8px 0 5px" }}>
               分辨率
             </div>
@@ -3136,26 +3268,7 @@ const EditPanel = ({
           <div style={{ fontSize: 11, color: "rgba(255,255,255,0.4)", marginBottom: 5 }}>
             宽高比
           </div>
-          <div style={{ display: "flex", gap: 4 }}>
-            {ASPECT_RATIOS.map((r) => (
-              <button
-                key={r.key}
-                onClick={() => onAspectChange(r.key)}
-                style={{
-                  flex: 1,
-                  padding: "5px 0",
-                  background: aspect === r.key ? "#a78bfa" : "rgba(255,255,255,0.08)",
-                  color: aspect === r.key ? "white" : "rgba(255,255,255,0.6)",
-                  border: "none",
-                  borderRadius: 5,
-                  fontSize: 11,
-                  cursor: "pointer",
-                }}
-              >
-                {r.key}
-              </button>
-            ))}
-          </div>
+          <AspectRatioButtons aspect={aspect} onAspectChange={onAspectChange} variant="edit" />
           <div style={{ fontSize: 11, color: "rgba(255,255,255,0.4)", margin: "8px 0 5px" }}>
             分辨率
           </div>
@@ -3690,8 +3803,8 @@ function PendingContainerNode({
           padding: 12,
           boxSizing: "border-box",
           background: isGenerating
-            ? "rgba(167,139,250,0.18)"
-            : "rgba(167,139,250,0.08)",
+            ? "rgba(167,139,250,0.12)"
+            : "rgba(20,20,35,0.82)",
           border: isDragActive
             ? "2px dashed #c4b5fd"
             : isConnectTarget
@@ -3855,17 +3968,11 @@ function PendingContainerNode({
             </span>
           </div>
         </div>
-        <div style={{ display: "flex", gap: 4 }}>
-          {ASPECT_RATIOS.map((r) => (
-            <button
-              key={r.key}
-              onClick={() => onChange({ aspect: r.key })}
-              style={{ flex: 1, ...smallBtn(container.aspect === r.key) }}
-            >
-              {r.key}
-            </button>
-          ))}
-        </div>
+        <AspectRatioButtons
+          aspect={container.aspect}
+          onAspectChange={(v) => onChange({ aspect: v })}
+          variant="container"
+        />
       </div>
 
       {/* 分辨率 */}
