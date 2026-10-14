@@ -1,5 +1,6 @@
 """REST API 路由"""
 import json
+import logging
 import queue
 import subprocess
 import sys
@@ -23,6 +24,8 @@ from app.providers.schema import (
     mask_key,
     resolve_preset,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["agent"])
 
@@ -608,8 +611,10 @@ def generate_image_stream(canvas_id: str, req: StreamGenRequest):
                             return
                 except ValueError:
                     # 流式不可用（模型不支持等）→ 平衡计数后回退非流式（工具装饰器重新跟踪）
+                    logger.info("流式生成不可用，回退估算模式", exc_info=True)
                     _end_tracked(False)
                 except Exception as e:
+                    logger.exception("流式图片生成失败")
                     _end_tracked(False)
                     yield _sse({"type": "done", "success": False, "message": f"生成失败：{e}"})
                     return
@@ -720,6 +725,7 @@ def chat_stream(req: ChatRequest):
             })
         except Exception as e:
             # worker 异常也必须发 done，否则前端会一直等
+            logger.exception("Agent 流式对话执行异常")
             q.put({
                 "type": "done",
                 "success": False,
@@ -1169,3 +1175,52 @@ def reveal_image(req: RevealImageRequest):
         raise HTTPException(status_code=500, detail=f"无法打开文件管理器: {e}")
 
     return {"success": True, "message": f"已在文件管理器中定位 {path.name}"}
+
+
+# ===== 前端日志上报（合流写入 backend/data/logs/app.log，[frontend] 标记来源） =====
+
+_front_logger = logging.getLogger("frontend")
+
+# 单条消息/堆栈截断上限：防止整段 base64 或超大堆栈刷爆日志文件
+_MAX_CLIENT_MSG = 2000
+_MAX_CLIENT_STACK = 4000
+_MAX_BATCH = 50
+
+
+class ClientLogItem(BaseModel):
+    level: str = "info"            # info | warn | error
+    message: str
+    stack: Optional[str] = None
+    url: Optional[str] = None      # 发生页面地址（含 canvas 参数）
+    canvas_id: Optional[str] = None
+    ts: Optional[float] = None     # 客户端时间戳（毫秒）
+
+
+class ClientLogsRequest(BaseModel):
+    logs: List[ClientLogItem]
+
+
+@router.post("/client_logs", summary="接收前端错误/日志上报（批量写入 app.log）")
+def receive_client_logs(req: ClientLogsRequest):
+    accepted = 0
+    for item in req.logs[:_MAX_BATCH]:
+        line = item.message[:_MAX_CLIENT_MSG]
+        extras = []
+        if item.url:
+            extras.append(f"url={item.url[:200]}")
+        if item.canvas_id:
+            extras.append(f"canvas={item.canvas_id}")
+        if extras:
+            line = f"{line} ({' '.join(extras)})"
+        stack = (item.stack or "")[:_MAX_CLIENT_STACK]
+        if stack:
+            line = f"{line}\n{stack}"
+        level = item.level.lower()
+        if level == "error":
+            _front_logger.error(line)
+        elif level == "warn":
+            _front_logger.warning(line)
+        else:
+            _front_logger.info(line)
+        accepted += 1
+    return {"success": True, "accepted": accepted}

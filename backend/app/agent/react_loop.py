@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import logging
 import threading
 from dataclasses import dataclass, field
 from typing import Callable
@@ -18,6 +19,8 @@ from app.agent.prompts import build_system_prompt
 from app.canvas.state import CanvasState
 from app.canvas.store import BaseStore
 from app.tools.base import ToolManager, ToolResult
+
+logger = logging.getLogger(__name__)
 
 # 事件回调类型
 EventCallback = Callable[[dict], None]
@@ -150,11 +153,14 @@ class ReActAgent:
                 if stop_evt.is_set():
                     return self._stopped_result(state, steps)
 
-                # LLM 流式调用：文本增量实时推给前端（打字机），tool_calls 聚合后照常执行
+                # LLM 流式调用：深度思考过程实时推前端（reasoning_delta），
+                # 文本增量实时推前端（delta 打字机），tool_calls 聚合后照常执行。
+                # 执行阶段保留深度思考，复杂工具链的规划质量靠它。
                 response = self.llm.chat_stream(
                     messages,
                     tools=self.tool_manager.list_schemas(),
                     on_text=lambda s: emit({"type": "delta", "content": s}),
+                    on_reasoning=lambda s: emit({"type": "reasoning_delta", "content": s}),
                 )
 
                 # LLM 返回文本，任务完成
@@ -287,9 +293,13 @@ class ReActAgent:
             emit({"type": "plan_delta", "content": buf})
 
         try:
-            resp = self.llm.chat_stream(plan_messages, tools=None, on_text=on_text)
+            # 规划/路由阶段关闭深度思考：闲聊与列计划都是轻量任务，
+            # 关掉后首字毫秒级（思考模型默认会为一句话也思考十几秒）
+            resp = self.llm.chat_stream(
+                plan_messages, tools=None, on_text=on_text, thinking=False)
         except Exception:
             # 规划失败不阻断执行（网络抖动 / Mock 模式等）
+            logger.warning("Agent 规划阶段失败，降级为无计划执行", exc_info=True)
             return "", ""
         content = (resp.content or "").strip()
         if content.startswith(CHAT_PREFIX):

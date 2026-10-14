@@ -15,6 +15,8 @@ interface ChatEntry {
   content: string;
   steps?: AgentStep[];
   plan?: string; // 执行计划（流式 plan 事件，展示为路线图卡片）
+  reasoning?: string; // 深度思考过程（reasoning_content 流，与正文分离）
+  reasoningOpen?: boolean; // 思考区展开态：思考中自动展开，正文开始自动折叠
   stopped?: boolean; // 用户中途停止
   timestamp: number;
   error?: boolean;
@@ -287,9 +289,20 @@ export function ChatPanel({
         if (evt.type === "plan_delta" && evt.content) {
           // 计划逐字流出（打字机），追加渲染
           updateLive((e) => ({ ...e, plan: (e.plan || "") + evt.content }));
+        } else if (evt.type === "reasoning_delta" && evt.content) {
+          // 深度思考过程实时流出：自动展开思考区（正文开始后折叠）
+          updateLive((e) => ({
+            ...e,
+            reasoning: (e.reasoning || "") + evt.content,
+            reasoningOpen: true,
+          }));
         } else if (evt.type === "delta" && evt.content) {
-          // LLM 文本逐字流出（思考/最终回复），追加渲染
-          updateLive((e) => ({ ...e, content: (e.content || "") + evt.content }));
+          // LLM 正文逐字流出；正文一出现就把思考区折叠起来
+          updateLive((e) => ({
+            ...e,
+            content: (e.content || "") + evt.content,
+            reasoningOpen: e.reasoning ? false : e.reasoningOpen,
+          }));
         } else if (evt.type === "tool_start") {
           updateLive((e) => ({
             ...e,
@@ -553,6 +566,65 @@ export function ChatPanel({
                   <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
                     {entry.plan}
                   </ReactMarkdown>
+                </div>
+              )}
+
+              {/* 深度思考过程（执行阶段保留思考，实时流式可见；正文开始自动折叠，可点击回看） */}
+              {entry.reasoning && (
+                <div
+                  style={{
+                    alignSelf: "flex-start",
+                    maxWidth: "92%",
+                    width: "92%",
+                    background: "rgba(255,255,255,0.03)",
+                    border: "1px solid rgba(255,255,255,0.08)",
+                    borderRadius: 8,
+                    fontSize: 12,
+                    color: "#8b8b9a",
+                    overflow: "hidden",
+                  }}
+                >
+                  <div
+                    onClick={() =>
+                      setEntries((prev) =>
+                        prev.map((e2, j) =>
+                          j === i ? { ...e2, reasoningOpen: !e2.reasoningOpen } : e2
+                        )
+                      )
+                    }
+                    style={{
+                      padding: "5px 10px",
+                      cursor: "pointer",
+                      userSelect: "none",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 6,
+                    }}
+                  >
+                    <span>🧠</span>
+                    <span>
+                      {entry.content ? "已深度思考（点击回看）" : "正在思考…"}
+                    </span>
+                    <span style={{ marginLeft: "auto", fontSize: 10 }}>
+                      {entry.reasoningOpen ? "▼" : "▶"}
+                    </span>
+                  </div>
+                  {entry.reasoningOpen && (
+                    <div
+                      style={{
+                        padding: "0 10px 6px",
+                        borderTop: "1px solid rgba(255,255,255,0.06)",
+                        paddingTop: 5,
+                        maxHeight: 200,
+                        overflowY: "auto",
+                        whiteSpace: "pre-wrap",
+                        wordBreak: "break-word",
+                        lineHeight: 1.55,
+                      }}
+                    >
+                      {entry.reasoning}
+                    </div>
+                  )}
                 </div>
               )}
 

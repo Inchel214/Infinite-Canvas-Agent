@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import base64
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 # 画布节点显示尺寸：图片最长边缩放到该值
 _DISPLAY_MAX = 400
@@ -18,7 +21,9 @@ def image_size_from_data_url(data_url: str) -> tuple[int, int] | None:
         raw = base64.b64decode(b64)
         with Image.open(io.BytesIO(raw)) as im:
             return (int(im.width), int(im.height))
-    except Exception:
+    except Exception as e:
+        # 不记录 data URL 本体（可能整段 base64），只记录异常原因
+        logger.warning("data URL 图片宽高解析失败: %s", e)
         return None
 
 

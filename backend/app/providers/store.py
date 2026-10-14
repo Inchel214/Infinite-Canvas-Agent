@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 
 from app.providers.schema import AppSettings
+
+logger = logging.getLogger(__name__)
 
 _SETTINGS_FILE = Path(__file__).resolve().parent.parent.parent / "data" / "settings.json"
 
@@ -23,7 +26,8 @@ class SettingsStore:
         try:
             data = json.loads(self._path.read_text(encoding="utf-8"))
             return AppSettings.from_dict(data)
-        except (FileNotFoundError, json.JSONDecodeError):
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            logger.warning("settings.json 读取失败（使用默认设置）: %s", e)
             return AppSettings()
 
     def save(self, settings: AppSettings) -> None:

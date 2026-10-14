@@ -56,9 +56,13 @@ class LLMProxy(BaseLLM):
     def chat(self, messages, tools=None):
         return self._manager.llm.chat(messages, tools=tools)
 
-    def chat_stream(self, messages, tools=None, on_text=None):
-        """流式调用也转发到当前实例（热切换后仍生效），保持 token 级打字机"""
-        return self._manager.llm.chat_stream(messages, tools=tools, on_text=on_text)
+    def chat_stream(self, messages, tools=None, on_text=None, on_reasoning=None,
+                    thinking=True):
+        """流式调用也转发到当前实例（热切换后仍生效），保持 token 级打字机。
+        透传思考开关与 reasoning_content 回调。"""
+        return self._manager.llm.chat_stream(
+            messages, tools=tools, on_text=on_text,
+            on_reasoning=on_reasoning, thinking=thinking)
 
 
 class ProviderManager:

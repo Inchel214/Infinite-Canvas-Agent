@@ -11,11 +11,14 @@ from __future__ import annotations
 
 import base64
 import io
+import logging
 import os
 import uuid
 from pathlib import Path
 
 from app.canvas.state import CanvasState
+
+logger = logging.getLogger(__name__)
 
 
 def _images_dir() -> Path:
@@ -135,7 +138,9 @@ def image_display_size(url: str, max_edge: int = 400) -> tuple[int, int] | None:
             return None
         scale = max_edge / max(real_w, real_h)
         return max(1, round(real_w * scale)), max(1, round(real_h * scale))
-    except (ValueError, OSError, ImportError):
+    except (ValueError, OSError, ImportError) as e:
+        # 不记录 data URL 本体（可能整段 base64），只记录异常原因
+        logger.warning("图片宽高解析失败（URL 类型: %s）: %s", url[:32], e)
         return None
 
 
@@ -179,7 +184,7 @@ def materialize_state_images(state: CanvasState) -> int:
             try:
                 node.image_url = save_data_image(url, state.canvas_id)
                 count += 1
-            except (ValueError, OSError):
+            except (ValueError, OSError) as e:
                 # 单张落盘失败保留 data URL，不影响保存画布
-                pass
+                logger.warning("节点图片落盘失败（保留 data URL）: %s", e)
     return count

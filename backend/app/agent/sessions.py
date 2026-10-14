@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # 每画布最多保留的消息条数（一对 user/assistant 算两条），超出丢弃最早
 _MAX_MESSAGES = 200
@@ -43,7 +46,8 @@ class ChatSessionStore:
                     with path.open("r", encoding="utf-8") as f:
                         data = json.load(f)
                     self._sessions[canvas_id] = data.get("messages", [])
-                except (json.JSONDecodeError, OSError):
+                except (json.JSONDecodeError, OSError) as e:
+                    logger.warning("对话历史读取失败（按空处理）: %s: %s", path.name, e)
                     self._sessions[canvas_id] = []
             else:
                 self._sessions[canvas_id] = []
@@ -76,8 +80,8 @@ class ChatSessionStore:
         self._sessions.pop(canvas_id, None)
         try:
             self._path(canvas_id).unlink(missing_ok=True)
-        except OSError:
-            pass
+        except OSError as e:
+            logger.warning("会话文件删除失败: %s: %s", canvas_id, e)
 
     def _messages_internal(self, canvas_id: str) -> list[dict]:
         """内部可变引用（先走一遍懒加载确保已初始化）"""
@@ -90,6 +94,6 @@ class ChatSessionStore:
         try:
             with path.open("w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False)
-        except OSError:
+        except OSError as e:
             # 磁盘写入失败不影响内存中的会话
-            pass
+            logger.warning("对话历史落盘失败（仅保留内存版）: %s: %s", path.name, e)

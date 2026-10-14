@@ -49,10 +49,11 @@ export async function chatWithAgent(
 
 // Agent SSE 流事件（/agent/chat/stream 逐步推送）
 export interface AgentStreamEvent {
-  // delta / plan_delta 为 token 级文本增量（打字机），其余为节点事件
+  // delta / plan_delta / reasoning_delta 为 token 级文本增量（打字机），其余为节点事件
   type:
     | "start"
     | "plan_delta"
+    | "reasoning_delta"
     | "delta"
     | "tool_start"
     | "tool_result"

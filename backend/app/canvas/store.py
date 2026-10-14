@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import time
 from abc import ABC, abstractmethod
@@ -16,6 +17,8 @@ from app.image.files import (
     materialize_state_images,
     normalize_state_image_sizes,
 )
+
+logger = logging.getLogger(__name__)
 
 # 历史栈最大长度（避免无限制增长占用内存）
 _MAX_HISTORY = 50
@@ -168,7 +171,8 @@ class FileStore(InMemoryStore):
             with path.open("r", encoding="utf-8") as f:
                 data = json.load(f)
             return CanvasState.from_dict(data)
-        except (json.JSONDecodeError, KeyError, OSError):
+        except (json.JSONDecodeError, KeyError, OSError) as e:
+            logger.warning("画布文件读取失败（按不存在处理）: %s: %s", path.name, e)
             return None
 
     def create_canvas(self, name: str = "") -> CanvasState:
@@ -182,8 +186,8 @@ class FileStore(InMemoryStore):
         try:
             with path.open("w", encoding="utf-8") as f:
                 json.dump(state.to_dict(), f, ensure_ascii=False)
-        except OSError:
-            pass
+        except OSError as e:
+            logger.warning("新建画布落盘失败（内存仍可用）: %s: %s", path.name, e)
         return state
 
     def get_canvas(self, canvas_id: str) -> CanvasState:
@@ -216,7 +220,8 @@ class FileStore(InMemoryStore):
         try:
             with tmp.open("w", encoding="utf-8") as f:
                 json.dump(state.to_dict(), f, ensure_ascii=False)
-        except OSError:
+        except OSError as e:
+            logger.error("画布快照写入临时文件失败（本次落盘放弃，内存仍为新版本）: %s: %s", tmp.name, e)
             return
         # Windows 下目标文件被并发读者瞬间占用会 PermissionError，短暂重试
         for _ in range(6):
@@ -226,10 +231,11 @@ class FileStore(InMemoryStore):
             except PermissionError:
                 time.sleep(0.02)
         # 放弃本次落盘（内存仍是新版本，下次保存再写）；清理残留临时文件
+        logger.error("画布落盘重试 6 次仍被占用，放弃本次写入: %s", path.name)
         try:
             tmp.unlink()
-        except OSError:
-            pass
+        except OSError as e:
+            logger.warning("残留临时文件清理失败: %s: %s", tmp.name, e)
 
     def save_canvas(self, state: CanvasState) -> None:
         # base64 节点图片落盘为文件，画布 JSON 只存 http URL（KB 级）
@@ -283,9 +289,10 @@ class FileStore(InMemoryStore):
                         "node_count": len(data.get("nodes", {})),
                         "updated_at": data.get("updated_at", 0),
                     }
-            except (json.JSONDecodeError, OSError):
+            except (json.JSONDecodeError, OSError) as e:
                 # 读失败/半截文件：回退内存版本（若有），绝不静默缺项——
                 # 列表里少一个画布比显示旧数据更让用户困惑
+                logger.warning("画布列表读取失败（回退内存版本）: %s: %s", path.name, e)
                 state = self._canvases.get(cid)
                 if state is not None:
                     seen[cid] = {
@@ -327,8 +334,8 @@ class FileStore(InMemoryStore):
         if exists:
             try:
                 path.unlink()
-            except OSError:
-                pass
+            except OSError as e:
+                logger.warning("画布文件删除失败: %s: %s", path.name, e)
         # 级联删除图片：整删画布子目录（新归类格式），再删旧平铺格式的引用文件
         self._delete_canvas_images(canvas_id, referenced)
 
@@ -341,8 +348,8 @@ class FileStore(InMemoryStore):
         if canvas_dir.is_dir():
             try:
                 shutil.rmtree(canvas_dir)
-            except OSError:
-                pass
+            except OSError as e:
+                logger.warning("画布图片目录删除失败: %s: %s", canvas_dir, e)
         # 旧格式：平铺在根目录的引用文件（别的画布未引用才安全删——
         # 平铺时代图片不区分归属，仅当文件不在任何其他画布 JSON 中时删除）
         if not referenced_urls:
@@ -361,7 +368,8 @@ class FileStore(InMemoryStore):
                             other_refs.add(_rel_from_url(u))
                         except ValueError:
                             pass
-            except (json.JSONDecodeError, OSError):
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning("级联清理时其他画布读取失败（跳过该文件）: %s: %s", p.name, e)
                 continue
         for url in referenced_urls:
             try:
@@ -372,5 +380,5 @@ class FileStore(InMemoryStore):
                 continue  # 仍被其他画布引用，保留
             try:
                 (IMAGES_DIR / rel).unlink()
-            except OSError:
-                pass
+            except OSError as e:
+                logger.warning("旧格式图片删除失败: %s: %s", rel, e)

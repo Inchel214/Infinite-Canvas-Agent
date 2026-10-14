@@ -6,10 +6,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import threading
 import uuid
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # 风格库目录（backend/data/experiences/）
 EXP_DIR = Path(__file__).resolve().parent.parent / "data" / "experiences"
@@ -31,7 +34,8 @@ def _load_registry() -> dict:
         return {}
     try:
         return json.loads(REGISTRY_FILE.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as e:
+        logger.warning("风格注册表读取失败（按空处理）: %s: %s", REGISTRY_FILE.name, e)
         return {}
 
 
@@ -70,7 +74,8 @@ def list_experiences() -> list[dict]:
             exp_id = uuid.uuid4().hex[:12]
             try:
                 content = f.read_text(encoding="utf-8")
-            except Exception:
+            except Exception as e:
+                logger.warning("风格文件扫描读取失败（跳过）: %s: %s", f.name, e)
                 continue
             reg[exp_id] = {
                 "name": f.stem,
@@ -104,7 +109,8 @@ def read_experience(exp_id: str) -> dict | None:
             return None
         try:
             content = path.read_text(encoding="utf-8")
-        except Exception:
+        except Exception as e:
+            logger.warning("风格全文读取失败（按不存在处理）: %s: %s", path.name, e)
             return None
         return {
             "id": exp_id,

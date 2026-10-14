@@ -10,8 +10,11 @@
 from __future__ import annotations
 
 import functools
+import logging
 import threading
 import time
+
+logger = logging.getLogger(__name__)
 
 # canvas_id -> 状态（generating: 进行中任务数；pending: 未查看新图数；last_done: 最近完成时间戳）
 _tasks: dict[str, dict] = {}
@@ -81,6 +84,7 @@ def tracks_generation(func):
             end(canvas_id, success=bool(result.success))
             return result
         except Exception:
+            logger.exception("生图任务异常（canvas=%s）", canvas_id)
             end(canvas_id, success=False)
             raise
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import struct
 from typing import Iterator
@@ -16,6 +17,8 @@ from app.image.base import (
     image_size_from_data_url as _image_size,
 )
 from app.image.files import to_sendable_ref
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 _DEFAULT_MODEL = "doubao-seedream-4-0-20260415"
@@ -48,8 +51,8 @@ def _clamp_size(size: str, model: str = "") -> str:
                     else:
                         h += 32
                 return f"{w}x{h}"
-    except ValueError:
-        pass
+    except ValueError as e:
+        logger.warning("尺寸规格无法钳制（原样透传）: %r: %s", size, e)
     return size
 
 
@@ -197,6 +200,7 @@ class VolcEngineImageGenerator(BaseImageGenerator):
             try:
                 evt = json.loads(payload)
             except json.JSONDecodeError:
+                logger.debug("生图 SSE 坏帧跳过: %s", payload[:100])
                 continue
 
             evt_type = evt.get("type", "")

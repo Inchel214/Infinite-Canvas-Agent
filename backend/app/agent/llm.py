@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -34,8 +37,12 @@ class BaseLLM(ABC):
         messages: list[dict],
         tools: list[dict] | None = None,
         on_text=None,
+        on_reasoning=None,
+        thinking: bool = True,
     ) -> LLMResponse:
         """流式对话：文本增量经 on_text 回调逐段推送（打字机效果）。
+        on_reasoning 回调深度思考模型的 reasoning_content 增量（不混入正文）。
+        thinking=False 时关闭深度思考（仅支持该参数的服务商生效）。
         默认降级实现走非流式 chat，一次性回调全文（MockLLM 等简单实现直接继承）。
         返回最终聚合结果（含 tool_calls），调用方逻辑与非流式完全一致。"""
         resp = self.chat(messages, tools)
@@ -286,7 +293,12 @@ class OpenAICompatLLM(BaseLLM):
                 try:
                     args = json.loads(rc["function"].get("arguments") or "{}")
                 except json.JSONDecodeError:
-                    args = {"prompt": rc["function"].get("arguments", "")}
+                    raw_args = rc["function"].get("arguments") or ""
+                    logger.warning(
+                        "工具调用参数 JSON 解析失败，降级为 prompt 参数: %s",
+                        raw_args[:200],
+                    )
+                    args = {"prompt": raw_args}
                 tool_calls.append(ToolCall(name=fn["name"], args=args))
 
         return LLMResponse(content=content, tool_calls=tool_calls)
@@ -296,15 +308,21 @@ class OpenAICompatLLM(BaseLLM):
         messages: list[dict],
         tools: list[dict] | None = None,
         on_text=None,
+        on_reasoning=None,
+        thinking: bool = True,
     ) -> LLMResponse:
         """流式 chat/completions：文本 delta 逐段经 on_text 回调（SSE 打字机），
-        tool_calls 分片按 index 聚合，最终组装成与非流式一致的 LLMResponse。"""
+        深度思考模型的 reasoning_content 经 on_reasoning 回调（不混入正文），
+        tool_calls 分片按 index 聚合，最终组装成与非流式一致的 LLMResponse。
+        thinking=False 时按 Ark/豆包协议传 thinking:{type:disabled} 关闭深度思考。"""
         body: dict = {
             "model": self.model,
             "messages": self._to_openai_messages(messages),
             "temperature": self.temperature,
             "stream": True,
         }
+        if not thinking:
+            body["thinking"] = {"type": "disabled"}
         oai_tools = self._to_openai_tools(tools)
         if oai_tools:
             body["tools"] = oai_tools
@@ -312,17 +330,19 @@ class OpenAICompatLLM(BaseLLM):
         # trust_env=False 绕过系统代理
         session = requests.Session()
         session.trust_env = False
-        resp = session.post(
-            self.api_url,
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-                "Accept": "text/event-stream",
-            },
-            json=body,
-            timeout=self.timeout,
-            stream=True,
-        )
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+        resp = session.post(self.api_url, headers=headers, json=body,
+                            timeout=self.timeout, stream=True)
+        # 非 Ark/豆包服务商可能不认 thinking 参数：400 时去掉它重试一次（对该参数静默降级）
+        if not thinking and resp.status_code == 400:
+            resp.close()
+            body.pop("thinking", None)
+            resp = session.post(self.api_url, headers=headers, json=body,
+                                timeout=self.timeout, stream=True)
         resp.raise_for_status()
         # iter_lines(decode_unicode) 依赖 resp.encoding，Ark 未带 charset 时强制 UTF-8
         resp.encoding = "utf-8"
@@ -340,11 +360,16 @@ class OpenAICompatLLM(BaseLLM):
                 try:
                     chunk = json.loads(data)
                 except json.JSONDecodeError:
+                    logger.debug("SSE 坏帧跳过: %s", data[:100])
                     continue  # 跳过坏帧
                 choices = chunk.get("choices") or []
                 if not choices:
                     continue  # keep-alive / usage 统计块
                 delta = choices[0].get("delta") or {}
+                # 深度思考增量（Ark/豆包：reasoning_content）：单独回调，不进正文
+                reasoning = delta.get("reasoning_content")
+                if reasoning and on_reasoning:
+                    on_reasoning(reasoning)
                 # 文本增量：逐段推给前端打字机渲染
                 text = delta.get("content")
                 if text:
@@ -370,6 +395,10 @@ class OpenAICompatLLM(BaseLLM):
                 try:
                     args = json.loads(acc["args"] or "{}")
                 except json.JSONDecodeError:
+                    logger.warning(
+                        "流式工具调用参数聚合后 JSON 解析失败，降级为 prompt 参数: %s",
+                        acc["args"][:200],
+                    )
                     args = {"prompt": acc["args"]}
                 tool_calls.append(ToolCall(name=acc["name"], args=args))
 
