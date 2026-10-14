@@ -1,14 +1,13 @@
-import { useEffect, useLayoutEffect, useRef, useCallback, useState } from "react";
-import { createPortal } from "react-dom";
+import { useEffect, useRef, useCallback, useState, useMemo, memo } from "react";
 import type { CanvasState, CanvasNode } from "../types/canvas";
 import { generateImageStream, uploadImageNode, cloneNode, undoCanvas, listExperiences, revealImageFile, type ExperienceMeta } from "../api/agent";
 
-// 右键菜单可触发的操作类型（experienceIds：风格库多选的风格，直连生图时后端确定性拼接）
+// 右键菜单可触发的操作类型（experienceId：风格库选中的风格，直连生图时后端确定性拼接）
 export type CanvasAction =
-  | { type: "compose"; nodeIds: string[]; prompt: string; size: string; x?: number; y?: number; experienceIds?: string[] }
-  | { type: "variate"; nodeId: string; prompt: string; size: string; x?: number; y?: number; experienceIds?: string[] }
-  | { type: "edit"; nodeId: string; prompt: string; size: string; x?: number; y?: number; experienceIds?: string[] }
-  | { type: "generate"; prompt: string; size: string; x: number; y: number; experienceIds?: string[] }
+  | { type: "compose"; nodeIds: string[]; prompt: string; size: string; x?: number; y?: number; experienceId?: string }
+  | { type: "variate"; nodeId: string; prompt: string; size: string; x?: number; y?: number; experienceId?: string }
+  | { type: "edit"; nodeId: string; prompt: string; size: string; x?: number; y?: number; experienceId?: string }
+  | { type: "generate"; prompt: string; size: string; x: number; y: number; experienceId?: string }
   | { type: "delete"; nodeIds: string[] }
   | { type: "arrange" };
 
@@ -23,7 +22,7 @@ export type PendingContainer = {
   resolution: string;
   prompt: string;
   refIds: string[];     // 连线进来的参考图节点 ID
-  experienceIds?: string[]; // 风格库多选的风格
+  experienceId?: string; // 风格库选中的风格
   error?: string;       // 生成失败提示
   previewUrl?: string;  // 流式生成的中间预览图
   exiting?: boolean;    // 生成完成后正在退场（淡出中）
@@ -39,40 +38,6 @@ const ASPECT_RATIOS = [
 ] as const;
 
 const RESOLUTIONS = ["1K", "2K", "4K"] as const;
-
-// 按节点当前宽高比找最接近的预设（编辑图片时默认继承原图比例）
-function closestAspectKey(w: number, h: number): string {
-  const target = w / h;
-  let best: (typeof ASPECT_RATIOS)[number] = ASPECT_RATIOS[0];
-  let bestDiff = Infinity;
-  for (const r of ASPECT_RATIOS) {
-    const diff = Math.abs(r.w / r.h - target);
-    if (diff < bestDiff) {
-      bestDiff = diff;
-      best = r;
-    }
-  }
-  return best.key;
-}
-
-// 按图片像素长边找最接近的分辨率档位（编辑图片时默认继承原图分辨率）
-function closestResolutionKey(longEdge: number): string {
-  const tiers: [string, number][] = [
-    ["1K", 1024],
-    ["2K", 2048],
-    ["4K", 4096],
-  ];
-  let best = "2K";
-  let bestDiff = Infinity;
-  for (const [key, px] of tiers) {
-    const diff = Math.abs(px - longEdge);
-    if (diff < bestDiff) {
-      bestDiff = diff;
-      best = key;
-    }
-  }
-  return best;
-}
 
 // 下载前必须拿到完整的图片 Blob。短暂的本地后端抖动会自动重试，
 // 且空响应/错误页不会被当成图片写入磁盘。
@@ -117,14 +82,6 @@ function calcSize(ratioKey: string, res: string): string {
   // Seedream 要求 512~4096 且为 32 的倍数
   w = Math.max(512, Math.min(4096, Math.round(w / 32) * 32));
   h = Math.max(512, Math.min(4096, Math.round(h / 32) * 32));
-  // 模型总像素下限 921600（≈960x960，实测 4.0/5.0 Pro）：不足时等比放大（32 倍数对齐），
-  // 保证 UI 计算的尺寸与后端实际发送、图片真实输出一致（如 1K 16:9 → 1280x736）
-  const MIN_AREA = 921600;
-  if (w * h < MIN_AREA) {
-    const s = Math.sqrt(MIN_AREA / (w * h));
-    w = Math.max(32, Math.ceil((w * s) / 32) * 32);
-    h = Math.max(32, Math.ceil((h * s) / 32) * 32);
-  }
   return `${w}x${h}`;
 }
 
@@ -290,7 +247,7 @@ type EditPanelState = {
   prompt: string;
   aspect: string;
   resolution: string;
-  experienceIds?: string[]; // 风格库多选的风格
+  experienceId?: string; // 风格库选中的风格
 };
 
 interface CanvasProps {
@@ -302,10 +259,6 @@ interface CanvasProps {
   onNodesMoved?: (moves: { nodeId: string; x: number; y: number }[]) => void;
   onAction?: (action: CanvasAction) => boolean | void | Promise<boolean | void>;
   onCanvasUpdate?: (state: CanvasState) => void;
-  // 右键"添加到对话"：把选中图片引用进 ChatPanel，发送时注入 Agent 上下文
-  onAddToChat?: (nodeIds: string[]) => void;
-  // 右侧对话面板展开时占据的宽度（含定位边距前的面板净宽）；用于缩放指示器避让
-  chatDockWidth?: number;
 }
 
 /**
@@ -314,7 +267,7 @@ interface CanvasProps {
  * 多选：单击/Ctrl+Shift+点选、空白直接拖动框选、右键菜单直接生成
  * 平移：空格+拖动 / Shift+拖动 / 鼠标中键拖动
  */
-export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved, onAction, onCanvasUpdate, onAddToChat, chatDockWidth = 0 }: CanvasProps) {
+export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved, onAction, onCanvasUpdate }: CanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   // 相机视角存档：每个画布记住用户上次停留的视角（localStorage），切回/刷新时还原。
   // 否则切画布时组件重挂载、视角重置到世界原点——内容不在原点附近时就表现为"画布空白不显示"
@@ -382,6 +335,9 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   // 多选整组拖拽：按下多选集合内的图时，记录所有选中节点的原始位置 + 鼠标世界坐标起点
   const dragGroupOriginsRef = useRef<Record<string, { x: number; y: number }> | null>(null);
   const dragGroupStartRef = useRef<{ x: number; y: number } | null>(null);
+  // rAF 合帧：节点拖拽时一帧内多次 mousemove 合并为一次 setLocalOverrides
+  const dragRafRef = useRef<null | (() => void)>(null);
+  const dragRafPending = useRef(false);
 
   // ===== 多选 / 框选 / 右键菜单 =====
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -394,7 +350,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
 
   // ===== 风格库（经验文档）：直连生图面板可选风格，后端确定性拼接 =====
   const [experiences, setExperiences] = useState<ExperienceMeta[]>([]);
-  const [menuStyleIds, setMenuStyleIds] = useState<string[]>([]); // 右键菜单 compose/variate 输入面板多选
+  const [menuStyleId, setMenuStyleId] = useState<string>(""); // 右键菜单 compose/variate 输入面板选中
   const refreshExperiences = useCallback(() => {
     listExperiences()
       .then((list) => setExperiences(list))
@@ -409,17 +365,9 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   useEffect(() => {
     if (menu) refreshExperiences();
   }, [menu, refreshExperiences]);
-  // 风格名查找（占位框提示用）：多选时名称以"、"连接，超过 2 个省略为"等 N 个"
-  const styleNamesByIds = useCallback(
-    (ids: string[] | undefined) => {
-      if (!ids || ids.length === 0) return undefined;
-      const names = ids
-        .map((id) => experiences.find((e) => e.id === id)?.name)
-        .filter((n): n is string => !!n);
-      if (names.length === 0) return undefined;
-      if (names.length <= 2) return names.join("、");
-      return `${names.slice(0, 2).join("、")} 等 ${names.length} 个`;
-    },
+  // 风格名查找（占位框提示用）
+  const styleNameById = useCallback(
+    (id: string | undefined) => (id ? experiences.find((e) => e.id === id)?.name : undefined),
     [experiences]
   );
 
@@ -445,8 +393,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   const removeProcessingBox = useCallback((id: number) => {
     setProcessingBoxes((prev) => prev.filter((b) => b.id !== id));
   }, []);
-  // 编辑框真实屏幕矩形（屏幕层锚定连线终点；位置/尺寸变化时驱动连线重渲染）
-  const [editPanelRect, setEditPanelRect] = useState({ x: 0, y: 0, w: 340, h: 420 });
+  // 测量编辑框实际高度（连线终点垂直居中用）
+  const [editPanelH, setEditPanelH] = useState(420);
 
   // ===== 待生成图片容器 + 连线 =====
   const [containers, setContainers] = useState<PendingContainer[]>([]);
@@ -478,11 +426,11 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
 
   const rawNodes = canvasState ? Object.values(canvasState.nodes) : [];
 
-  // 合并本地覆盖位置
-  const nodes = rawNodes.map((n) => {
+  // 合并本地覆盖位置（useMemo 稳定引用：pan/zoom 变化时不产生新 node 对象引用）
+  const nodes = useMemo(() => rawNodes.map((n) => {
     const ov = localOverrides[n.id];
     return ov ? { ...n, x: ov.x, y: ov.y } : n;
-  });
+  }), [rawNodes, localOverrides]);
 
   // 画布状态变更（拖拽后端回显/自动整理/删除等）后：本地坐标覆盖让位于后端权威数据，
   // 否则自动整理后节点仍停留在拖拽前的旧位置，需刷新页面才能看到新布局
@@ -993,7 +941,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       return;
     }
     if (draggingNode) {
-      // 拖拽图片
+      // 拖拽图片（rAF 合帧：一帧内多次 mousemove 合并为一次 setLocalOverrides）
       const container = containerRef.current;
       if (!container) return;
       const rect = container.getBoundingClientRect();
@@ -1003,23 +951,33 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       const worldY = (mouseY - pan.y) / zoom;
       const groupOrigins = dragGroupOriginsRef.current;
       const groupStart = dragGroupStartRef.current;
+
+      // 计算本次偏移并暂存到 ref，rAF 回调里统一 flush
       if (groupOrigins && groupStart) {
-        // 多选整组拖拽：所有选中节点按相同位移平移，保持相对布局
         const dx = worldX - groupStart.x;
         const dy = worldY - groupStart.y;
         const next: Record<string, { x: number; y: number }> = {};
         for (const [id, orig] of Object.entries(groupOrigins)) {
           next[id] = { x: orig.x + dx, y: orig.y + dy };
         }
-        setLocalOverrides((prev) => ({ ...prev, ...next }));
+        dragRafRef.current = () => setLocalOverrides((prev) => ({ ...prev, ...next }));
       } else {
-        setLocalOverrides((prev) => ({
-          ...prev,
-          [draggingNode]: {
-            x: worldX - dragOffset.x,
-            y: worldY - dragOffset.y,
-          },
-        }));
+        dragRafRef.current = () =>
+          setLocalOverrides((prev) => ({
+            ...prev,
+            [draggingNode]: {
+              x: worldX - dragOffset.x,
+              y: worldY - dragOffset.y,
+            },
+          }));
+      }
+      if (!dragRafPending.current) {
+        dragRafPending.current = true;
+        requestAnimationFrame(() => {
+          dragRafPending.current = false;
+          const fn = dragRafRef.current;
+          if (fn) fn();
+        });
       }
     } else if (isPanning) {
       // rAF 合帧：一帧内多次 mousemove 合并为一次 setPan，避免高频重渲染
@@ -1218,25 +1176,9 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
           x: mx,
           y: my,
           prompt: c && c !== "本地图片" ? c : "",
-          // 默认继承节点当前宽高比（就近匹配预设），而不是全局上次选择
-          aspect: closestAspectKey(node.width, node.height),
+          aspect,
           resolution,
         });
-        // 分辨率同样默认继承原图：节点只存世界尺寸（生成图固定 400 长边），
-        // 需异步读图片 natural 尺寸后按长边就近匹配档位（图片已展示过，走缓存几乎瞬时）
-        if (node.image_url) {
-          const nid = node.id;
-          const img = new Image();
-          img.onload = () => {
-            const longEdge = Math.max(img.naturalWidth, img.naturalHeight);
-            if (longEdge > 0) {
-              setEditPanel((p) =>
-                p && p.nodeId === nid ? { ...p, resolution: closestResolutionKey(longEdge) } : p
-              );
-            }
-          };
-          img.src = node.image_url;
-        }
         setMenu(null); // 关闭普通菜单，编辑框独立显示
         return;
       }
@@ -1244,15 +1186,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     if (mode === "edit") return; // 编辑仅支持单图独立编辑框，条件不满足时忽略
     setPromptInput("");
     setMenu((prev) => (prev ? { ...prev, mode } : null));
-  }, [nodes, selectedIds, pan, zoom, resolution]);
-
-  // 右键"添加到对话"：把当前选中的图片引用进 ChatPanel（去重追加）
-  const handleAddToChat = useCallback(() => {
-    const ids = [...selectedIds];
-    if (ids.length === 0) return;
-    onAddToChat?.(ids);
-    setMenu(null);
-  }, [selectedIds, onAddToChat]);
+  }, [nodes, selectedIds, pan, zoom, aspect, resolution]);
 
   // 计算生成中占位框的尺寸/位置：尺寸与最终图节点一致（最长边 400），
   // 位置优先放参考图组右侧（顶部对齐），若该处有图片或连线则依次退让：
@@ -1302,21 +1236,21 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     if (menu.mode === "compose" && ids.length >= 2) {
       setMenu(null);
       setPromptInput("");
-      const sname = styleNamesByIds(menuStyleIds);
+      const sname = styleNameById(menuStyleId);
       const boxId = addProcessingBox(box, sname ? `正在按《${sname}》组合...` : `正在组合 ${ids.length} 张图片...`);
       Promise.resolve(
-        onAction({ type: "compose", nodeIds: ids, prompt, size, x: box.x, y: box.y, experienceIds: menuStyleIds.length ? menuStyleIds : undefined })
+        onAction({ type: "compose", nodeIds: ids, prompt, size, x: box.x, y: box.y, experienceId: menuStyleId || undefined })
       ).finally(() => removeProcessingBox(boxId));
     } else if (menu.mode === "variate" && ids.length === 1) {
       setMenu(null);
       setPromptInput("");
-      const sname = styleNamesByIds(menuStyleIds);
+      const sname = styleNameById(menuStyleId);
       const boxId = addProcessingBox(box, sname ? `正在按《${sname}》生成变体...` : "正在生成变体...");
       Promise.resolve(
-        onAction({ type: "variate", nodeId: ids[0], prompt, size, x: box.x, y: box.y, experienceIds: menuStyleIds.length ? menuStyleIds : undefined })
+        onAction({ type: "variate", nodeId: ids[0], prompt, size, x: box.x, y: box.y, experienceId: menuStyleId || undefined })
       ).finally(() => removeProcessingBox(boxId));
     }
-  }, [onAction, menu, selectedIds, nodes, promptInput, aspect, resolution, buildProcessingBox, menuStyleIds, styleNamesByIds, addProcessingBox, removeProcessingBox]);
+  }, [onAction, menu, selectedIds, nodes, promptInput, aspect, resolution, buildProcessingBox, menuStyleId, styleNameById, addProcessingBox, removeProcessingBox]);
 
   // 编辑框执行：使用编辑框自身的 nodeId 和 prompt（不依赖菜单/选中状态）
   // 点生成 → 面板关闭 → 在新图位置（原图右侧）画占位框显示"正在编辑图片..."
@@ -1328,14 +1262,14 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     const node = nodes.find((n) => n.id === editPanel.nodeId);
     if (!node) return;
     const box = buildProcessingBox(editPanel.aspect, [node]);
-    const sname = styleNamesByIds(editPanel.experienceIds);
-    const expIds = editPanel.experienceIds;
+    const sname = styleNameById(editPanel.experienceId);
+    const expId = editPanel.experienceId;
     setEditPanel(null);
     const boxId = addProcessingBox(box, sname ? `正在按《${sname}》编辑图片...` : "正在编辑图片...");
     Promise.resolve(
-      onAction({ type: "edit", nodeId: node.id, prompt, size, x: box.x, y: box.y, experienceIds: expIds?.length ? expIds : undefined })
+      onAction({ type: "edit", nodeId: node.id, prompt, size, x: box.x, y: box.y, experienceId: expId || undefined })
     ).finally(() => removeProcessingBox(boxId));
-  }, [onAction, editPanel, nodes, buildProcessingBox, styleNamesByIds, addProcessingBox, removeProcessingBox]);
+  }, [onAction, editPanel, nodes, buildProcessingBox, styleNameById, addProcessingBox, removeProcessingBox]);
 
   const handleDelete = useCallback(() => {
     if (!onAction || selectedIds.size === 0) return;
@@ -1487,8 +1421,6 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   const handleContainerGenerate = useCallback(
     async (c: PendingContainer) => {
       if (!canvasId) return;
-      // 防重入：生成中（含 textarea Enter 直触）不允许再次发起
-      if (generatingContainerIdRef.current) return;
       const prompt = c.prompt.trim();
       const size = calcSize(c.aspect, c.resolution);
 
@@ -1530,7 +1462,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
             y: c.y,
             node_id: op === "variate" ? c.refIds[0] : undefined,
             node_ids: op === "compose" ? c.refIds : undefined,
-            experience_ids: c.experienceIds?.length ? c.experienceIds : undefined,
+            experience_id: c.experienceId || undefined,
           },
           {
             onStart: (mode) => {
@@ -1778,8 +1710,36 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
             });
           })}
 
-          {/* 编辑框锚定连线已移至屏幕层 portal（EditPanel 是 fixed 屏幕元素，
-              画在被 scale(zoom) 缩放的世界层会导致连线长度被缩放塌缩） */}
+          {/* 编辑框连线：源图 → 编辑框（虚线，与参考连线同风格，世界坐标系渲染） */}
+          {editPanel &&
+            (() => {
+              const node = nodes.find((n) => n.id === editPanel.nodeId);
+              if (!node) return null;
+              // 画布容器 fixed inset:0，左上角 = (0,0)，编辑框屏幕坐标 → 世界坐标
+              const PANEL_W = 340;
+              const panelWorldX = (editPanel.x - pan.x) / zoom;
+              const panelWorldY = (editPanel.y - pan.y) / zoom;
+              const panelWorldW = PANEL_W / zoom;
+              const panelWorldH = editPanelH / zoom;
+              const src: BBox = { x: node.x, y: node.y, width: node.width, height: node.height };
+              const tgt: BBox = { x: panelWorldX, y: panelWorldY, width: panelWorldW, height: panelWorldH };
+              const ep = getConnectionEndpoints(src, tgt);
+              const path = `M ${ep.x1} ${ep.y1} C ${ep.cx1} ${ep.cy1}, ${ep.cx2} ${ep.cy2}, ${ep.x2} ${ep.y2}`;
+              return (
+                <g key={`edit-${editPanel.nodeId}`}>
+                  <path
+                    d={path}
+                    fill="none"
+                    stroke="rgba(167,139,250,0.7)"
+                    strokeWidth={2.5}
+                    strokeDasharray="8 6"
+                    strokeLinecap="round"
+                    markerEnd="url(#ica-arrow-dashed)"
+                  />
+                  <circle cx={ep.x1} cy={ep.y1} r={4} fill="#a78bfa" />
+                </g>
+              );
+            })()}
 
           {/* 拖动中的临时连线 */}
           {connecting &&
@@ -1834,7 +1794,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
             node={node}
             isDragging={draggingNode === node.id}
             isHovered={hoveredNode === node.id}
-            isLinked={!!(node.source_ids && node.source_ids.length >= 2)}
+            isLinked={!!(node.source_ids && node.source_ids.length > 0)}
             isSelected={selectedIds.has(node.id)}
             showPorts={hoveredNode === node.id || (connecting?.fromId === node.id)}
             onPortMouseDown={(e, portIdx) => handlePortMouseDown(e, node, portIdx)}
@@ -1968,10 +1928,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         </div>
       )}
 
-      {/* 右键菜单（普通菜单 / compose / variate 输入框）
-          portal 到 body：画布层有 transform: scale(zoom)，否则 position:fixed
-          会以变换层为包含块被整体缩放，字号/滚动条放大、边框错位 */}
-      {menu && createPortal(
+      {/* 右键菜单（普通菜单 / compose / variate 输入框） */}
+      {menu && (
         <ContextMenu
           ref={menuRef}
           x={menu.x}
@@ -1990,8 +1948,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
           onAspectChange={setAspect}
           onResolutionChange={setResolution}
           experiences={experiences}
-          styleIds={menuStyleIds}
-          onStyleChange={setMenuStyleIds}
+          styleId={menuStyleId}
+          onStyleChange={setMenuStyleId}
           onMenuAction={handleMenuAction}
           onExecute={handleExecute}
           onDelete={handleDelete}
@@ -1999,15 +1957,12 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
           onSaveImage={handleSaveImage}
           onRevealImage={handleRevealImage}
           onCreateContainer={handleCreateContainer}
-          onAddToChat={handleAddToChat}
           onClose={() => setMenu(null)}
-        />,
-        document.body,
+        />
       )}
 
-      {/* 编辑图片框（独立于右键菜单，可与普通菜单并存；连线在画布 SVG 层渲染）
-          portal 到 body，避免被画布 scale(zoom) 缩放（坐标本就是屏幕视口坐标） */}
-      {editPanel && createPortal(
+      {/* 编辑图片框（独立于右键菜单，可与普通菜单并存；连线在画布 SVG 层渲染） */}
+      {editPanel && (
         <EditPanel
           ref={editPanelRef}
           x={editPanel.x}
@@ -2022,43 +1977,14 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
           onAspectChange={(v) => setEditPanel((p) => (p ? { ...p, aspect: v } : p))}
           onResolutionChange={(v) => setEditPanel((p) => (p ? { ...p, resolution: v } : p))}
           experiences={experiences}
-          styleIds={editPanel.experienceIds ?? []}
-          onStyleChange={(v) => setEditPanel((p) => (p ? { ...p, experienceIds: v.length ? v : undefined } : p))}
+          styleId={editPanel.experienceId ?? ""}
+          onStyleChange={(v) => setEditPanel((p) => (p ? { ...p, experienceId: v || undefined } : p))}
           onExecute={handleEditPanelExecute}
           onClose={() => setEditPanel(null)}
           onMove={(nx, ny) => setEditPanel((p) => (p ? { ...p, x: nx, y: ny } : p))}
-          onRect={setEditPanelRect}
-        />,
-        document.body,
+          onMeasure={(h) => setEditPanelH(h)}
+        />
       )}
-
-      {/* 编辑框锚定连线（屏幕层 portal）：源图屏幕矩形 → 面板真实屏幕矩形，
-          不随画布 scale(zoom) 缩放，与图片间连线同风格。
-          注意：world 层不一定位于画布容器 (0,0)（可能有包裹层偏移），
-          故原点取 world 元素真实 rect，而非 container 原点 + pan */}
-      {editPanel &&
-        (() => {
-          const node = nodes.find((n) => n.id === editPanel.nodeId);
-          const worldEl = containerRef.current?.querySelector("[data-role=world]");
-          if (!node || !worldEl) return null;
-          const wr = worldEl.getBoundingClientRect();
-          const nodeRect: BBox = {
-            x: wr.left + node.x * zoom,
-            y: wr.top + node.y * zoom,
-            width: node.width * zoom,
-            height: node.height * zoom,
-          };
-          const panelRect: BBox = {
-            x: editPanelRect.x,
-            y: editPanelRect.y,
-            width: editPanelRect.w,
-            height: editPanelRect.h,
-          };
-          return createPortal(
-            <EditPanelConnector nodeRect={nodeRect} panelRect={panelRect} />,
-            document.body,
-          );
-        })()}
 
       {/* 选中数量提示（localStatusMsg 显示时隐藏，避免重叠） */}
       {selectedCount > 0 && !menu && !connecting && !busy && !localStatusMsg && (
@@ -2219,20 +2145,18 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         </svg>
       </button>
 
-      {/* 缩放指示器：钉在视口右下角（对话圆按钮已上移避让）；对话面板展开时只做水平避让（贴面板左外缘），纵向永不移动 */}
+      {/* 缩放指示器 */}
       <div
         style={{
           position: "absolute",
-          bottom: 16,
-          right: chatDockWidth > 0 ? chatDockWidth + 24 : 16,
+          bottom: 80,
+          right: 16,
           background: "rgba(0,0,0,0.6)",
           color: "#fff",
           padding: "4px 10px",
           borderRadius: 6,
           fontSize: 12,
           pointerEvents: "none",
-          transition: "right 0.18s ease",
-          zIndex: 500,
         }}
       >
         {Math.round(zoom * 100)}%
@@ -2241,180 +2165,44 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   );
 }
 
-// 风格多选下拉（风格库为空时隐藏；深色底浅字，选中后每份风格全文依次拼接进生成提示词）
+// 风格下拉（风格库为空时隐藏；深色底浅字，选中后把风格全文拼接进生成提示词）
 function StyleSelect({
   experiences,
   value,
   onChange,
 }: {
   experiences: ExperienceMeta[];
-  value: string[];
-  onChange: (v: string[]) => void;
+  value: string;
+  onChange: (v: string) => void;
 }) {
-  const [open, setOpen] = useState(false);
-  const rootRef = useRef<HTMLDivElement>(null);
-  const btnRef = useRef<HTMLButtonElement>(null);
-  const listRef = useRef<HTMLDivElement>(null);
-  // 下拉的 fixed 定位（打开时刻按按钮屏幕矩形计算；按钮在缩放的容器面板内时 rect 仍是真实屏幕坐标）
-  const [listPos, setListPos] = useState({ left: 0, top: 0, width: 0, maxH: 208 });
-
-  // 打开时计算定位：portal 到 body + fixed，避免被 EditPanel 内容区 overflow:hidden、
-  // 画布世界层裁剪、容器面板 transform:scale 等任何父级上下文裁剪/缩放
-  useEffect(() => {
-    if (!open || !btnRef.current) return;
-    const r = btnRef.current.getBoundingClientRect();
-    const maxH = Math.max(120, Math.min(208, window.innerHeight - r.bottom - 12));
-    setListPos({ left: r.left, top: r.bottom + 4, width: r.width, maxH });
-  }, [open]);
-
-  // 点击组件外部/按 Esc 关闭下拉。
-  // 用捕获阶段监听：EditPanel/ContextMenu 根节点对 mousedown stopPropagation（阻止画布拖拽），
-  // 冒泡阶段的 document 监听收不到事件，点面板内其他区域时下拉关不掉
-  useEffect(() => {
-    if (!open) return;
-    const onDocDown = (ev: MouseEvent) => {
-      const t = ev.target as Node;
-      if (rootRef.current?.contains(t) || listRef.current?.contains(t)) return;
-      setOpen(false);
-    };
-    const onKey = (ev: KeyboardEvent) => {
-      if (ev.key === "Escape") {
-        // 只关下拉：阻止 Esc 继续传播关闭编辑框/菜单/容器
-        ev.stopPropagation();
-        setOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", onDocDown, true);
-    document.addEventListener("keydown", onKey, true);
-    return () => {
-      document.removeEventListener("mousedown", onDocDown, true);
-      document.removeEventListener("keydown", onKey, true);
-    };
-  }, [open]);
-
   if (experiences.length === 0) return null;
-
-  const toggle = (id: string) => {
-    onChange(value.includes(id) ? value.filter((v) => v !== id) : [...value, id]);
-  };
-  const names = experiences.filter((e) => value.includes(e.id)).map((e) => e.name);
-  const label =
-    names.length === 0
-      ? "无（自由发挥）"
-      : names.length === 1
-        ? names[0]
-        : `已选 ${names.length} 个风格`;
-
   return (
-    <div ref={rootRef} style={{ marginTop: 10 }}>
-      <div style={{ fontSize: 14, color: "rgba(255,255,255,0.78)", marginBottom: 6 }}>风格（可多选）</div>
-      <button
-        ref={btnRef}
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        title="选中后，每份风格指南全文会依次拼接进生成提示词"
+    <div style={{ marginTop: 10 }}>
+      <div style={{ fontSize: 14, color: "rgba(255,255,255,0.78)", marginBottom: 6 }}>风格</div>
+      <select
+        className="ic-select"
         style={{
           width: "100%",
           boxSizing: "border-box",
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          gap: 6,
           background: "rgba(255,255,255,0.06)",
           border: "1px solid rgba(255,255,255,0.12)",
           borderRadius: 6,
-          color: names.length ? "#c4b5fd" : "#eee",
+          color: "#eee",
           fontSize: 15,
           padding: "9px 10px",
-          cursor: "pointer",
-          textAlign: "left",
-          fontFamily: "inherit",
+          outline: "none",
         }}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        title="选中后，该风格指南全文会拼接进生成提示词"
       >
-        <span
-          style={{
-            overflow: "hidden",
-            textOverflow: "ellipsis",
-            whiteSpace: "nowrap",
-            flex: 1,
-          }}
-        >
-          {label}
-        </span>
-        <span style={{ fontSize: 11, opacity: 0.6, flexShrink: 0 }}>▼</span>
-      </button>
-      {open && createPortal(
-        <div
-          ref={listRef}
-          style={{
-            position: "fixed",
-            left: listPos.left,
-            top: listPos.top,
-            width: listPos.width,
-            boxSizing: "border-box",
-            zIndex: 1100,
-            background: "rgba(20,20,40,0.98)",
-            border: "1px solid rgba(167,139,250,0.5)",
-            borderRadius: 8,
-            boxShadow: "0 8px 24px rgba(0,0,0,0.6)",
-            maxHeight: listPos.maxH,
-            overflowY: "auto",
-            padding: 4,
-          }}
-        >
-          {experiences.map((e) => {
-            const checked = value.includes(e.id);
-            return (
-              <div
-                key={e.id}
-                onClick={() => toggle(e.id)}
-                title={e.description || e.name}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 8,
-                  padding: "8px 10px",
-                  borderRadius: 6,
-                  cursor: "pointer",
-                  color: checked ? "#c4b5fd" : "rgba(255,255,255,0.85)",
-                  fontSize: 14,
-                  background: "transparent",
-                  userSelect: "none",
-                }}
-                onMouseEnter={(ev) => {
-                  ev.currentTarget.style.background = "rgba(167,139,250,0.12)";
-                }}
-                onMouseLeave={(ev) => {
-                  ev.currentTarget.style.background = "transparent";
-                }}
-              >
-                {/* 复选框 */}
-                <span
-                  style={{
-                    width: 16,
-                    height: 16,
-                    flexShrink: 0,
-                    borderRadius: 4,
-                    border: `1.5px solid ${checked ? "#a78bfa" : "rgba(255,255,255,0.35)"}`,
-                    background: checked ? "#a78bfa" : "transparent",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    color: "#1a1a2e",
-                    fontSize: 11,
-                    fontWeight: 700,
-                    lineHeight: 1,
-                  }}
-                >
-                  {checked ? "✓" : ""}
-                </span>
-                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{e.name}</span>
-              </div>
-            );
-          })}
-        </div>,
-        document.body,
-      )}
+        <option value="">无（自由发挥）</option>
+        {experiences.map((e) => (
+          <option key={e.id} value={e.id}>
+            {e.name}
+          </option>
+        ))}
+      </select>
     </div>
   );
 }
@@ -2436,7 +2224,7 @@ const ContextMenu = ({
   onAspectChange,
   onResolutionChange,
   experiences,
-  styleIds,
+  styleId,
   onStyleChange,
   onMenuAction,
   onExecute,
@@ -2445,7 +2233,6 @@ const ContextMenu = ({
   onSaveImage,
   onRevealImage,
   onCreateContainer,
-  onAddToChat,
   onClose,
 }: {
   ref: React.RefObject<HTMLDivElement | null>;
@@ -2461,8 +2248,8 @@ const ContextMenu = ({
   onAspectChange: (v: string) => void;
   onResolutionChange: (v: string) => void;
   experiences: ExperienceMeta[];
-  styleIds: string[];
-  onStyleChange: (v: string[]) => void;
+  styleId: string;
+  onStyleChange: (v: string) => void;
   onMenuAction: (mode: "compose" | "variate" | "edit") => void;
   onExecute: () => void;
   onDelete: () => void;
@@ -2470,7 +2257,6 @@ const ContextMenu = ({
   onSaveImage: () => void;
   onRevealImage: () => void;
   onCreateContainer: () => void;
-  onAddToChat: () => void;
   onClose: () => void;
 }) => {
   // 输入模式（组合/变体/编辑）加宽，操作菜单保持紧凑
@@ -2605,12 +2391,6 @@ const ContextMenu = ({
               <span style={{ fontSize: 11, color: "rgba(255,255,255,0.35)" }}>≥2 张</span>
             </div>
           )}
-          <div style={itemStyle} onMouseEnter={hoverBg} onMouseLeave={hoverOut} onClick={onAddToChat}>
-            <span>💬 添加到对话</span>
-            <span style={{ fontSize: 11, color: "rgba(255,255,255,0.35)" }}>
-              引用{selectedCount > 1 ? ` ${selectedCount} 张` : " #"}
-            </span>
-          </div>
           {selectedCount === 1 && (
             <>
               <div style={itemStyle} onMouseEnter={hoverBg} onMouseLeave={hoverOut} onClick={() => onMenuAction("variate")}>
@@ -2729,7 +2509,7 @@ const ContextMenu = ({
           </div>
 
           {/* 风格选择（风格库为空时隐藏） */}
-          <StyleSelect experiences={experiences} value={styleIds} onChange={onStyleChange} />
+          <StyleSelect experiences={experiences} value={styleId} onChange={onStyleChange} />
 
           <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
             <button
@@ -2770,54 +2550,7 @@ const ContextMenu = ({
 };
 
 /**
- * 编辑框锚定连线（屏幕层）：源图屏幕矩形 → 编辑框屏幕矩形。
- * EditPanel 是 fixed 屏幕元素（不随画布 zoom 缩放），其连线也必须画在屏幕坐标系，
- * 否则放在被 scale(zoom) 缩放的世界 SVG 层里，连线屏幕长度会随 zoom 塌缩/放大、线宽变化。
- * 两端都直接用真实 DOM 的 getBoundingClientRect，因此拖动面板/拉宽/面板贴边 clamp 都自动对齐。
- */
-function EditPanelConnector({ nodeRect, panelRect }: { nodeRect: BBox; panelRect: BBox }) {
-  const ep = getConnectionEndpoints(nodeRect, panelRect);
-  const path = `M ${ep.x1} ${ep.y1} C ${ep.cx1} ${ep.cy1}, ${ep.cx2} ${ep.cy2}, ${ep.x2} ${ep.y2}`;
-  return (
-    <svg
-      style={{
-        position: "fixed",
-        inset: 0,
-        width: "100vw",
-        height: "100vh",
-        pointerEvents: "none",
-        zIndex: 999,
-      }}
-    >
-      <defs>
-        <marker
-          id="ica-edit-arrow"
-          viewBox="0 0 10 10"
-          refX="9"
-          refY="5"
-          markerWidth="6"
-          markerHeight="6"
-          orient="auto-start-reverse"
-        >
-          <path d="M 0 1 L 10 5 L 0 9 z" fill="#a78bfa" />
-        </marker>
-      </defs>
-      <path
-        d={path}
-        fill="none"
-        stroke="rgba(167,139,250,0.85)"
-        strokeWidth={2.5}
-        strokeDasharray="8 6"
-        strokeLinecap="round"
-        markerEnd="url(#ica-edit-arrow)"
-      />
-      <circle cx={ep.x1} cy={ep.y1} r={4} fill="#a78bfa" />
-    </svg>
-  );
-}
-
-/**
- * 编辑图片框：独立浮窗，带连线指向源图（连线在屏幕层 portal 渲染）。
+ * 编辑图片框：独立浮窗，带连线指向源图（连线在画布 SVG 层渲染）。
  * 与右键菜单并存，只能 Esc/取消关闭。prompt 必填。
  * 位置由父组件控制（拖动时 onMove 回调更新父组件 state，连线随之更新）。
  */
@@ -2833,12 +2566,12 @@ const EditPanel = ({
   onAspectChange,
   onResolutionChange,
   experiences,
-  styleIds,
+  styleId,
   onStyleChange,
   onExecute,
   onClose,
   onMove,
-  onRect,
+  onMeasure,
 }: {
   ref: React.RefObject<HTMLDivElement | null>;
   x: number;
@@ -2851,12 +2584,12 @@ const EditPanel = ({
   onAspectChange: (v: string) => void;
   onResolutionChange: (v: string) => void;
   experiences: ExperienceMeta[];
-  styleIds: string[];
-  onStyleChange: (v: string[]) => void;
+  styleId: string;
+  onStyleChange: (v: string) => void;
   onExecute: () => void;
   onClose: () => void;
   onMove: (x: number, y: number) => void;
-  onRect: (rect: { x: number; y: number; w: number; h: number }) => void;
+  onMeasure: (h: number) => void;
 }) => {
   // 可拉伸尺寸：宽度持久化；高度默认自适应（null），拉伸过一次后固定并持久化
   const [panelW, setPanelW] = useState<number>(() => {
@@ -2869,9 +2602,7 @@ const EditPanel = ({
   });
   const [resizeHover, setResizeHover] = useState(false);
   const left = Math.min(x, window.innerWidth - panelW - 8);
-  // 固定高度时按真实高度钳制；自适应时按含风格选择/原始提示词的最大内容估算
-  const estH = panelH ?? (nodeContent && nodeContent !== "本地图片" ? 500 : 435);
-  const top = Math.min(y, window.innerHeight - estH - 8);
+  const top = Math.min(y, window.innerHeight - 435);
 
   const onTitleMouseDown = useCallback((e: React.MouseEvent) => {
     if (e.button !== 0) return;
@@ -2894,8 +2625,8 @@ const EditPanel = ({
     document.addEventListener("mouseup", onUp);
   }, [left, top, onMove, panelW]);
 
-  // 拉伸：角落同时调宽高（宽 340~720）；四边逐轴拉伸（e/w 调宽、n/s 调高，对边锚定）
-  const onResizeMouseDown = useCallback((e: React.MouseEvent, dir: "corner" | "n" | "s" | "e" | "w") => {
+  // 右下角拉伸：拖拽同时调整宽高（宽 340~720）；面板贴近视口底部时向上生长
+  const onResizeMouseDown = useCallback((e: React.MouseEvent) => {
     if (e.button !== 0) return;
     e.stopPropagation();
     e.preventDefault();
@@ -2906,40 +2637,14 @@ const EditPanel = ({
     let lastW = origW;
     let lastH = origH;
     const onMov = (ev: MouseEvent) => {
-      const dx = ev.clientX - startX;
-      const dy = ev.clientY - startY;
-      if (dir === "corner" || dir === "e") lastW = Math.max(340, Math.min(origW + dx, 720));
-      if (dir === "w") lastW = Math.max(340, Math.min(origW - dx, 720));
-      if (dir === "corner" || dir === "s") lastH = Math.max(420, origH + dy);
-      if (dir === "n") lastH = Math.max(420, origH - dy);
-      // 左边柄：右边锚定、左边跟随；顶到视口 0 后宽度停止增长（右缘保持原位）
-      if (dir === "w") {
-        const nl = left + origW - lastW;
-        if (nl < 0) {
-          lastW = Math.max(340, left + origW);
-          onMove(0, top);
-        } else {
-          onMove(nl, top);
-        }
-      }
-      // 上边柄：底边锚定、顶边跟随；顶到视口 0 后高度停止增长（底缘保持原位）
-      if (dir === "n") {
-        const nt = top + origH - lastH;
-        if (nt < 0) {
-          lastH = Math.max(420, top + origH);
-          onMove(left, 0);
-        } else {
-          onMove(left, nt);
-        }
-      }
-      // 底边/角落向下超出视口 → 面板顶边上移（向上生长）；顶到 0 后高度钳制在视口内
-      if (dir === "corner" || dir === "s") {
-        const overflow = top + lastH - (window.innerHeight - 8);
-        if (overflow > 0) {
-          const newTop = Math.max(0, top - overflow);
-          onMove(left, newTop);
-          if (newTop === 0) lastH = Math.max(420, window.innerHeight - 8);
-        }
+      lastW = Math.max(340, Math.min(origW + ev.clientX - startX, 720));
+      lastH = Math.max(420, origH + ev.clientY - startY);
+      // 底部超出视口 → 面板顶边上移（向上生长）；顶到 0 后高度钳制在视口内
+      const overflow = top + lastH - (window.innerHeight - 8);
+      if (overflow > 0) {
+        const newTop = Math.max(0, top - overflow);
+        onMove(left, newTop);
+        if (newTop === 0) lastH = Math.max(420, window.innerHeight - 8);
       }
       setPanelW(lastW);
       setPanelH(lastH);
@@ -2954,20 +2659,10 @@ const EditPanel = ({
     document.addEventListener("mouseup", onUp);
   }, [panelW, panelH, top, left, onMove, ref]);
 
-  // 回报真实屏幕矩形（含贴边 clamp 后的 left/top 与实际宽高），供屏幕层连线终点对齐。
-  // useLayoutEffect 在浏览器绘制前同步；ResizeObserver 兜底内容撑高（高度自适应时）。
-  useLayoutEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    const report = () => {
-      const r = el.getBoundingClientRect();
-      onRect({ x: r.left, y: r.top, w: r.width, h: r.height });
-    };
-    report();
-    const ro = new ResizeObserver(report);
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, [left, top, panelW, panelH, onRect, ref]);
+  // 测量实际高度，回报父组件用于连线计算
+  useEffect(() => {
+    if (ref.current) onMeasure(ref.current.offsetHeight);
+  });
 
   const canExecute = prompt.trim().length > 0;
 
@@ -3021,7 +2716,7 @@ const EditPanel = ({
             borderRadius: 6,
             margin: "0 6px 6px",
             lineHeight: 1.5,
-            maxHeight: 72,
+            maxHeight: 100,
             overflowY: "auto",
             wordBreak: "break-word",
             userSelect: "text",
@@ -3039,7 +2734,6 @@ const EditPanel = ({
           padding: "8px 10px",
           flex: 1,
           minHeight: 0,
-          overflow: "hidden",
           display: "flex",
           flexDirection: "column",
         }}
@@ -3073,10 +2767,9 @@ const EditPanel = ({
             resize: "none",
             fontFamily: "inherit",
             lineHeight: 1.5,
-            // 拉伸过高度后（panelH 固定），输入框弹性填满剩余空间；
-            // 空间不足时允许收缩到 0，保证底部按钮永远在边框内（minHeight 60 会顶住收缩导致按钮溢出）
-            flex: panelH ? "1 1 auto" : undefined,
-            minHeight: panelH ? 0 : 60,
+            // 拉伸过高度后（panelH 固定），输入框弹性填满剩余空间
+            flex: panelH ? 1 : undefined,
+            minHeight: 60,
           }}
         />
 
@@ -3131,7 +2824,7 @@ const EditPanel = ({
         </div>
 
         {/* 风格选择（风格库为空时隐藏） */}
-        <StyleSelect experiences={experiences} value={styleIds} onChange={onStyleChange} />
+        <StyleSelect experiences={experiences} value={styleId} onChange={onStyleChange} />
 
         <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
           <button
@@ -3168,24 +2861,9 @@ const EditPanel = ({
         </div>
       </div>
 
-      {/* 四边拉伸热区：跨边框的隐形热区，仅光标形状反馈（与容器一致）；
-          两端各让出 32px 避开右下角手柄 */}
-      {(["n", "s", "e", "w"] as const).map((dir) => {
-        const st: React.CSSProperties = {
-          position: "absolute",
-          zIndex: 10,
-          background: "transparent",
-        };
-        if (dir === "n") Object.assign(st, { top: -5, left: 32, right: 32, height: 10, cursor: "ns-resize" });
-        if (dir === "s") Object.assign(st, { bottom: -5, left: 32, right: 32, height: 10, cursor: "ns-resize" });
-        if (dir === "e") Object.assign(st, { right: -5, top: 32, bottom: 32, width: 10, cursor: "ew-resize" });
-        if (dir === "w") Object.assign(st, { left: -5, top: 32, bottom: 32, width: 10, cursor: "ew-resize" });
-        return <div key={dir} style={st} onMouseDown={(e) => onResizeMouseDown(e, dir)} />;
-      })}
-
       {/* 右下角拉伸手柄：平时隐形热区，hover 显示对角线指示 */}
       <div
-        onMouseDown={(e) => onResizeMouseDown(e, "corner")}
+        onMouseDown={onResizeMouseDown}
         onMouseEnter={() => setResizeHover(true)}
         onMouseLeave={() => setResizeHover(false)}
         title="拖拽调整编辑框大小"
@@ -3222,7 +2900,8 @@ const EditPanel = ({
 /**
  * 图片节点：渲染单个图片，可拖拽、可选中，hover 显示连接点
  */
-function ImageNode({
+// React.memo 自定义比较：只比 node 引用 + 布尔状态，忽略回调引用（回调闭包捕获的 node 引用不变时行为等价）
+const ImageNode = memo(function ImageNode({
   node,
   isDragging,
   isHovered,
@@ -3309,30 +2988,6 @@ function ImageNode({
             transition: isDragging ? "none" : "box-shadow 0.2s, outline 0.2s",
           }}
         />
-        {/* 编号 badge：用户与 Agent 用 #N 指代图片（右键"添加到对话"引用也用它） */}
-        {node.index != null && (
-          <div
-            title={`#${node.index}`}
-            style={{
-              position: "absolute",
-              left: 6,
-              top: 6,
-              minWidth: 24,
-              padding: "1px 6px",
-              borderRadius: 6,
-              background: "rgba(0,0,0,0.55)",
-              color: "#e0e7ff",
-              fontSize: 11,
-              fontWeight: 600,
-              lineHeight: "18px",
-              textAlign: "center",
-              pointerEvents: "none",
-              zIndex: 5,
-            }}
-          >
-            #{node.index}
-          </div>
-        )}
         {ports.map((p, i) => {
           const isHovered = hoveredPortIdx === i;
           return (
@@ -3421,7 +3076,14 @@ function ImageNode({
   }
 
   return null;
-}
+}, (prev, next) =>
+  prev.node === next.node &&
+  prev.isDragging === next.isDragging &&
+  prev.isHovered === next.isHovered &&
+  prev.isLinked === next.isLinked &&
+  prev.isSelected === next.isSelected &&
+  prev.showPorts === next.showPorts
+);
 
 /**
  * 容器边缘/四角拉伸柄：纯隐形热区，仅以光标形状作为反馈
@@ -3826,7 +3488,11 @@ function PendingContainerNode({
       </div>
 
       {/* 风格选择（风格库为空时隐藏） */}
-      <StyleSelect experiences={experiences} value={container.experienceIds ?? []} onChange={(v) => onChange({ experienceIds: v.length ? v : undefined })} />
+      <StyleSelect
+        experiences={experiences}
+        value={container.experienceId ?? ""}
+        onChange={(v) => onChange({ experienceId: v || undefined })}
+      />
 
       {/* 描述 */}
       <textarea
@@ -3894,14 +3560,13 @@ function PendingContainerNode({
           <ContainerResizeHandle key={dir} dir={dir} thickness={handleT} onDown={onHandleDown} />
         ))}
 
-      {/* 生成中覆盖层：整个面板显示流式预览与进度；
-          zIndex 45 盖过关闭按钮(40)/拉伸柄(30)，拦截一切交互——生成中不可再改风格/比例/描述等 */}
+      {/* 生成中覆盖层：整个面板显示流式预览与进度 */}
       {isGenerating && (
         <div
           style={{
             position: "absolute",
             inset: 0,
-            zIndex: 45,
+            zIndex: 5,
             borderRadius: 10,
             background: container.previewUrl
               ? "rgba(0,0,0,0.25)"
@@ -3913,6 +3578,7 @@ function PendingContainerNode({
             justifyContent: "center",
             gap: 8,
             overflow: "hidden",
+            pointerEvents: "none",
           }}
         >
           {/* 流式预览图（模糊→清晰渐进，贴合容器形状） */}

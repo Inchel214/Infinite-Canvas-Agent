@@ -30,7 +30,15 @@ app.include_router(router)
 
 # 画布图片静态服务（节点 image_url 指向这里，画布 JSON 只存 URL）
 IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-app.mount("/images", StaticFiles(directory=str(IMAGES_DIR)), name="images")
+app.mount("/images", StaticFiles(directory=str(IMAGES_DIR), html=False), name="images")
+
+# 给图片静态资源加上浏览器缓存头，避免每次切画布/刷新都重拉图片
+@app.middleware("http")
+async def cache_images(request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/images/"):
+        response.headers.setdefault("Cache-Control", "public, max-age=86400")
+    return response
 
 
 @app.get("/health", summary="健康检查")
