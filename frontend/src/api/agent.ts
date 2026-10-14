@@ -1,6 +1,12 @@
 // 后端 API 调用
 
-import type { CanvasState, CanvasSummary, ChatMessage, ChatResponse } from "../types/canvas";
+import type {
+  AgentStep,
+  CanvasState,
+  CanvasSummary,
+  ChatMessage,
+  ChatResponse,
+} from "../types/canvas";
 
 const API_BASE = "http://127.0.0.1:8000/api";
 
@@ -34,6 +40,82 @@ export async function chatWithAgent(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ canvas_id: canvasId, prompt }),
+  });
+  if (!res.ok) {
+    throw new Error(`${res.status}`);
+  }
+  return res.json();
+}
+
+// Agent SSE 流事件（/agent/chat/stream 逐步推送）
+export interface AgentStreamEvent {
+  // delta / plan_delta 为 token 级文本增量（打字机），其余为节点事件
+  type:
+    | "start"
+    | "plan_delta"
+    | "delta"
+    | "tool_start"
+    | "tool_result"
+    | "response"
+    | "done";
+  content?: string;
+  tool?: string;
+  args?: Record<string, unknown>;
+  result?: string;
+  success?: boolean;
+  stopped?: boolean;
+  message?: string;
+  canvas?: CanvasState;
+  steps?: AgentStep[];
+}
+
+// 流式 Agent 对话：计划/思考/工具过程逐事件回调，最终 done 事件带完整结果
+export async function chatWithAgentStream(
+  canvasId: string,
+  prompt: string,
+  onEvent: (evt: AgentStreamEvent) => void
+): Promise<void> {
+  const res = await fetch(`${API_BASE}/agent/chat/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ canvas_id: canvasId, prompt }),
+  });
+  if (!res.ok || !res.body) {
+    throw new Error(`${res.status}`);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    // SSE 帧以空行分隔；跨 chunk 的半帧留在 buf 里等下一块
+    let sep: number;
+    while ((sep = buf.indexOf("\n\n")) >= 0) {
+      const chunk = buf.slice(0, sep);
+      buf = buf.slice(sep + 2);
+      for (const line of chunk.split("\n")) {
+        if (line.startsWith("data: ")) {
+          try {
+            onEvent(JSON.parse(line.slice(6)));
+          } catch {
+            /* 跳过坏帧 */
+          }
+        }
+      }
+    }
+  }
+}
+
+// 停止当前画布正在执行的 Agent 任务（下一个操作边界生效）
+export async function stopAgent(
+  canvasId: string
+): Promise<{ success: boolean; message: string }> {
+  const res = await fetch(`${API_BASE}/agent/stop`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ canvas_id: canvasId }),
   });
   if (!res.ok) {
     throw new Error(`${res.status}`);

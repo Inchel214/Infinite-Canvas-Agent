@@ -41,6 +41,9 @@ export interface AgentStep {
   args?: Record<string, unknown>;
   result?: string;
   content?: string;
+  // 流式过程中的状态：pending=执行中，success=是否成功（结束后回填）
+  pending?: boolean;
+  success?: boolean;
 }
 
 export interface ChatResponse {

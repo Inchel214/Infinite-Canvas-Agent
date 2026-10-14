@@ -29,6 +29,20 @@ class BaseLLM(ABC):
     def chat(self, messages: list[dict], tools: list[dict] | None = None) -> LLMResponse:
         ...
 
+    def chat_stream(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        on_text=None,
+    ) -> LLMResponse:
+        """流式对话：文本增量经 on_text 回调逐段推送（打字机效果）。
+        默认降级实现走非流式 chat，一次性回调全文（MockLLM 等简单实现直接继承）。
+        返回最终聚合结果（含 tool_calls），调用方逻辑与非流式完全一致。"""
+        resp = self.chat(messages, tools)
+        if on_text and resp.content:
+            on_text(resp.content)
+        return resp
+
 
 class MockLLM(BaseLLM):
     """
@@ -276,6 +290,90 @@ class OpenAICompatLLM(BaseLLM):
                 tool_calls.append(ToolCall(name=fn["name"], args=args))
 
         return LLMResponse(content=content, tool_calls=tool_calls)
+
+    def chat_stream(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        on_text=None,
+    ) -> LLMResponse:
+        """流式 chat/completions：文本 delta 逐段经 on_text 回调（SSE 打字机），
+        tool_calls 分片按 index 聚合，最终组装成与非流式一致的 LLMResponse。"""
+        body: dict = {
+            "model": self.model,
+            "messages": self._to_openai_messages(messages),
+            "temperature": self.temperature,
+            "stream": True,
+        }
+        oai_tools = self._to_openai_tools(tools)
+        if oai_tools:
+            body["tools"] = oai_tools
+
+        # trust_env=False 绕过系统代理
+        session = requests.Session()
+        session.trust_env = False
+        resp = session.post(
+            self.api_url,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream",
+            },
+            json=body,
+            timeout=self.timeout,
+            stream=True,
+        )
+        resp.raise_for_status()
+        # iter_lines(decode_unicode) 依赖 resp.encoding，Ark 未带 charset 时强制 UTF-8
+        resp.encoding = "utf-8"
+
+        content_parts: list[str] = []
+        # tool_calls 分片聚合：{index: {"name":…, "args": 拼接中的 JSON 字符串}}
+        tc_acc: dict[int, dict] = {}
+        try:
+            for raw in resp.iter_lines(decode_unicode=True):
+                if not raw or not raw.startswith("data:"):
+                    continue
+                data = raw[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue  # 跳过坏帧
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue  # keep-alive / usage 统计块
+                delta = choices[0].get("delta") or {}
+                # 文本增量：逐段推给前端打字机渲染
+                text = delta.get("content")
+                if text:
+                    content_parts.append(text)
+                    if on_text:
+                        on_text(text)
+                # 工具调用分片：id/name 在首块，arguments 按块拼接
+                for tc in delta.get("tool_calls") or []:
+                    idx = tc.get("index", 0)
+                    acc = tc_acc.setdefault(idx, {"name": "", "args": ""})
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        acc["name"] += fn["name"]
+                    if fn.get("arguments"):
+                        acc["args"] += fn["arguments"]
+        finally:
+            resp.close()
+
+        tool_calls: list[ToolCall] | None = None
+        if tc_acc:
+            tool_calls = []
+            for _, acc in sorted(tc_acc.items()):
+                try:
+                    args = json.loads(acc["args"] or "{}")
+                except json.JSONDecodeError:
+                    args = {"prompt": acc["args"]}
+                tool_calls.append(ToolCall(name=acc["name"], args=args))
+
+        return LLMResponse(content="".join(content_parts), tool_calls=tool_calls)
 
     def _to_openai_tools(self, tools: list[dict] | None) -> list[dict] | None:
         """把内部工具描述转换为 OpenAI function calling 格式"""

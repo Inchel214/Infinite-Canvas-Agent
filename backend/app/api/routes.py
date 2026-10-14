@@ -1,5 +1,6 @@
 """REST API 路由"""
 import json
+import queue
 import subprocess
 import sys
 import threading
@@ -671,6 +672,94 @@ def chat(req: ChatRequest):
         canvas=result.state.to_dict(),
         steps=result.steps,
     )
+
+
+class StopRequest(BaseModel):
+    canvas_id: str
+
+
+@router.post(
+    "/agent/chat/stream",
+    summary="Agent 对话（SSE 流式：计划/思考/工具过程/最终结果，支持停止）",
+)
+def chat_stream(req: ChatRequest):
+    """SSE 事件协议：
+
+    - start                  流开始
+    - plan      {content}    执行计划（规划阶段产出，立即展示）
+    - thought   {content}    模型边想边调工具时的自述
+    - tool_start  {tool, args}           工具开始执行
+    - tool_result {tool, result, success, canvas?} 工具执行完成（canvas 随事件增量刷新）
+    - response {content}     最终文本回复
+    - done      {success, stopped, message, canvas, steps} 终止事件
+    """
+    # 预校验画布存在：错误走标准 404，而不是流内 done 事件
+    try:
+        deps.store.get_canvas(req.canvas_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    history = deps.chat_sessions.get_context(req.canvas_id)
+    q: "queue.Queue[dict | None]" = queue.Queue()
+
+    def worker():
+        try:
+            result = deps.agent.run(
+                req.prompt, req.canvas_id, history=history,
+                on_event=lambda e: q.put(e),
+            )
+            # 与 /agent/chat 一致：回写一轮对话供下轮上下文与历史展示
+            deps.chat_sessions.append_round(req.canvas_id, req.prompt, result.message)
+            q.put({
+                "type": "done",
+                "success": result.success,
+                "stopped": result.stopped,
+                "message": result.message,
+                "canvas": result.state.to_dict(),
+                "steps": result.steps,
+            })
+        except Exception as e:
+            # worker 异常也必须发 done，否则前端会一直等
+            q.put({
+                "type": "done",
+                "success": False,
+                "message": f"Agent 执行失败：{e}",
+                "steps": [],
+            })
+        finally:
+            q.put(None)
+
+    threading.Thread(
+        target=worker, daemon=True, name=f"agent-stream-{req.canvas_id[:8]}"
+    ).start()
+
+    def sse():
+        finished = False
+        try:
+            yield _sse({"type": "start"})
+            while True:
+                evt = q.get()
+                if evt is None:
+                    finished = True
+                    return
+                yield _sse(evt)
+        finally:
+            # 客户端断开（关页面/刷新/网络中断）视为放弃：
+            # 请求停止后台执行，避免白烧模型与生图额度
+            if not finished:
+                deps.agent.control.request_stop(req.canvas_id)
+
+    return StreamingResponse(sse(), media_type="text/event-stream")
+
+
+@router.post("/agent/stop", summary="停止当前画布正在执行的 Agent 任务")
+def stop_agent(req: StopRequest):
+    # 停止在下一个操作边界生效（当前正在执行的生图等长操作会先完成）
+    stopped = deps.agent.control.request_stop(req.canvas_id)
+    return {
+        "success": True,
+        "message": "已请求停止，正在等待当前操作完成" if stopped else "当前没有正在执行的任务",
+    }
 
 
 @router.get("/agent/history", summary="获取画布对话历史")

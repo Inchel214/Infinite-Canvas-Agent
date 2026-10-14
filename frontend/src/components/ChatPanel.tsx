@@ -2,9 +2,10 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
-  chatWithAgent,
+  chatWithAgentStream,
   getChatHistory,
   clearChatHistory,
+  stopAgent,
 } from "../api/agent";
 import type { AgentStep, CanvasNode, CanvasState } from "../types/canvas";
 
@@ -13,6 +14,8 @@ interface ChatEntry {
   role: "user" | "assistant";
   content: string;
   steps?: AgentStep[];
+  plan?: string; // 执行计划（流式 plan 事件，展示为路线图卡片）
+  stopped?: boolean; // 用户中途停止
   timestamp: number;
   error?: boolean;
 }
@@ -259,38 +262,92 @@ export function ChatPanel({
         : "";
     setInput("");
     setSending(true);
+    const ts = Date.now();
+    // 立刻挂一条空的 assistant 条目作为"直播位"，流式事件逐步填充它
     setEntries((prev) => [
       ...prev,
-      { role: "user", content: text, timestamp: Date.now() },
+      { role: "user", content: text, timestamp: ts },
+      { role: "assistant", content: "", steps: [], timestamp: ts },
     ]);
 
+    // 更新直播条目（entries 末尾那条 assistant）
+    const updateLive = (patch: (e: ChatEntry) => ChatEntry) => {
+      setEntries((prev) => {
+        if (prev.length === 0) return prev;
+        const last = prev[prev.length - 1];
+        if (last.role !== "assistant") return prev;
+        const next = [...prev];
+        next[next.length - 1] = patch(last);
+        return next;
+      });
+    };
+
     try {
-      const res = await chatWithAgent(canvasId, refBlock + text);
-      setEntries((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content: res.message,
-          steps: res.steps,
-          timestamp: Date.now(),
-        },
-      ]);
-      // 引用已随本条消息消费，发送后清空（一次性引用，避免残留误伤后续指令）
-      onClearRefs();
-      // Agent 可能改了画布（生成/移动/删除节点），通知上层刷新
-      onCanvasUpdate(res.canvas);
+      await chatWithAgentStream(canvasId, refBlock + text, (evt) => {
+        if (evt.type === "plan_delta" && evt.content) {
+          // 计划逐字流出（打字机），追加渲染
+          updateLive((e) => ({ ...e, plan: (e.plan || "") + evt.content }));
+        } else if (evt.type === "delta" && evt.content) {
+          // LLM 文本逐字流出（思考/最终回复），追加渲染
+          updateLive((e) => ({ ...e, content: (e.content || "") + evt.content }));
+        } else if (evt.type === "tool_start") {
+          updateLive((e) => ({
+            ...e,
+            steps: [
+              ...(e.steps || []),
+              { type: "tool_call", tool: evt.tool, args: evt.args, result: "", pending: true },
+            ],
+          }));
+        } else if (evt.type === "tool_result") {
+          // 画布随工具执行增量刷新：生成的图片立刻出现在画布上
+          if (evt.canvas) onCanvasUpdate(evt.canvas);
+          updateLive((e) => {
+            const steps = [...(e.steps || [])];
+            for (let k = steps.length - 1; k >= 0; k--) {
+              if (steps[k].pending) {
+                steps[k] = {
+                  ...steps[k],
+                  result: evt.result || "",
+                  success: evt.success,
+                  pending: false,
+                };
+                break;
+              }
+            }
+            return { ...e, steps };
+          });
+        } else if (evt.type === "done") {
+          updateLive((e) => ({
+            ...e,
+            content: evt.message || e.content,
+            steps: evt.steps || e.steps,
+            stopped: evt.stopped,
+            error: !evt.success && !evt.stopped,
+          }));
+          if (evt.canvas) onCanvasUpdate(evt.canvas);
+          // 引用已随本条消息消费（停止/失败时保留，方便重发）
+          if (evt.success) onClearRefs();
+        }
+        // start / response 事件无需单独处理（response 与 done.message 一致）
+      });
     } catch (e) {
-      setEntries((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content: `请求失败：${(e as Error).message}（请检查后端与模型配置）`,
-          timestamp: Date.now(),
-          error: true,
-        },
-      ]);
+      updateLive((live) => ({
+        ...live,
+        content: `请求失败：${(e as Error).message}（请检查后端与模型配置）`,
+        error: true,
+      }));
     } finally {
       setSending(false);
+    }
+  };
+
+  // 停止当前执行：后端在下一个操作边界中断，done 事件（stopped）到达后 UI 复位
+  const handleStop = async () => {
+    if (!canvasId) return;
+    try {
+      await stopAgent(canvasId);
+    } catch {
+      // 停止请求失败时忽略，等待流自然结束
     }
   };
 
@@ -475,25 +532,49 @@ export function ChatPanel({
               </div>
             </div>
           ) : (
-            /* Agent 回复：左对齐气泡 + 工具调用过程 */
+            /* Agent 回复：执行计划卡片 + 左对齐气泡 + 工具调用过程 */
             <div key={i} style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              <div
-                style={{
-                  alignSelf: "flex-start",
-                  maxWidth: "92%",
-                  background: "rgba(255,255,255,0.07)",
-                  color: entry.error ? "#f87171" : "#e8e8f0",
-                  padding: "8px 12px",
-                  borderRadius: "12px 12px 12px 2px",
-                  fontSize: 14,
-                  lineHeight: 1.6,
-                  wordBreak: "break-word",
-                }}
-              >
-                <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
-                  {entry.content}
-                </ReactMarkdown>
-              </div>
+              {/* 执行计划（规划阶段流式产出，工具执行期间就能看到路线图） */}
+              {entry.plan && (
+                <div
+                  style={{
+                    alignSelf: "flex-start",
+                    maxWidth: "92%",
+                    width: "92%",
+                    background: "rgba(99,102,241,0.08)",
+                    border: "1px dashed rgba(99,102,241,0.45)",
+                    borderRadius: 8,
+                    padding: "6px 10px",
+                    fontSize: 12.5,
+                    color: "#c7d2fe",
+                  }}
+                >
+                  <div style={{ fontWeight: 600, marginBottom: 2 }}>📋 执行计划</div>
+                  <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+                    {entry.plan}
+                  </ReactMarkdown>
+                </div>
+              )}
+
+              {entry.content && (
+                <div
+                  style={{
+                    alignSelf: "flex-start",
+                    maxWidth: "92%",
+                    background: "rgba(255,255,255,0.07)",
+                    color: entry.error ? "#f87171" : entry.stopped ? "#fbbf24" : "#e8e8f0",
+                    padding: "8px 12px",
+                    borderRadius: "12px 12px 12px 2px",
+                    fontSize: 14,
+                    lineHeight: 1.6,
+                    wordBreak: "break-word",
+                  }}
+                >
+                  <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+                    {entry.content}
+                  </ReactMarkdown>
+                </div>
+              )}
 
               {/* 工具调用步骤（仅本轮对话展示） */}
               {entry.steps && entry.steps.some((s) => s.type === "tool_call") && (
@@ -525,7 +606,9 @@ export function ChatPanel({
                       >
                         <span
                           style={{
-                            background: "rgba(99,102,241,0.2)",
+                            background: s.pending
+                              ? "rgba(99,102,241,0.35)"
+                              : "rgba(99,102,241,0.2)",
                             color: "#a5b4fc",
                             padding: "1px 8px",
                             borderRadius: 4,
@@ -537,14 +620,19 @@ export function ChatPanel({
                         </span>
                         <span
                           style={{
-                            color: "#888",
+                            color: s.pending
+                              ? "#818cf8"
+                              : s.success === false
+                                ? "#f87171"
+                                : "#888",
                             overflow: "hidden",
                             textOverflow: "ellipsis",
                             whiteSpace: "nowrap",
+                            animation: s.pending ? "chatblink 1.2s infinite" : undefined,
                           }}
                           title={s.result || ""}
                         >
-                          {s.result || ""}
+                          {s.pending ? "执行中..." : (s.result || "")}
                         </span>
                       </div>
                     ))}
@@ -678,22 +766,42 @@ export function ChatPanel({
             lineHeight: 1.5,
           }}
         />
-        <button
-          onClick={handleSend}
-          disabled={!input.trim() || !canvasId || sending}
-          style={{
-            background: sending || !input.trim() || !canvasId ? "rgba(99,102,241,0.35)" : "rgba(99,102,241,0.95)",
-            border: "none",
-            color: "#fff",
-            borderRadius: 10,
-            padding: "10px 16px",
-            fontSize: 14,
-            cursor: sending || !input.trim() || !canvasId ? "default" : "pointer",
-            flexShrink: 0,
-          }}
-        >
-          发送
-        </button>
+        {sending ? (
+          /* 执行中可随时中断：后端在下一个操作边界停止，done(stopped) 事件到达后复位 */
+          <button
+            onClick={handleStop}
+            style={{
+              background: "rgba(248,113,113,0.92)",
+              border: "none",
+              color: "#fff",
+              borderRadius: 10,
+              padding: "10px 16px",
+              fontSize: 14,
+              cursor: "pointer",
+              flexShrink: 0,
+            }}
+            title="停止当前正在执行的 Agent 任务"
+          >
+            停止
+          </button>
+        ) : (
+          <button
+            onClick={handleSend}
+            disabled={!input.trim() || !canvasId}
+            style={{
+              background: !input.trim() || !canvasId ? "rgba(99,102,241,0.35)" : "rgba(99,102,241,0.95)",
+              border: "none",
+              color: "#fff",
+              borderRadius: 10,
+              padding: "10px 16px",
+              fontSize: 14,
+              cursor: !input.trim() || !canvasId ? "default" : "pointer",
+              flexShrink: 0,
+            }}
+          >
+            发送
+          </button>
+        )}
       </div>
 
       <style>{`
