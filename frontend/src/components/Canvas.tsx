@@ -15,10 +15,10 @@ export type CanvasAction =
 // 待生成图片容器（右键空白创建，接收连线作为参考图）
 export type PendingContainer = {
   id: string;
-  x: number;            // 世界坐标（左上角）
+  x: number;            // 世界坐标锚点（左上角）
   y: number;
-  w: number;            // 世界宽（创建时按 1/zoom 换算，屏幕上恒为基准大小）
-  h: number;            // 世界高
+  w: number;            // 屏幕像素宽：不随画布 zoom 改变
+  h: number;            // 屏幕像素高
   aspect: string;
   resolution: string;
   prompt: string;
@@ -120,11 +120,10 @@ async function fetchImageBlob(url: string, attempts = 3): Promise<Blob> {
   throw lastError instanceof Error ? lastError : new Error("图片加载失败");
 }
 
-// 容器面板基准尺寸（屏幕像素）：创建时按 1/zoom 换算为世界尺寸——
-// 任何相机视野下创建，屏幕上都呈现同样大小、字体同样清晰；
-// 创建后作为画布元素与图片同律缩放（固定在画布坐标上，无相对运动）
-const CONTAINER_BASE_W = 340; // 控件（比例按钮一行 5 个）所需宽度
-const CONTAINER_BASE_H = 600; // 控件自然高度（实测 598：17px 字号 + 描述框 minHeight 232 的固定行高总和）；基准须≥自然高度，否则可视边框超出世界盒/拉伸柄错位
+// 容器面板基准尺寸（屏幕像素）：面板保留画布锚点，但采用屏幕尺度渲染，
+// 因此缩放/平移时仍跟随画布位置，文字和控件不会随 zoom 变得过小或过大。
+const CONTAINER_BASE_W = 320; // 与右侧编辑面板接近的紧凑宽度，比例按钮仍保持一行
+const CONTAINER_BASE_H = 480; // 紧凑字号体系下的自然高度；基准须覆盖内容高度，避免拉伸柄错位
 
 // 按比例 + 分辨率档位计算 size 字符串（如 "2048x1152"）
 function calcSize(ratioKey: string, res: string): string {
@@ -353,6 +352,12 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   }
   const [pan, setPan] = useState(savedCam.current ? { x: savedCam.current.x, y: savedCam.current.y } : { x: 0, y: 0 });
   const [zoom, setZoom] = useState(savedCam.current ? savedCam.current.z : 0.5);
+  const [viewport, setViewport] = useState(() => ({ width: window.innerWidth, height: window.innerHeight }));
+  useEffect(() => {
+    const onResize = () => setViewport({ width: window.innerWidth, height: window.innerHeight });
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
   // pan/zoom 的 ref 镜像：原生 wheel 监听里读最新值，避免闭包过期
   const panRef = useRef(pan);
   panRef.current = pan;
@@ -685,33 +690,45 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     [pan, zoom]
   );
 
+  // 待生成面板的锚点属于画布世界，但面板自身使用屏幕像素尺寸。
+  // 当锚点靠近视口边缘或右侧聊天栏时，仅钳制显示位置，不改写世界锚点；
+  // 用户拖动面板后才会把新的显示位置写回锚点。
+  const getContainerPlacement = useCallback((c: PendingContainer) => {
+    const pad = 8;
+    const left = pad;
+    const top = pad;
+    const right = Math.max(left, viewport.width - (chatDockWidth > 0 ? chatDockWidth + 24 : pad));
+    const bottom = Math.max(top, viewport.height - 56); // 避让底部画布工具栏
+    const desiredX = pan.x + c.x * zoom;
+    const desiredY = pan.y + c.y * zoom;
+    const screenX = right - left >= c.w
+      ? Math.min(Math.max(desiredX, left), right - c.w)
+      : left;
+    const screenY = bottom - top >= c.h
+      ? Math.min(Math.max(desiredY, top), bottom - c.h)
+      : top;
+    return {
+      x: (screenX - pan.x) / zoom,
+      y: (screenY - pan.y) / zoom,
+      screenX,
+      screenY,
+      screenW: c.w,
+      screenH: c.h,
+    };
+  }, [pan, zoom, viewport, chatDockWidth]);
+
   // 创建待生成容器（居中于世界坐标 wx/wy 处，可带初始参考图）：
-  // 世界尺寸 = 基准/zoom，任何视野下创建时屏幕上都呈 340×600、字体清晰；
-  // 位置尽量钳制在当前相机视野内（仅创建时算一次，之后仍是固定画布元素，与图片同律缩放）
+  // 尺寸始终以屏幕像素保存，锚点则保存在画布世界坐标中。
   const createContainer = useCallback((wx: number, wy: number, refId?: string) => {
     containerSeqRef.current += 1;
-    const w = Math.round(CONTAINER_BASE_W / zoom);
-    const h = Math.round(CONTAINER_BASE_H / zoom);
-    let x = Math.round(wx - w / 2);
-    let y = Math.round(wy - h / 2);
-    // 可视区域（世界坐标）：排除右侧聊天面板与底部工具按钮行
-    const rect = containerRef.current?.getBoundingClientRect();
-    if (rect) {
-      const chat = document.querySelector<HTMLElement>('[data-role="chat-panel"]');
-      const usableR = (chat ? chat.getBoundingClientRect().left - 8 : rect.right - 8) - rect.left;
-      const usableB = rect.height - 56; // 底部工具按钮行高约 48px
-      const vl = -pan.x / zoom;
-      const vt = -pan.y / zoom;
-      const vr = (usableR - pan.x) / zoom;
-      const vb = (usableB - pan.y) / zoom;
-      // 放得下则钳进视野（尽量贴近原点击点）；放不下（窗口过小）则左上角对齐
-      x = vr - vl >= w ? Math.min(Math.max(x, vl + 8 / zoom), vr - w) : vl;
-      y = vb - vt >= h ? Math.min(Math.max(y, vt + 8 / zoom), vb - h) : vt;
-    }
+    const w = CONTAINER_BASE_W;
+    const h = CONTAINER_BASE_H;
+    const x = wx - w / (2 * zoom);
+    const y = wy - h / (2 * zoom);
     const c: PendingContainer = {
       id: `pending-${Date.now()}-${containerSeqRef.current}`,
-      x,
-      y,
+      x: Math.round(x),
+      y: Math.round(y),
       w,
       h,
       aspect: "1:1",
@@ -720,7 +737,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       refIds: refId ? [refId] : [],
     };
     setContainers((prev) => [...prev, c]);
-  }, [zoom, pan]);
+  }, [zoom]);
 
   const updateContainer = useCallback((id: string, patch: Partial<PendingContainer>) => {
     setContainers((prev) => prev.map((c) => (c.id === id ? { ...c, ...patch } : c)));
@@ -1092,16 +1109,18 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   }, [connecting, draggingContainer, draggingNode, isPanning, pan, zoom, dragOffset, screenToWorld]);
 
   const handleMouseUp = useCallback((e: React.MouseEvent) => {
-    // 连线结束：判断是否命中容器（命中范围覆盖容器整个可视区域，世界坐标判定）
+    // 连线结束：面板是屏幕尺度浮层，按其钳制后的真实屏幕矩形判定命中。
     if (connecting) {
       const w = screenToWorld(e.clientX, e.clientY);
-      const hit = containers.find(
-        (c) =>
-          w.x >= c.x &&
-          w.x <= c.x + c.w &&
-          w.y >= c.y &&
-          w.y <= c.y + c.h + 24
-      );
+      const hit = containers.find((c) => {
+        const p = getContainerPlacement(c);
+        return (
+          e.clientX >= p.screenX &&
+          e.clientX <= p.screenX + p.screenW &&
+          e.clientY >= p.screenY &&
+          e.clientY <= p.screenY + p.screenH + 24
+        );
+      });
       if (hit && !hit.refIds.includes(connecting.fromId)) {
         // 命中容器：添加参考图
         updateContainer(hit.id, { refIds: [...hit.refIds, connecting.fromId], error: undefined });
@@ -1200,7 +1219,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       backgroundDownRef.current = null;
       setIsPanning(false);
     }
-  }, [marquee, draggingNode, localOverrides, onNodeMoved, onNodesMoved, isPanning, pan, zoom, nodes, connecting, containers, updateContainer, screenToWorld, draggingContainer, createContainer, menu]);
+  }, [marquee, draggingNode, localOverrides, onNodeMoved, onNodesMoved, isPanning, pan, zoom, nodes, connecting, containers, updateContainer, screenToWorld, draggingContainer, createContainer, menu, getContainerPlacement]);
 
   // 图片节点拖拽开始（记录起点用于 click/drag 判定）
   const handleNodeMouseDown = useCallback((e: React.MouseEvent, node: CanvasNode) => {
@@ -1651,6 +1670,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   return (
     <div
       ref={containerRef}
+      data-role="canvas-root"
       onMouseDown={handleMouseDown}
       onMouseMove={handleMouseMove}
       onMouseUp={handleMouseUp}
@@ -1692,11 +1712,16 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
                   : "default",
       }}
     >
-      {/* 全局动画 keyframes：图片入场淡入缩放 */}
+      {/* 全局动画 keyframes：图片与浮层入场 */}
       <style>{`
         @keyframes ica-img-in {
           from { opacity: 0; transform: scale(0.92); }
           to   { opacity: 1; transform: scale(1); }
+        }
+        @keyframes ica-popover-in {
+          0%   { opacity: 0; transform: translateY(-3px) scale(0.985); }
+          58%  { opacity: .82; transform: translateY(4px) scale(.997); }
+          100% { opacity: 1; transform: translateY(0) scale(1); }
         }
         @keyframes ica-proc-pulse {
           0%, 100% { box-shadow: 0 0 0 3px rgba(167,139,250,0.95), 0 0 28px rgba(167,139,250,0.5); }
@@ -1824,7 +1849,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
 
           {/* 容器的待生成参考连线（虚线），目标为容器世界矩形 */}
           {containers.map((c) => {
-            const tgtRect: BBox = { x: c.x, y: c.y, width: c.w, height: c.h };
+            const p = getContainerPlacement(c);
+            const tgtRect: BBox = { x: p.x, y: p.y, width: c.w / zoom, height: c.h / zoom };
             return c.refIds.map((rid) => {
               const src = nodes.find((n) => n.id === rid);
               if (!src) return null;
@@ -1914,36 +1940,41 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
           />
         ))}
 
-        {/* 待生成图片容器：world 层渲染，与图片同律缩放（固定在画布坐标上，无相对运动） */}
-        {containers.map((c) => (
-          <PendingContainerNode
-            key={c.id}
-            container={c}
-            nodes={nodes}
-            zoom={zoom}
-            isGenerating={generatingIds.has(c.id)}
-            isDragActive={draggingContainer?.id === c.id}
-            isConnectTarget={!!connecting}
-            progress={genProgressMap[c.id] ?? 0}
-            experiences={experiences}
-            onHeaderMouseDown={(e) => {
-              if (e.button !== 0) return;
-              e.stopPropagation();
-              e.preventDefault();
-              const w = screenToWorld(e.clientX, e.clientY);
-              setDraggingContainer({ id: c.id, offsetX: w.x - c.x, offsetY: w.y - c.y });
-            }}
-            onChange={(patch) => updateContainer(c.id, patch)}
-            onRemoveRef={(rid) =>
-              updateContainer(c.id, { refIds: c.refIds.filter((rr) => rr !== rid) })
-            }
-            onRemove={() => removeContainer(c.id)}
-            onGenerate={() => handleContainerGenerate(c)}
-            onActivate={() => {
-              activeContainerIdRef.current = c.id;
-            }}
-          />
-        ))}
+        {/* 待生成图片容器：保留世界锚点，同时反向抵消相机缩放，维持舒适的屏幕阅读尺寸。 */}
+        {containers.map((c) => {
+          const p = getContainerPlacement(c);
+          return (
+            <PendingContainerNode
+              key={c.id}
+              container={c}
+              displayX={p.x}
+              displayY={p.y}
+              nodes={nodes}
+              zoom={zoom}
+              isGenerating={generatingIds.has(c.id)}
+              isDragActive={draggingContainer?.id === c.id}
+              isConnectTarget={!!connecting}
+              progress={genProgressMap[c.id] ?? 0}
+              experiences={experiences}
+              onHeaderMouseDown={(e) => {
+                if (e.button !== 0) return;
+                e.stopPropagation();
+                e.preventDefault();
+                const w = screenToWorld(e.clientX, e.clientY);
+                setDraggingContainer({ id: c.id, offsetX: w.x - p.x, offsetY: w.y - p.y });
+              }}
+              onChange={(patch) => updateContainer(c.id, patch)}
+              onRemoveRef={(rid) =>
+                updateContainer(c.id, { refIds: c.refIds.filter((rr) => rr !== rid) })
+              }
+              onRemove={() => removeContainer(c.id)}
+              onGenerate={() => handleContainerGenerate(c)}
+              onActivate={() => {
+                activeContainerIdRef.current = c.id;
+              }}
+            />
+          );
+        })}
 
         {/* 生成中占位框：编辑/变体/组合执行时，新图位置的预留矩形（支持多张同时生成） */}
         {processingBoxes.map((box) => (
@@ -2375,8 +2406,8 @@ function StyleSelect({
         : `已选 ${names.length} 个风格`;
 
   return (
-    <div ref={rootRef} style={{ marginTop: 10 }}>
-      <div style={{ fontSize: 14, color: "rgba(255,255,255,0.78)", marginBottom: 6 }}>风格（可多选）</div>
+    <div ref={rootRef} style={{ marginTop: 8 }}>
+      <div style={{ fontSize: 11, color: "rgba(255,255,255,0.62)", marginBottom: 5 }}>风格（可多选）</div>
       <button
         ref={btnRef}
         type="button"
@@ -2393,8 +2424,8 @@ function StyleSelect({
           border: "1px solid rgba(255,255,255,0.12)",
           borderRadius: 6,
           color: names.length ? "#c4b5fd" : "#eee",
-          fontSize: 15,
-          padding: "9px 10px",
+          fontSize: 12,
+          padding: "6px 9px",
           cursor: "pointer",
           textAlign: "left",
           fontFamily: "inherit",
@@ -2441,12 +2472,12 @@ function StyleSelect({
                 style={{
                   display: "flex",
                   alignItems: "center",
-                  gap: 8,
-                  padding: "8px 10px",
+                  gap: 7,
+                  padding: "7px 9px",
                   borderRadius: 6,
                   cursor: "pointer",
                   color: checked ? "#c4b5fd" : "rgba(255,255,255,0.85)",
-                  fontSize: 14,
+                  fontSize: 12,
                   background: "transparent",
                   userSelect: "none",
                 }}
@@ -2460,8 +2491,8 @@ function StyleSelect({
                 {/* 复选框 */}
                 <span
                   style={{
-                    width: 16,
-                    height: 16,
+                    width: 14,
+                    height: 14,
                     flexShrink: 0,
                     borderRadius: 4,
                     border: `1.5px solid ${checked ? "#a78bfa" : "rgba(255,255,255,0.35)"}`,
@@ -2470,7 +2501,7 @@ function StyleSelect({
                     alignItems: "center",
                     justifyContent: "center",
                     color: "#1a1a2e",
-                    fontSize: 11,
+                    fontSize: 10,
                     fontWeight: 700,
                     lineHeight: 1,
                   }}
@@ -2745,6 +2776,8 @@ const ContextMenu = ({
         padding: 6,
         zIndex: 1000,
         backdropFilter: "blur(8px)",
+        transformOrigin: "top left",
+        animation: "ica-popover-in 220ms cubic-bezier(0.22, 0.78, 0.24, 1) both",
       }}
       onMouseDown={(e) => e.stopPropagation()}
       onContextMenu={(e) => e.preventDefault()}
@@ -2767,7 +2800,6 @@ const ContextMenu = ({
           : mode === "background"
             ? "画布空白处"
             : "描述（可选）"}
-        <span style={{ float: "right", opacity: 0.4, fontSize: 10 }}>⠿ 拖</span>
       </div>
 
       {/* 选中图片的生成提示词（详情，可鼠标选中复制） */}
@@ -3474,25 +3506,26 @@ const ImageNode = memo(function ImageNode({
             transition: isDragging ? "none" : "box-shadow 0.2s, outline 0.2s",
           }}
         />
-        {/* 编号 badge：用户与 Agent 用 #N 指代图片（右键"添加到对话"引用也用它） */}
+        {/* 编号放在图片外侧，避免遮挡内容；用户与 Agent 均用 #N 指代图片。 */}
         {node.index != null && (
           <div
             title={`#${node.index}`}
             style={{
               position: "absolute",
-              left: 6,
-              top: 6,
+              left: 0,
+              bottom: "calc(100% + 4px)",
               minWidth: 24,
-              padding: "1px 6px",
+              padding: "1px 7px",
               borderRadius: 6,
-              background: "rgba(0,0,0,0.55)",
-              color: "#e0e7ff",
+              background: "rgba(55,55,65,0.94)",
+              color: "rgba(255,255,255,0.92)",
               fontSize: 11,
               fontWeight: 600,
-              lineHeight: "18px",
+              lineHeight: "19px",
               textAlign: "center",
               pointerEvents: "none",
               zIndex: 5,
+              boxShadow: "0 2px 8px rgba(0,0,0,0.28)",
             }}
           >
             #{node.index}
@@ -3537,25 +3570,6 @@ const ImageNode = memo(function ImageNode({
             </div>
           );
         })}
-        {isLinked && (
-          <div
-            style={{
-              position: "absolute",
-              left: 0,
-              top: -24,
-              background: "rgba(99,102,241,0.9)",
-              color: "white",
-              padding: "2px 8px",
-              borderRadius: 4,
-              fontSize: 10,
-              fontWeight: 500,
-              pointerEvents: "none",
-              whiteSpace: "nowrap",
-            }}
-          >
-            组合结果
-          </div>
-        )}
       </div>
     );
   }
@@ -3635,11 +3649,13 @@ function ContainerResizeHandle({
 }
 
 /**
- * 待生成图片容器：画布原生元素（世界坐标渲染、随相机缩放），
- * 面板内容按自然尺寸排版后整体 scale(s)——创建时刻屏幕上恒为基准 UI
+ * 待生成图片容器：位置锚定画布世界，视觉尺寸反向抵消相机 zoom。
+ * 面板始终保持可读的屏幕尺度，同时仍能跟随画布平移、连线和拖动。
  */
 function PendingContainerNode({
   container,
+  displayX,
+  displayY,
   nodes,
   zoom,
   isGenerating,
@@ -3655,6 +3671,8 @@ function PendingContainerNode({
   onActivate,
 }: {
   container: PendingContainer;
+  displayX: number;
+  displayY: number;
   nodes: CanvasNode[];
   zoom: number;
   isGenerating: boolean;
@@ -3682,14 +3700,14 @@ function PendingContainerNode({
   const aspectRatio =
     ASPECT_RATIOS.find((r) => r.key === container.aspect) ?? ASPECT_RATIOS[0];
 
-  // 选项按钮：15px 字号 + 9px 上下内距 ≈ 39px 高的触控目标（Fitts 定律 ≥ 38px 舒适区）
+  // 与右侧编辑面板共用紧凑字号层级，避免浮层之间出现明显的视觉尺度差。
   const smallBtn = (active: boolean): React.CSSProperties => ({
-    padding: "9px 0",
+    padding: "6px 0",
     background: active ? "#a78bfa" : "rgba(255,255,255,0.08)",
     color: active ? "#1a1a2e" : "rgba(255,255,255,0.85)",
     border: "none",
     borderRadius: 6,
-    fontSize: 15,
+    fontSize: 12,
     cursor: "pointer",
     fontWeight: active ? 600 : 400,
   });
@@ -3706,7 +3724,7 @@ function PendingContainerNode({
     if (e.button !== 0) return;
     e.stopPropagation();
     e.preventDefault();
-    resizeStartRef.current = { mx: e.clientX, my: e.clientY, x: container.x, y: container.y, w: container.w, h: container.h };
+    resizeStartRef.current = { mx: e.clientX, my: e.clientY, x: displayX, y: displayY, w: container.w, h: container.h };
     setResizeDir(dir);
   };
 
@@ -3722,13 +3740,13 @@ function PendingContainerNode({
             : "nwse-resize";
     const prevCursor = document.body.style.cursor;
     document.body.style.cursor = cursor;
-    const MIN_W = 240 / zoom; // 拉伸下限：屏幕上仍可读
-    const MIN_H = 160 / zoom;
+    const MIN_W = 240; // 屏幕像素下限：保证控件仍可读
+    const MIN_H = 160;
     const onMove = (e: MouseEvent) => {
       const s0 = resizeStartRef.current;
       if (!s0) return;
-      const dx = (e.clientX - s0.mx) / zoom;
-      const dy = (e.clientY - s0.my) / zoom;
+      const dx = e.clientX - s0.mx;
+      const dy = e.clientY - s0.my;
       let w = s0.w;
       let h = s0.h;
       if (resizeDir === "e") w = s0.w + dx;
@@ -3747,8 +3765,8 @@ function PendingContainerNode({
       if (h < MIN_H) h = MIN_H;
       let { x, y } = s0;
       // 拉伸时对侧边/角固定不动
-      if (resizeDir.includes("w")) x = s0.x + s0.w - w;
-      if (resizeDir.includes("n")) y = s0.y + s0.h - h;
+      if (resizeDir.includes("w")) x = s0.x + (s0.w - w) / zoom;
+      if (resizeDir.includes("n")) y = s0.y + (s0.h - h) / zoom;
       onChange({ x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(h) });
     };
     const onUp = () => setResizeDir(null);
@@ -3761,20 +3779,20 @@ function PendingContainerNode({
     };
   }, [resizeDir, zoom, onChange]);
 
-  // 拉伸柄热区厚度：屏幕恒定（约 12px），面板本地值按 s×zoom 补偿，并按面板尺寸封顶
-  const handleT = Math.max(5, Math.min(12 / (s * zoom), Math.min(container.w / s, container.h / s) / 10));
+  // 相机 zoom 已被抵消；拉伸柄只需按用户对面板的缩放 s 补偿，屏幕热区恒定约 12px。
+  const handleT = Math.max(5, Math.min(12 / s, Math.min(container.w / s, container.h / s) / 10));
 
   return (
     <div
       data-scroll-scope
+      data-role="pending-container"
       style={{
         position: "absolute",
-        left: container.x,
-        top: container.y,
-        // 外框 = 世界占位 c.w×c.h（画布坐标固定，与图片同律缩放），仅负责占位/事件/退场动画；
-        // 视觉样式（边框/背景/圆角）在下方 inner 上——随 s 缩放，创建时刻屏幕边框恒为 2px 清晰
-        width: container.w,
-        minHeight: container.h,
+        left: displayX,
+        top: displayY,
+        // 外框仍在世界层，尺寸按 1/zoom 换算，使命中盒与屏幕上的视觉面板一致。
+        width: container.w / zoom,
+        height: container.h / zoom,
         zIndex: 20,
         // 退场：淡出 + 轻微缩小（0 0 原点），与图片入场动画重叠
         transformOrigin: "0 0",
@@ -3789,18 +3807,16 @@ function PendingContainerNode({
       }}
       onContextMenu={(e) => e.preventDefault()}
     >
-      {/* 内层：自然尺寸排版 + 统一 scale(s)。宽度/高度按两轴实际比例铺满外框，
-          逐轴拉伸时 s 不变（文字不变形），width:100%/flex 控件重排补足拉伸量。
-          边框/背景/圆角在此层——随 s 缩放，创建时刻屏幕边框恒为 2px，任何视野下创建都清晰 */}
+      {/* 内层：scale(s / zoom) 抵消世界层的相机缩放；s 只表达用户主动拉伸面板的比例。 */}
       <div
         style={{
-          transform: `scale(${s})`,
+          transform: `scale(${s / zoom})`,
           transformOrigin: "0 0",
           width: container.w / s,
           minHeight: container.h / s,
           display: "flex",
           flexDirection: "column",
-          padding: 12,
+          padding: 10,
           boxSizing: "border-box",
           background: isGenerating
             ? "rgba(167,139,250,0.12)"
@@ -3810,7 +3826,7 @@ function PendingContainerNode({
             : isConnectTarget
               ? "2px solid rgba(196,181,253,0.95)"
               : "2px dashed rgba(167,139,250,0.8)",
-          borderRadius: 12,
+          borderRadius: 10,
           boxShadow: isGenerating
             ? "0 0 30px rgba(167,139,250,0.5)"
             : isConnectTarget
@@ -3827,11 +3843,11 @@ function PendingContainerNode({
           justifyContent: "space-between",
           alignItems: "center",
           cursor: "move",
-          marginBottom: 8,
+          marginBottom: 6,
           userSelect: "none",
         }}
       >
-        <span style={{ fontSize: 17, fontWeight: 600, color: "#c4b5fd" }}>
+        <span style={{ fontSize: 13, fontWeight: 600, color: "#c4b5fd" }}>
           📦 图片容器 · {modeLabel}
         </span>
         <button
@@ -3842,8 +3858,8 @@ function PendingContainerNode({
             // 提升到拉伸柄（zIndex 30）之上：右上角柄不遮挡关闭按钮的点击
             position: "relative",
             zIndex: 40,
-            width: 30,
-            height: 30,
+            width: 24,
+            height: 24,
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
@@ -3852,7 +3868,7 @@ function PendingContainerNode({
             borderRadius: 6,
             cursor: "pointer",
             color: "rgba(255,255,255,0.55)",
-            fontSize: 18,
+            fontSize: 15,
             lineHeight: 1,
             transition: "background 0.15s ease, color 0.15s ease",
           }}
@@ -3871,7 +3887,7 @@ function PendingContainerNode({
 
       {/* 参考图缩略 */}
       {refNodes.length > 0 && (
-        <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", gap: 7, marginTop: 6, flexWrap: "wrap" }}>
           {refNodes.map((n) => (
             <div key={n.id} style={{ position: "relative" }}>
               <img
@@ -3879,8 +3895,8 @@ function PendingContainerNode({
                 alt={n.content || "ref"}
                 draggable={false}
                 style={{
-                  width: 44,
-                  height: 44,
+                  width: 36,
+                  height: 36,
                   objectFit: "cover",
                   borderRadius: 8,
                   border: "1px solid rgba(167,139,250,0.6)",
@@ -3892,10 +3908,10 @@ function PendingContainerNode({
                 title="断开此参考图"
                 style={{
                   position: "absolute",
-                  top: -9,
-                  right: -9,
-                  width: 24,
-                  height: 24,
+                  top: -7,
+                  right: -7,
+                  width: 20,
+                  height: 20,
                   display: "flex",
                   alignItems: "center",
                   justifyContent: "center",
@@ -3904,7 +3920,7 @@ function PendingContainerNode({
                   borderRadius: "50%",
                   background: "#f87171",
                   color: "white",
-                  fontSize: 13,
+                  fontSize: 11,
                   lineHeight: 1,
                   cursor: "pointer",
                   fontWeight: 700,
@@ -3928,29 +3944,29 @@ function PendingContainerNode({
       )}
 
       {/* 宽高比（右侧：迷你形状预览 + 输出像素尺寸） */}
-      <div style={{ marginTop: 12 }}>
+      <div style={{ marginTop: 8 }}>
         <div
           style={{
             display: "flex",
             justifyContent: "space-between",
             alignItems: "center",
-            marginBottom: 6,
+            marginBottom: 5,
           }}
         >
-          <span style={{ fontSize: 14, color: "rgba(255,255,255,0.78)" }}>宽高比</span>
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: 11, color: "rgba(255,255,255,0.62)" }}>宽高比</span>
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
             {/* 迷你形状预览：直观呈现最终图片的比例（替代旧版外框整体形变） */}
             <span
               style={{
                 display: "inline-block",
                 width:
                   aspectRatio.w >= aspectRatio.h
-                    ? 34
-                    : Math.round((34 * aspectRatio.w) / aspectRatio.h),
+                    ? 26
+                    : Math.round((26 * aspectRatio.w) / aspectRatio.h),
                 height:
                   aspectRatio.w >= aspectRatio.h
-                    ? Math.round((34 * aspectRatio.h) / aspectRatio.w)
-                    : 34,
+                    ? Math.round((26 * aspectRatio.h) / aspectRatio.w)
+                    : 26,
                 border: "1.5px solid #a78bfa",
                 borderRadius: 3,
                 background: "rgba(167,139,250,0.22)",
@@ -3959,7 +3975,7 @@ function PendingContainerNode({
             />
             <span
               style={{
-                fontSize: 13,
+                fontSize: 11,
                 color: "rgba(255,255,255,0.7)",
                 fontVariantNumeric: "tabular-nums",
               }}
@@ -3976,8 +3992,8 @@ function PendingContainerNode({
       </div>
 
       {/* 分辨率 */}
-      <div style={{ marginTop: 10 }}>
-        <div style={{ fontSize: 14, color: "rgba(255,255,255,0.78)", marginBottom: 6 }}>分辨率</div>
+      <div style={{ marginTop: 8 }}>
+        <div style={{ fontSize: 11, color: "rgba(255,255,255,0.62)", marginBottom: 5 }}>分辨率</div>
         <div style={{ display: "flex", gap: 4 }}>
           {RESOLUTIONS.map((res) => (
             <button
@@ -4015,15 +4031,15 @@ function PendingContainerNode({
           width: "100%",
           boxSizing: "border-box",
           flex: 1,
-          minHeight: 232,
-          marginTop: 12,
-          padding: "10px 12px",
+          minHeight: 128,
+          marginTop: 9,
+          padding: "8px 10px",
           background: "rgba(0,0,0,0.25)",
           border: "1px solid rgba(167,139,250,0.5)",
           borderRadius: 6,
           color: "white",
-          fontSize: 17,
-          lineHeight: 1.6,
+          fontSize: 13,
+          lineHeight: 1.5,
           outline: "none",
           resize: "none",
           fontFamily: "inherit",
@@ -4031,7 +4047,7 @@ function PendingContainerNode({
       />
 
       {container.error && (
-        <div style={{ color: "#f87171", fontSize: 14, marginTop: 6 }}>{container.error}</div>
+        <div style={{ color: "#f87171", fontSize: 11, marginTop: 5 }}>{container.error}</div>
       )}
 
       {/* 生成按钮 */}
@@ -4040,13 +4056,13 @@ function PendingContainerNode({
         disabled={isGenerating}
         style={{
           width: "100%",
-          marginTop: 12,
-          padding: "12px 0",
+          marginTop: 9,
+          padding: "8px 0",
           background: isGenerating ? "rgba(167,139,250,0.4)" : "#a78bfa",
           color: "#1a1a2e",
           border: "none",
           borderRadius: 8,
-          fontSize: 17,
+          fontSize: 13,
           fontWeight: 700,
           cursor: isGenerating ? "not-allowed" : "pointer",
         }}
