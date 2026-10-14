@@ -1,35 +1,35 @@
 @echo off
 chcp 65001 >nul
-title Infinite-Canvas-Agent å¯åŠ¨å™¨
+title Infinite-Canvas-Agent Æô¶¯Æ÷
 cd /d "%~dp0"
 
 echo.
 echo ==========================================
-echo   Infinite-Canvas-Agent ä¸€é”®å¯åŠ¨ (Windows)
+echo   Infinite-Canvas-Agent Ò»¼üÆô¶¯ (Windows)
 echo ==========================================
 echo.
 
-REM ===== 1. æ£€æŸ¥ Node.js =====
+REM ===== 1. ¼ì²é Node.js =====
 where node >nul 2>nul
 if %errorlevel%==0 (
     echo [OK] Node: & node --version
 ) else (
-    echo [ç¼º] æœªæ£€æµ‹åˆ° Node.jsï¼Œå°è¯•è‡ªåŠ¨å®‰è£…...
+    echo [È±] Î´¼ì²âµ½ Node.js£¬³¢ÊÔ×Ô¶¯°²×°...
     where winget >nul 2>nul
     if not %errorlevel%==0 goto NEED_NODE
     winget install --id OpenJS.NodeJS.LTS --silent --accept-source-agreements --accept-package-agreements
     if not %errorlevel%==0 goto NEED_NODE
-    echo [æç¤º] Node.js å·²å®‰è£…ï¼Œè¯·å…³é—­æœ¬çª—å£åé‡æ–°åŒå‡»è¿è¡Œ
+    echo [ÌáÊ¾] Node.js ÒÑ°²×°£¬Çë¹Ø±Õ±¾´°¿ÚºóÖØĞÂË«»÷ÔËĞĞ
     pause & exit /b 1
     :NEED_NODE
     echo.
-    echo è¯·æ‰‹åŠ¨å®‰è£… Node.jsï¼ˆLTS ç‰ˆï¼‰åé‡æ–°åŒå‡»æœ¬è„šæœ¬ï¼š
+    echo ÇëÊÖ¶¯°²×° Node.js£¨LTS °æ£©ºóÖØĞÂË«»÷±¾½Å±¾£º
     echo   https://nodejs.org/zh-cn/download
     echo.
     pause & exit /b 1
 )
 
-REM ===== 2. æ£€æŸ¥ Python =====
+REM ===== 2. ¼ì²é Python =====
 set "PYCMD="
 py -3 -V >nul 2>nul && set "PYCMD=py -3"
 if not defined PYCMD (
@@ -37,99 +37,99 @@ if not defined PYCMD (
 )
 if defined PYCMD goto PY_OK
 
-echo [ç¼º] æœªæ£€æµ‹åˆ° Pythonï¼Œå°è¯•è‡ªåŠ¨å®‰è£…...
+echo [È±] Î´¼ì²âµ½ Python£¬³¢ÊÔ×Ô¶¯°²×°...
 where winget >nul 2>nul
 if not %errorlevel%==0 goto NEED_PY
 winget install --id Python.Python.3.12 --silent --accept-source-agreements --accept-package-agreements
 if not %errorlevel%==0 goto NEED_PY
-echo [æç¤º] Python å·²å®‰è£…ï¼Œè¯·å…³é—­æœ¬çª—å£åé‡æ–°åŒå‡»è¿è¡Œ
+echo [ÌáÊ¾] Python ÒÑ°²×°£¬Çë¹Ø±Õ±¾´°¿ÚºóÖØĞÂË«»÷ÔËĞĞ
 pause & exit /b 1
 :NEED_PY
 echo.
-echo è¯·æ‰‹åŠ¨å®‰è£… Python 3.10+ åé‡æ–°åŒå‡»æœ¬è„šæœ¬ï¼š
+echo ÇëÊÖ¶¯°²×° Python 3.10+ ºóÖØĞÂË«»÷±¾½Å±¾£º
 echo   https://www.python.org/downloads/windows/
-echo ï¼ˆå®‰è£…æ—¶å‹¾é€‰ "Add Python to PATH"ï¼‰
+echo £¨°²×°Ê±¹´Ñ¡ "Add Python to PATH"£©
 echo.
 pause & exit /b 1
 :PY_OK
-echo [OK] Python å°±ç»ª
+echo [OK] Python ¾ÍĞ÷
 
-REM ===== 3. æ¸…ç†æ—§çš„åç«¯è¿›ç¨‹ï¼ˆé˜²æ­¢æ—§ä»£ç å ç€ç«¯å£å¯¼è‡´"å‡é‡å¯"ï¼‰=====
-echo æ£€æŸ¥æ—§åç«¯è¿›ç¨‹...
-powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name LIKE 'python%'\" | Where-Object { $_.CommandLine -match 'uvicorn' -and $_.CommandLine -match 'app.main' } | ForEach-Object { Write-Host ('  å·²æ¸…ç†æ—§è¿›ç¨‹ ' + $_.ProcessId); Stop-Process -Id $_.ProcessId -Force }" >nul 2>nul
+REM ===== 3. ÇåÀíÕ¼ÓÃ 8000/5173 ¶Ë¿ÚµÄ¾É½ø³Ì£¨ÎŞÂÛÖ®Ç°ÊÇ bat Æô¶¯»¹ÊÇÊÖ¶¯Æô¶¯£©=====
+echo ¼ì²é²¢ÇåÀíÕ¼ÓÃ 8000/5173 ¶Ë¿ÚµÄ¾É½ø³Ì...
+powershell -NoProfile -Command "foreach ($port in @(8000, 5173)) { $conns = Get-NetTCPConnection -LocalPort $port -State Listen -EA SilentlyContinue; if ($conns) { foreach ($c in $conns) { $proc = Get-Process -Id $c.OwningProcess -EA SilentlyContinue; if ($proc) { Write-Host ('  ÒÑÇåÀí¶Ë¿Ú ' + $port + ' ÉÏµÄ½ø³Ì ' + $proc.Name + ' (PID ' + $proc.Id + ')'); Stop-Process -Id $proc.Id -Force } } } }"
 
-REM ===== 4. åç«¯ç¯å¢ƒï¼ˆvenv éš”ç¦»ï¼Œä¸æ±¡æŸ“ç³»ç»Ÿï¼‰=====
-echo å‡†å¤‡åç«¯ç¯å¢ƒ...
+REM ===== 4. ºó¶Ë»·¾³£¨venv ¸ôÀë£¬²»ÎÛÈ¾ÏµÍ³£©=====
+echo ×¼±¸ºó¶Ë»·¾³...
 cd /d "%~dp0backend"
 if not exist .venv (
-    echo é¦–æ¬¡è¿è¡Œï¼šåˆ›å»º Python è™šæ‹Ÿç¯å¢ƒ...
+    echo Ê×´ÎÔËĞĞ£º´´½¨ Python ĞéÄâ»·¾³...
     %PYCMD% -m venv .venv
     if not exist .venv\Scripts\python.exe (
-        echo [é”™è¯¯] è™šæ‹Ÿç¯å¢ƒåˆ›å»ºå¤±è´¥ï¼Œè¯·æ£€æŸ¥ Python å®‰è£…
+        echo [´íÎó] ĞéÄâ»·¾³´´½¨Ê§°Ü£¬Çë¼ì²é Python °²×°
         pause & exit /b 1
     )
 )
-echo æ£€æŸ¥/å®‰è£…åç«¯ä¾èµ–ï¼ˆé¦–æ¬¡å¯èƒ½éœ€è¦å‡ åˆ†é’Ÿï¼‰...
+echo ¼ì²é/°²×°ºó¶ËÒÀÀµ£¨Ê×´Î¿ÉÄÜĞèÒª¼¸·ÖÖÓ£©...
 .venv\Scripts\python -m pip install --upgrade pip -q --disable-pip-version-check
 .venv\Scripts\python -m pip install -r requirements.txt -q --disable-pip-version-check
 if not %errorlevel%==0 (
-    echo [é”™è¯¯] åç«¯ä¾èµ–å®‰è£…å¤±è´¥ï¼Œè¯·æ£€æŸ¥ç½‘ç»œåé‡è¯•
+    echo [´íÎó] ºó¶ËÒÀÀµ°²×°Ê§°Ü£¬Çë¼ì²éÍøÂçºóÖØÊÔ
     pause & exit /b 1
 )
-echo [OK] åç«¯ä¾èµ–å°±ç»ª
+echo [OK] ºó¶ËÒÀÀµ¾ÍĞ÷
 cd /d "%~dp0"
 
-REM ===== 5. å‰ç«¯ä¾èµ–ï¼ˆæ¯æ¬¡è¿è¡Œï¼šä¾èµ–é½å…¨æ—¶å‡ ç§’å®Œæˆï¼Œæ›´æ–°åè‡ªåŠ¨è¡¥è£…ï¼‰=====
-echo å‡†å¤‡å‰ç«¯ç¯å¢ƒ...
+REM ===== 5. Ç°¶ËÒÀÀµ£¨Ã¿´ÎÔËĞĞ£ºÒÀÀµÆëÈ«Ê±¼¸ÃëÍê³É£¬¸üĞÂºó×Ô¶¯²¹×°£©=====
+echo ×¼±¸Ç°¶Ë»·¾³...
 cd /d "%~dp0frontend"
 call npm install --no-fund --no-audit
 if not %errorlevel%==0 (
-    echo [é”™è¯¯] å‰ç«¯ä¾èµ–å®‰è£…å¤±è´¥ï¼Œè¯·æ£€æŸ¥ç½‘ç»œåé‡è¯•
+    echo [´íÎó] Ç°¶ËÒÀÀµ°²×°Ê§°Ü£¬Çë¼ì²éÍøÂçºóÖØÊÔ
     pause & exit /b 1
 )
-echo [OK] å‰ç«¯ä¾èµ–å°±ç»ª
+echo [OK] Ç°¶ËÒÀÀµ¾ÍĞ÷
 cd /d "%~dp0"
 
-REM ===== 6. API Key é…ç½®ï¼ˆå¯é€‰ï¼Œè·³è¿‡åˆ™ç”¨æ¼”ç¤ºæ¨¡å¼ï¼‰=====
+REM ===== 6. API Key ÅäÖÃ£¨¿ÉÑ¡£¬Ìø¹ıÔòÓÃÑİÊ¾Ä£Ê½£©=====
 if exist backend\.env goto KEY_DONE
 echo.
-echo æ£€æµ‹åˆ°æœªé…ç½® API Key
-echo   - é…ç½®åå¯è°ƒç”¨è±†åŒ… Seedream çœŸå®ç”Ÿå›¾ API
-echo   - ç›´æ¥å›è½¦è·³è¿‡ï¼Œå°†ä½¿ç”¨æ¼”ç¤ºæ¨¡å¼ï¼ˆç”Ÿæˆå ä½å›¾ï¼Œæ— éœ€è”ç½‘ï¼‰
+echo ¼ì²âµ½Î´ÅäÖÃ API Key
+echo   - ÅäÖÃºó¿Éµ÷ÓÃ¶¹°ü Seedream ÕæÊµÉúÍ¼ API
+echo   - Ö±½Ó»Ø³µÌø¹ı£¬½«Ê¹ÓÃÑİÊ¾Ä£Ê½£¨Éú³ÉÕ¼Î»Í¼£¬ÎŞĞèÁªÍø£©
 echo.
 set "api_key="
-set /p "api_key=è¯·è¾“å…¥ ARK_API_KEYï¼ˆå¯ç•™ç©ºè·³è¿‡ï¼‰: "
+set /p "api_key=ÇëÊäÈë ARK_API_KEY£¨¿ÉÁô¿ÕÌø¹ı£©: "
 if "%api_key%"=="" goto KEY_SKIP
 > backend\.env echo ARK_API_KEY=%api_key%
-echo [OK] API Key å·²ä¿å­˜åˆ° backend\.env
+echo [OK] API Key ÒÑ±£´æµ½ backend\.env
 goto KEY_DONE
 :KEY_SKIP
-echo å·²è·³è¿‡ï¼Œä½¿ç”¨æ¼”ç¤ºæ¨¡å¼
+echo ÒÑÌø¹ı£¬Ê¹ÓÃÑİÊ¾Ä£Ê½
 :KEY_DONE
 
-REM ===== 7. å¯åŠ¨æœåŠ¡ï¼ˆä¸¤ä¸ªç‹¬ç«‹çª—å£ï¼Œå…³é—­çª—å£å³åœæ­¢æœåŠ¡ï¼‰=====
+REM ===== 7. Æô¶¯·şÎñ£¨Á½¸ö¶ÀÁ¢´°¿Ú£¬¹Ø±Õ´°¿Ú¼´Í£Ö¹·şÎñ£©=====
 echo.
-echo å¯åŠ¨æœåŠ¡ä¸­...
+echo Æô¶¯·şÎñÖĞ...
 cd /d "%~dp0backend"
-start "InfiniteCanvas-åç«¯" cmd /k ".venv\Scripts\python -m uvicorn app.main:app --host 127.0.0.1 --port 8000"
+start "InfiniteCanvas-ºó¶Ë" cmd /k ".venv\Scripts\python -m uvicorn app.main:app --host 127.0.0.1 --port 8000"
 cd /d "%~dp0frontend"
-start "InfiniteCanvas-å‰ç«¯" cmd /k "npm run dev"
+start "InfiniteCanvas-Ç°¶Ë" cmd /k "npm run dev"
 cd /d "%~dp0"
 
-REM ===== 8. ç­‰å¾…åç«¯å°±ç»ªåæ‰“å¼€æµè§ˆå™¨ =====
-echo ç­‰å¾…æœåŠ¡å¯åŠ¨ï¼ˆæœ€å¤š 45 ç§’ï¼‰...
+REM ===== 8. µÈ´ıºó¶Ë¾ÍĞ÷ºó´ò¿ªä¯ÀÀÆ÷ =====
+echo µÈ´ı·şÎñÆô¶¯£¨×î¶à 45 Ãë£©...
 powershell -NoProfile -Command "for($i=0; $i -lt 45; $i++){ try { Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8000/api/canvas -TimeoutSec 2 | Out-Null; exit 0 } catch { Start-Sleep 1 } }"
 start "" http://localhost:5173
 
 echo.
 echo ==========================================
-echo   å¯åŠ¨å®Œæˆï¼
+echo   Æô¶¯Íê³É£¡
 echo ==========================================
 echo.
-echo   å‰ç«¯é¡µé¢:  http://localhost:5173
-echo   åç«¯æ¥å£:  http://127.0.0.1:8000
+echo   Ç°¶ËÒ³Ãæ:  http://localhost:5173
+echo   ºó¶Ë½Ó¿Ú:  http://127.0.0.1:8000
 echo.
-echo   åœæ­¢æœåŠ¡ï¼šå…³é—­"InfiniteCanvas-åç«¯"å’Œ"InfiniteCanvas-å‰ç«¯"ä¸¤ä¸ªçª—å£
-echo   ä¸‹æ¬¡ä½¿ç”¨ï¼šç›´æ¥åŒå‡»æœ¬è„šæœ¬å³å¯ï¼ˆä¼šè‡ªåŠ¨è·³è¿‡å·²å®Œæˆçš„å®‰è£…æ­¥éª¤ï¼‰
+echo   Í£Ö¹·şÎñ£º¹Ø±Õ"InfiniteCanvas-ºó¶Ë"ºÍ"InfiniteCanvas-Ç°¶Ë"Á½¸ö´°¿Ú
+echo   ÏÂ´ÎÊ¹ÓÃ£ºÖ±½ÓË«»÷±¾½Å±¾¼´¿É£¨»á×Ô¶¯Ìø¹ıÒÑÍê³ÉµÄ°²×°²½Öè£©
 echo.
 pause

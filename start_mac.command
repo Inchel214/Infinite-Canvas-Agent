@@ -109,7 +109,20 @@ if [[ ! -f backend/.env ]]; then
   echo ""
 fi
 
-# ===== 7. 启动服务 =====
+# ===== 7. 清理占用 8000/5173 端口的旧进程 =====
+info "检查并清理占用 8000/5173 端口的旧进程..."
+for port in 8000 5173; do
+  pids=$(lsof -ti :$port 2>/dev/null)
+  if [[ -n "$pids" ]]; then
+    for pid in $pids; do
+      pname=$(ps -p "$pid" -o comm= 2>/dev/null)
+      warn "  已清理端口 $port 上的进程 $pname (PID $pid)"
+      kill -9 "$pid" 2>/dev/null
+    done
+  fi
+done
+
+# ===== 8. 启动服务 =====
 info "启动服务中..."
 cleanup() {
   echo ""
