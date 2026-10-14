@@ -44,5 +44,5 @@ agent = ReActAgent(
     llm=LLMProxy(manager),
     tool_manager=tool_manager,
     store=store,
-    max_steps=5,
+    max_steps=30,
 )

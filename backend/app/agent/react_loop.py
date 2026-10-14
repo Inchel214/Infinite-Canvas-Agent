@@ -32,7 +32,7 @@ class ReActAgent:
         llm: BaseLLM,
         tool_manager: ToolManager,
         store: BaseStore,
-        max_steps: int = 5,
+        max_steps: int = 30,
     ):
         self.llm = llm
         self.tool_manager = tool_manager
