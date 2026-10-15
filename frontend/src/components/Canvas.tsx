@@ -52,9 +52,36 @@ function parseRatio(ratioKey: string): { w: number; h: number } {
 
 const RESOLUTIONS = ["1K", "2K", "4K"] as const;
 
+const EXPERIENCE_USAGE_KEY = "ica:experienceUsage";
+const EXPERIENCE_USAGE_EVENT = "ica:experienceUsageChanged";
+
+function readExperienceUsage(): Record<string, number> {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(EXPERIENCE_USAGE_KEY) ?? "{}");
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+// 只在真正发起生成时累计，风格下拉据此把常用项逐步排到前面。
+function recordExperienceUsage(ids?: string[]) {
+  if (!ids?.length) return;
+  try {
+    const usage = readExperienceUsage();
+    ids.forEach((id) => {
+      usage[id] = (Number(usage[id]) || 0) + 1;
+    });
+    localStorage.setItem(EXPERIENCE_USAGE_KEY, JSON.stringify(usage));
+    window.dispatchEvent(new Event(EXPERIENCE_USAGE_EVENT));
+  } catch {
+    // 本地统计不可用时不应阻断图片生成。
+  }
+}
+
 const IMAGE_MENTION_RE = /@图片(\d+)/g;
 
-// 图片提及跟随“图片身份”而不是表面编号：参考图换序或删除后，提示词仍指向原图。
+// 删除参考图时让图片提及继续指向原图；槽位交换会显式跳过这一步。
 function remapImageMentions(prompt: string, oldRefIds: string[], newRefIds: string[]): string {
   return prompt
     .replace(IMAGE_MENTION_RE, (mention, rawIndex: string) => {
@@ -67,11 +94,10 @@ function remapImageMentions(prompt: string, oldRefIds: string[], newRefIds: stri
     .replace(/[ \t]+\n/g, "\n");
 }
 
-function moveReference(refIds: string[], fromIndex: number, toIndex: number): string[] {
+function swapReferences(refIds: string[], fromIndex: number, toIndex: number): string[] {
   if (fromIndex === toIndex || fromIndex < 0 || toIndex < 0) return refIds;
   const next = [...refIds];
-  const [moved] = next.splice(fromIndex, 1);
-  next.splice(toIndex, 0, moved);
+  [next[fromIndex], next[toIndex]] = [next[toIndex], next[fromIndex]];
   return next;
 }
 
@@ -1432,6 +1458,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     const box = buildProcessingBox(aspect, srcNodes);
 
     if (menu.mode === "compose" && ids.length >= 2) {
+      recordExperienceUsage(menuStyleIds);
       setMenu(null);
       setPromptInput("");
       const sname = styleNamesByIds(menuStyleIds);
@@ -1440,6 +1467,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         onAction({ type: "compose", nodeIds: ids, prompt, size, x: box.x, y: box.y, experienceIds: menuStyleIds.length ? menuStyleIds : undefined })
       ).finally(() => removeProcessingBox(boxId));
     } else if (menu.mode === "variate" && ids.length === 1) {
+      recordExperienceUsage(menuStyleIds);
       setMenu(null);
       setPromptInput("");
       const sname = styleNamesByIds(menuStyleIds);
@@ -1464,6 +1492,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     const box = buildProcessingBox(editPanel.aspect, refNodes);
     const sname = styleNamesByIds(editPanel.experienceIds);
     const expIds = editPanel.experienceIds;
+    recordExperienceUsage(expIds);
     setEditPanel(null);
     const boxId = addProcessingBox(
       box,
@@ -1642,6 +1671,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       const op =
         c.refIds.length === 0 ? "generate" : c.refIds.length === 1 ? "variate" : "compose";
 
+      recordExperienceUsage(c.experienceIds);
       setGeneratingIds((prev) => new Set(prev).add(c.id));
       generatingPositionsRef.current[c.id] = { x: c.x, y: c.y };
       setGenProgressMap((prev) => ({ ...prev, [c.id]: 5 }));
@@ -2199,10 +2229,10 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
             .filter((node): node is CanvasNode => !!node)}
           prompt={editPanel.prompt}
           onPromptChange={(v) => setEditPanel((p) => (p ? { ...p, prompt: v } : p))}
-          onRefIdsChange={(nextIds) => setEditPanel((p) => p
+          onRefIdsChange={(nextIds, preserveSlotMentions = false) => setEditPanel((p) => p
             ? {
                 ...p,
-                prompt: remapImageMentions(p.prompt, p.refIds, nextIds),
+                prompt: preserveSlotMentions ? p.prompt : remapImageMentions(p.prompt, p.refIds, nextIds),
                 refIds: nextIds,
               }
             : p
@@ -2448,6 +2478,7 @@ function StyleSelect({
   onChange: (v: string[]) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const [usageVersion, setUsageVersion] = useState(0);
   const rootRef = useRef<HTMLDivElement>(null);
   const btnRef = useRef<HTMLButtonElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
@@ -2462,6 +2493,16 @@ function StyleSelect({
     const maxH = Math.max(120, Math.min(208, window.innerHeight - r.bottom - 12));
     setListPos({ left: r.left, top: r.bottom + 4, width: r.width, maxH });
   }, [open]);
+
+  useEffect(() => {
+    const refresh = () => setUsageVersion((current) => current + 1);
+    window.addEventListener(EXPERIENCE_USAGE_EVENT, refresh);
+    window.addEventListener("storage", refresh);
+    return () => {
+      window.removeEventListener(EXPERIENCE_USAGE_EVENT, refresh);
+      window.removeEventListener("storage", refresh);
+    };
+  }, []);
 
   // 点击组件外部/按 Esc 关闭下拉。
   // 用捕获阶段监听：EditPanel/ContextMenu 根节点对 mousedown stopPropagation（阻止画布拖拽），
@@ -2487,6 +2528,17 @@ function StyleSelect({
       document.removeEventListener("keydown", onKey, true);
     };
   }, [open]);
+
+  const sortedExperiences = useMemo(() => {
+    const usage = readExperienceUsage();
+    return experiences
+      .map((experience, index) => ({ experience, index }))
+      .sort((a, b) =>
+        (Number(usage[b.experience.id]) || 0) - (Number(usage[a.experience.id]) || 0) ||
+        a.index - b.index
+      )
+      .map(({ experience }) => experience);
+  }, [experiences, usageVersion]);
 
   if (experiences.length === 0) return null;
 
@@ -2558,7 +2610,7 @@ function StyleSelect({
             padding: 4,
           }}
         >
-          {experiences.map((e) => {
+          {sortedExperiences.map((e) => {
             const checked = value.includes(e.id);
             return (
               <div
@@ -2639,15 +2691,15 @@ function AspectRatioButtons({
   const activeBg = variant === "context" ? "#6366f1" : "#a78bfa";
   const activeColor = variant === "container" ? "#1a1a2e" : "white";
   const inactiveColor = variant === "container" ? "rgba(255,255,255,0.85)" : "rgba(255,255,255,0.6)";
-  const btnFont = variant === "container" ? 15 : 11;
+  const btnFont = 11;
 
   const btnStyle = (active: boolean): React.CSSProperties => ({
     flex: 1,
-    padding: variant === "container" ? "9px 0" : "5px 0",
+    padding: "5px 0",
     background: active ? activeBg : "rgba(255,255,255,0.08)",
     color: active ? activeColor : inactiveColor,
     border: "none",
-    borderRadius: variant === "container" ? 6 : 5,
+    borderRadius: 5,
     fontSize: btnFont,
     cursor: "pointer",
     fontWeight: active && variant === "container" ? 600 : 400,
@@ -3161,7 +3213,7 @@ const EditPanel = ({
   refNodes: CanvasNode[];
   prompt: string;
   onPromptChange: (v: string) => void;
-  onRefIdsChange: (refIds: string[]) => void;
+  onRefIdsChange: (refIds: string[], preserveSlotMentions?: boolean) => void;
   aspect: string;
   resolution: string;
   onAspectChange: (v: string) => void;
@@ -3185,6 +3237,8 @@ const EditPanel = ({
     return Number.isFinite(v) && v >= 420 ? v : null;
   });
   const [resizeHover, setResizeHover] = useState(false);
+  const [sourcePromptExpanded, setSourcePromptExpanded] = useState(false);
+  const [sourcePromptCopied, setSourcePromptCopied] = useState(false);
   const [draggingRefId, setDraggingRefId] = useState<string | null>(null);
   const [dragGhost, setDragGhost] = useState<{ imageUrl: string; x: number; y: number } | null>(null);
   const referenceDragRef = useRef<{ pointerId: number; refId: string; order: string[] } | null>(null);
@@ -3388,7 +3442,7 @@ const EditPanel = ({
         </button>
       </div>
 
-      {/* 图1固定为编辑底图；追加参考图可拖动换序，编号与提示词中的 @图片同步。 */}
+      {/* 编号属于槽位；拖动时交换两个槽位里的图片，@图片N 文本保持不变。 */}
       <div
         style={{
           margin: "2px 6px 6px",
@@ -3406,7 +3460,7 @@ const EditPanel = ({
                 key={node.id}
                 data-edit-reference-id={node.id}
                 onPointerDown={(e) => {
-                  if (isBase || e.button !== 0 || (e.target as HTMLElement).closest("button")) return;
+                  if (e.button !== 0 || (e.target as HTMLElement).closest("button")) return;
                   e.stopPropagation();
                   e.preventDefault();
                   e.currentTarget.setPointerCapture(e.pointerId);
@@ -3430,21 +3484,20 @@ const EditPanel = ({
                   if (!hitId || hitId === drag.refId) return;
                   const fromIndex = drag.order.indexOf(drag.refId);
                   const toIndex = drag.order.indexOf(hitId);
-                  // 图1是编辑底图，不允许被其它参考图挤出首位。
-                  if (fromIndex < 1 || toIndex < 1 || fromIndex === toIndex) return;
-                  const nextOrder = moveReference(drag.order, fromIndex, toIndex);
+                  if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) return;
+                  const nextOrder = swapReferences(drag.order, fromIndex, toIndex);
                   drag.order = nextOrder;
-                  onRefIdsChange(nextOrder);
+                  onRefIdsChange(nextOrder, true);
                 }}
                 onPointerUp={finishReferenceDrag}
                 onPointerCancel={finishReferenceDrag}
-                title={isBase ? "图1 · 编辑底图" : "拖动调整参考图顺序"}
+                title="拖动与另一张参考图交换"
                 style={{
                   position: "relative",
                   width: 42,
                   paddingBottom: 11,
                   touchAction: "none",
-                  cursor: isBase ? "default" : draggingRefId === node.id ? "grabbing" : "grab",
+                  cursor: draggingRefId === node.id ? "grabbing" : "grab",
                   opacity: draggingRefId === node.id ? 0.28 : 1,
                   userSelect: "none",
                 }}
@@ -3514,36 +3567,123 @@ const EditPanel = ({
         </div>
       </div>
 
-      {/* 源图原始提示词（可鼠标选中复制） */}
+      {/* 源图原始提示词：默认显示摘要，需要时再展开全文。 */}
       {nodeContent && nodeContent !== "本地图片" && (
         <div
           style={{
-            padding: "8px 14px",
-            fontSize: 12,
-            color: "#c7d2fe",
-            background: "rgba(167,139,250,0.08)",
+            padding: "8px 12px 7px",
+            color: "rgba(255,255,255,0.92)",
+            background: "rgba(10,10,16,0.48)",
             borderRadius: 6,
-            margin: "0 6px 6px",
-            lineHeight: 1.5,
-            maxHeight: 72,
-            overflowY: "auto",
-            wordBreak: "break-word",
-            userSelect: "text",
+            margin: "0 6px 2px",
+            border: "1px solid rgba(255,255,255,0.07)",
           }}
         >
-          <div style={{ fontSize: 10, color: "rgba(255,255,255,0.4)", marginBottom: 4 }}>
-            原始提示词
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              marginBottom: 4,
+            }}
+          >
+            <span style={{ fontSize: 10, fontWeight: 650, color: "rgba(255,255,255,0.42)" }}>
+              PROMPT
+            </span>
+            <button
+              type="button"
+              aria-label="复制原始提示词"
+              title={sourcePromptCopied ? "已复制" : "复制原始提示词"}
+              onClick={() => {
+                void navigator.clipboard.writeText(nodeContent).then(() => {
+                  setSourcePromptCopied(true);
+                  window.setTimeout(() => setSourcePromptCopied(false), 1200);
+                });
+              }}
+              style={{
+                width: 24,
+                height: 24,
+                padding: 0,
+                border: "none",
+                borderRadius: 5,
+                background: "transparent",
+                color: sourcePromptCopied ? "#c4b5fd" : "rgba(255,255,255,0.6)",
+                cursor: "pointer",
+                position: "relative",
+              }}
+            >
+              <span
+                aria-hidden="true"
+                style={{
+                  position: "absolute",
+                  width: 10,
+                  height: 10,
+                  left: 6,
+                  top: 6,
+                  border: "1.4px solid currentColor",
+                  borderRadius: 3,
+                }}
+              />
+              <span
+                aria-hidden="true"
+                style={{
+                  position: "absolute",
+                  width: 10,
+                  height: 10,
+                  left: 9,
+                  top: 9,
+                  border: "1.4px solid currentColor",
+                  borderRadius: 3,
+                  background: "rgba(10,10,16,0.9)",
+                }}
+              />
+            </button>
           </div>
-          {nodeContent}
+          <div
+            style={{
+              fontSize: 12,
+              lineHeight: 1.55,
+              wordBreak: "break-word",
+              userSelect: "text",
+              ...(sourcePromptExpanded
+                ? { maxHeight: 180, overflowY: "auto" as const }
+                : {
+                    display: "-webkit-box",
+                    WebkitBoxOrient: "vertical" as const,
+                    WebkitLineClamp: 3,
+                    overflow: "hidden",
+                  }),
+            }}
+          >
+            {nodeContent}
+          </div>
+          <button
+            type="button"
+            onClick={() => setSourcePromptExpanded((current) => !current)}
+            style={{
+              display: "block",
+              margin: "4px 0 0 auto",
+              padding: 0,
+              border: "none",
+              background: "transparent",
+              color: "rgba(255,255,255,0.64)",
+              fontSize: 11,
+              fontWeight: 650,
+              cursor: "pointer",
+            }}
+          >
+            {sourcePromptExpanded ? "See Less" : "See More"}
+          </button>
         </div>
       )}
 
       <div
         style={{
-          padding: "8px 10px",
+          padding: "2px 10px 8px",
           flex: 1,
           minHeight: 0,
-          overflow: "hidden",
+          overflowY: "auto",
+          overflowX: "hidden",
           display: "flex",
           flexDirection: "column",
         }}
@@ -3557,6 +3697,8 @@ const EditPanel = ({
             if (canExecute) onExecute();
           }}
           onEscape={onClose}
+          resizable
+          initialHeight={112}
         />
 
         {/* 尺寸选择：宽高比 + 分辨率 */}
@@ -3941,6 +4083,8 @@ function ImageMentionPrompt({
   onChange,
   onGenerate,
   onEscape,
+  resizable = false,
+  initialHeight = 128,
 }: {
   value: string;
   refNodes: CanvasNode[];
@@ -3948,12 +4092,16 @@ function ImageMentionPrompt({
   onChange: (value: string) => void;
   onGenerate: () => void;
   onEscape?: () => void;
+  resizable?: boolean;
+  initialHeight?: number;
 }) {
   const editorRef = useRef<HTMLDivElement>(null);
   const renderedValueRef = useRef("");
   const renderedRefsRef = useRef("");
   const [mentionRange, setMentionRange] = useState<Range | null>(null);
   const [mentionIndex, setMentionIndex] = useState(0);
+  const [editorHeight, setEditorHeight] = useState(initialHeight);
+  const promptResizeRef = useRef<{ pointerId: number; startY: number; startHeight: number } | null>(null);
 
   const createMentionNode = useCallback((node: CanvasNode, index: number) => {
     const mention = document.createElement("span");
@@ -4116,8 +4264,25 @@ function ImageMentionPrompt({
     emitChange();
   };
 
+  const finishPromptResize = (e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = promptResizeRef.current;
+    if (!drag || drag.pointerId !== e.pointerId) return;
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+    promptResizeRef.current = null;
+  };
+
   return (
-    <div style={{ position: "relative", flex: 1, minHeight: 128, marginTop: 9 }}>
+    <div
+      style={{
+        position: "relative",
+        flex: resizable ? "0 0 auto" : 1,
+        height: resizable ? editorHeight : undefined,
+        minHeight: resizable ? 96 : 128,
+        marginTop: resizable ? 4 : 9,
+      }}
+    >
       <div
         ref={editorRef}
         contentEditable
@@ -4172,9 +4337,9 @@ function ImageMentionPrompt({
         style={{
           width: "100%",
           height: "100%",
-          minHeight: 128,
+          minHeight: resizable ? 0 : 128,
           boxSizing: "border-box",
-          padding: "8px 10px",
+          padding: resizable ? "8px 22px 16px 10px" : "8px 10px",
           background: "rgba(0,0,0,0.25)",
           border: "1px solid rgba(167,139,250,0.5)",
           borderRadius: 6,
@@ -4188,6 +4353,48 @@ function ImageMentionPrompt({
           wordBreak: "break-word",
         }}
       />
+      {resizable && (
+        <div
+          role="separator"
+          aria-label="调整提示词输入区高度"
+          aria-orientation="vertical"
+          title="拖动调整提示词输入区高度"
+          onPointerDown={(e) => {
+            if (e.button !== 0) return;
+            e.preventDefault();
+            e.stopPropagation();
+            e.currentTarget.setPointerCapture(e.pointerId);
+            promptResizeRef.current = {
+              pointerId: e.pointerId,
+              startY: e.clientY,
+              startHeight: editorHeight,
+            };
+          }}
+          onPointerMove={(e) => {
+            const drag = promptResizeRef.current;
+            if (!drag || drag.pointerId !== e.pointerId) return;
+            e.preventDefault();
+            setEditorHeight(Math.max(96, Math.min(520, drag.startHeight + e.clientY - drag.startY)));
+          }}
+          onPointerUp={finishPromptResize}
+          onPointerCancel={finishPromptResize}
+          style={{
+            position: "absolute",
+            right: 0,
+            bottom: 0,
+            width: 24,
+            height: 24,
+            cursor: "ns-resize",
+            touchAction: "none",
+            zIndex: 2,
+          }}
+        >
+          <svg width="24" height="24" viewBox="0 0 24 24" aria-hidden="true">
+            <line x1="20" y1="11" x2="11" y2="20" stroke="rgba(196,181,253,0.5)" strokeWidth="1.4" strokeLinecap="round" />
+            <line x1="20" y1="16" x2="16" y2="20" stroke="rgba(196,181,253,0.5)" strokeWidth="1.4" strokeLinecap="round" />
+          </svg>
+        </div>
+      )}
       {!value && (
         <span
           style={{
@@ -4311,12 +4518,12 @@ function PendingContainerNode({
 
   // 与右侧编辑面板共用紧凑字号层级，避免浮层之间出现明显的视觉尺度差。
   const smallBtn = (active: boolean): React.CSSProperties => ({
-    padding: "6px 0",
+    padding: "5px 0",
     background: active ? "#a78bfa" : "rgba(255,255,255,0.08)",
     color: active ? "#1a1a2e" : "rgba(255,255,255,0.85)",
     border: "none",
-    borderRadius: 6,
-    fontSize: 12,
+    borderRadius: 5,
+    fontSize: 11,
     cursor: "pointer",
     fontWeight: active ? 600 : 400,
   });
@@ -4337,12 +4544,13 @@ function PendingContainerNode({
     pointerId: number;
     refId: string;
     order: string[];
-    prompt: string;
   } | null>(null);
 
   const applyReferenceOrder = useCallback(
-    (oldOrder: string[], nextOrder: string[], oldPrompt: string) => {
-      const nextPrompt = remapImageMentions(oldPrompt, oldOrder, nextOrder);
+    (oldOrder: string[], nextOrder: string[], oldPrompt: string, preserveSlotMentions = false) => {
+      const nextPrompt = preserveSlotMentions
+        ? oldPrompt
+        : remapImageMentions(oldPrompt, oldOrder, nextOrder);
       const firstNode = nodes.find((node) => node.id === nextOrder[0]);
       onChange({
         refIds: nextOrder,
@@ -4546,7 +4754,6 @@ function PendingContainerNode({
                   pointerId: e.pointerId,
                   refId: n.id,
                   order: [...container.refIds],
-                  prompt: container.prompt,
                 };
                 setDraggingRefId(n.id);
                 setDragGhost({ imageUrl: n.image_url ?? "", x: e.clientX, y: e.clientY });
@@ -4566,10 +4773,9 @@ function PendingContainerNode({
                 const fromIndex = drag.order.indexOf(drag.refId);
                 const toIndex = drag.order.indexOf(hitId);
                 if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) return;
-                const nextOrder = moveReference(drag.order, fromIndex, toIndex);
-                const nextPrompt = applyReferenceOrder(drag.order, nextOrder, drag.prompt);
+                const nextOrder = swapReferences(drag.order, fromIndex, toIndex);
+                applyReferenceOrder(drag.order, nextOrder, container.prompt, true);
                 drag.order = nextOrder;
-                drag.prompt = nextPrompt;
               }}
               onPointerUp={finishReferenceDrag}
               onPointerCancel={finishReferenceDrag}
@@ -4583,7 +4789,7 @@ function PendingContainerNode({
                 transition: "transform 120ms ease, opacity 120ms ease",
                 userSelect: "none",
               }}
-              title="拖动调整参考图顺序"
+              title="拖动与另一张参考图交换"
             >
               <img
                 src={n.image_url}
@@ -4698,13 +4904,13 @@ function PendingContainerNode({
                 display: "inline-block",
                 width:
                   aspectRatio.w >= aspectRatio.h
-                    ? 26
-                    : Math.round((26 * aspectRatio.w) / aspectRatio.h),
+                    ? 20
+                    : Math.round((20 * aspectRatio.w) / aspectRatio.h),
                 height:
                   aspectRatio.w >= aspectRatio.h
-                    ? Math.round((26 * aspectRatio.h) / aspectRatio.w)
-                    : 26,
-                border: "1.5px solid #a78bfa",
+                    ? Math.round((20 * aspectRatio.h) / aspectRatio.w)
+                    : 20,
+                border: "1px solid #a78bfa",
                 borderRadius: 3,
                 background: "rgba(167,139,250,0.22)",
                 transition: "width 0.15s ease, height 0.15s ease",
@@ -4712,7 +4918,7 @@ function PendingContainerNode({
             />
             <span
               style={{
-                fontSize: 11,
+                fontSize: 10,
                 color: "rgba(255,255,255,0.7)",
                 fontVariantNumeric: "tabular-nums",
               }}
