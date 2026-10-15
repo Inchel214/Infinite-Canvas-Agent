@@ -451,6 +451,7 @@ function App() {
                 .filter((n): n is NonNullable<typeof n> => !!n)
             : []
         }
+        canvasNodes={canvasState ? Object.values(canvasState.nodes) : []}
         onRemoveRef={(nodeId) => setChatRefIds((prev) => prev.filter((id) => id !== nodeId))}
         onClearRefs={() => setChatRefIds([])}
         onCanvasUpdate={applyCanvasState}

@@ -13,6 +13,7 @@ import type { AgentStep, CanvasNode, CanvasState } from "../types/canvas";
 interface ChatEntry {
   role: "user" | "assistant";
   content: string;
+  refs?: ChatReference[]; // 本条用户消息携带的画布图片引用
   steps?: AgentStep[];
   plan?: string; // 执行计划（流式 plan 事件，展示为路线图卡片）
   reasoning?: string; // 深度思考过程（reasoning_content 流，与正文分离）
@@ -20,6 +21,13 @@ interface ChatEntry {
   stopped?: boolean; // 用户中途停止
   timestamp: number;
   error?: boolean;
+}
+
+interface ChatReference {
+  id: string;
+  label: string;
+  content?: string;
+  imageUrl?: string;
 }
 
 interface ChatPanelProps {
@@ -32,6 +40,8 @@ interface ChatPanelProps {
   onWidthChange: (w: number) => void;
   // 右键"添加到对话"引用的图片（App 从画布状态解析）
   refNodes: CanvasNode[];
+  // 当前画布全部节点：用于恢复历史消息中已持久化的引用缩略图
+  canvasNodes: CanvasNode[];
   onRemoveRef: (nodeId: string) => void;
   onClearRefs: () => void;
   // Agent 操作画布后（生成/移动/删除节点）通知上层刷新画布状态
@@ -146,6 +156,48 @@ const mdComponents = {
 const MIN_PANEL_WIDTH = 360;
 const MAX_PANEL_WIDTH = 720;
 
+const REF_LINE_RE = /^\[引用图片\s+(\S+).*?\(node_id=([^)]+)\)\]$/;
+
+function snapshotRefs(nodes: CanvasNode[]): ChatReference[] {
+  return nodes.map((n) => ({
+    id: n.id,
+    label: n.index != null ? `#${n.index}` : "图",
+    content: n.content,
+    imageUrl: n.image_url,
+  }));
+}
+
+/**
+ * 后端为了给 Agent 定位节点，会把引用作为用户消息开头的标记行持久化。
+ * 加载历史时把这些行还原成消息元数据，避免技术标记出现在气泡里。
+ */
+function parsePersistedUserMessage(
+  content: string,
+  nodeById: Map<string, CanvasNode>
+): { content: string; refs?: ChatReference[] } {
+  const lines = content.split("\n");
+  const refs: ChatReference[] = [];
+  let firstContentLine = 0;
+
+  for (; firstContentLine < lines.length; firstContentLine++) {
+    const match = lines[firstContentLine].match(REF_LINE_RE);
+    if (!match) break;
+    const [, persistedLabel, nodeId] = match;
+    const node = nodeById.get(nodeId);
+    refs.push({
+      id: nodeId,
+      label: node?.index != null ? `#${node.index}` : persistedLabel,
+      content: node?.content,
+      imageUrl: node?.image_url,
+    });
+  }
+
+  return {
+    content: lines.slice(firstContentLine).join("\n"),
+    refs: refs.length > 0 ? refs : undefined,
+  };
+}
+
 export function ChatPanel({
   canvasId,
   open,
@@ -153,6 +205,7 @@ export function ChatPanel({
   width,
   onWidthChange,
   refNodes,
+  canvasNodes,
   onRemoveRef,
   onClearRefs,
   onCanvasUpdate,
@@ -166,6 +219,11 @@ export function ChatPanel({
   const listRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const resizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
+  const canvasNodesRef = useRef(canvasNodes);
+
+  useEffect(() => {
+    canvasNodesRef.current = canvasNodes;
+  }, [canvasNodes]);
 
   // 引用变化（右键"添加到对话"）时聚焦输入框，引导用户直接下指令
   useEffect(() => {
@@ -203,14 +261,21 @@ export function ChatPanel({
   // 挂载时加载该画布的持久化对话历史（组件按 canvasId 重挂载，天然隔离）
   useEffect(() => {
     if (!canvasId) return;
+    const nodeById = new Map(canvasNodesRef.current.map((node) => [node.id, node]));
     getChatHistory(canvasId)
       .then((messages) => {
         setEntries(
-          messages.map((m) => ({
-            role: m.role,
-            content: m.content,
-            timestamp: 0, // 历史不展示时间戳
-          }))
+          messages.map((m) => {
+            const restored =
+              m.role === "user"
+                ? parsePersistedUserMessage(m.content, nodeById)
+                : { content: m.content };
+            return {
+              role: m.role,
+              ...restored,
+              timestamp: 0, // 历史不展示时间戳
+            };
+          })
         );
       })
       .catch(() => {
@@ -262,13 +327,16 @@ export function ChatPanel({
             })
             .join("\n") + "\n"
         : "";
+    const messageRefs = snapshotRefs(refNodes);
     setInput("");
+    // 引用在发送时就归属到这条消息，不再停留在输入区等待 Agent 完成。
+    onClearRefs();
     setSending(true);
     const ts = Date.now();
     // 立刻挂一条空的 assistant 条目作为"直播位"，流式事件逐步填充它
     setEntries((prev) => [
       ...prev,
-      { role: "user", content: text, timestamp: ts },
+      { role: "user", content: text, refs: messageRefs, timestamp: ts },
       { role: "assistant", content: "", steps: [], timestamp: ts },
     ]);
 
@@ -338,8 +406,6 @@ export function ChatPanel({
             error: !evt.success && !evt.stopped,
           }));
           if (evt.canvas) onCanvasUpdate(evt.canvas);
-          // 引用已随本条消息消费（停止/失败时保留，方便重发）
-          if (evt.success) onClearRefs();
         }
         // start / response 事件无需单独处理（response 与 done.message 一致）
       });
@@ -527,7 +593,10 @@ export function ChatPanel({
         {entries.map((entry, i) =>
           entry.role === "user" ? (
             /* 用户消息：右对齐气泡 */
-            <div key={i} style={{ display: "flex", justifyContent: "flex-end" }}>
+            <div
+              key={i}
+              style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 5 }}
+            >
               <div
                 style={{
                   maxWidth: "86%",
@@ -543,6 +612,44 @@ export function ChatPanel({
               >
                 {entry.content}
               </div>
+              {entry.refs && entry.refs.length > 0 && (
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "flex-end",
+                    gap: 6,
+                    flexWrap: "wrap",
+                    maxWidth: "86%",
+                  }}
+                >
+                  {entry.refs.map((ref) => (
+                    <div
+                      key={ref.id}
+                      title={ref.content || "引用图片"}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 6,
+                        background: "rgba(99,102,241,0.14)",
+                        border: "1px solid rgba(99,102,241,0.45)",
+                        borderRadius: 8,
+                        padding: "3px 7px 3px 4px",
+                      }}
+                    >
+                      {ref.imageUrl && (
+                        <img
+                          src={ref.imageUrl}
+                          alt={ref.content || "引用图"}
+                          style={{ width: 26, height: 26, objectFit: "cover", borderRadius: 4 }}
+                        />
+                      )}
+                      <span style={{ color: "#c7d2fe", fontSize: 12, fontWeight: 600 }}>
+                        {ref.label}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           ) : (
             /* Agent 回复：执行计划卡片 + 左对齐气泡 + 工具调用过程 */

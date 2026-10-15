@@ -6,7 +6,10 @@ OpenAI 兼容网关。不支持 SSE 流式，前端自动回退估算进度条�
 from __future__ import annotations
 
 import base64
+import json
+import logging
 import os
+import re
 
 import requests
 
@@ -19,14 +22,62 @@ from app.image.base import (
 from app.image.files import is_local_image_url, local_url_to_data_url
 
 _DEFAULT_BASE_URL = "https://api.openai.com/v1"
+logger = logging.getLogger(__name__)
 
 # 各档位映射的目标边长（OpenAI 官方最大 1024/1536，网关普遍支持更大值）
 _SIZE_MAP = {"1K": "1024x1024", "2K": "2048x2048", "4K": "2048x2048"}
+
+# OpenAI 图片编辑接口的通用预设。兼容网关对自定义尺寸支持不一：
+# 首次仍原样请求，只在自定义尺寸被 400 拒绝时降级到同方向预设。
+_OPENAI_EDIT_SIZES = ("1024x1024", "1536x1024", "1024x1536")
+_PIXEL_SIZE_RE = re.compile(r"^(\d+)[xX](\d+)$")
 
 
 def _norm_size(size: str) -> str:
     """把 1K/2K/4K 归一化为 WxH；自定义 WxH 原样透传（由服务商校验）"""
     return _SIZE_MAP.get(size.upper(), size)
+
+
+def _fallback_edit_size(size: str) -> str | None:
+    """为被网关拒绝的自定义尺寸选择同方向 OpenAI 预设。"""
+    normalized = _norm_size(size)
+    match = _PIXEL_SIZE_RE.fullmatch(normalized)
+    if not match or normalized in _OPENAI_EDIT_SIZES:
+        return None
+    width, height = (int(v) for v in match.groups())
+    if width > height:
+        return "1536x1024"
+    if height > width:
+        return "1024x1536"
+    return "1024x1024"
+
+
+def _response_error_detail(resp: requests.Response) -> str:
+    """提取上游错误正文，不记录请求头或 API Key。"""
+    try:
+        body = resp.json()
+    except (requests.JSONDecodeError, json.JSONDecodeError, ValueError):
+        body = resp.text.strip()
+
+    if isinstance(body, dict):
+        error = body.get("error", body)
+        if isinstance(error, dict):
+            detail = error.get("message") or error.get("detail") or error.get("code")
+        else:
+            detail = error
+    else:
+        detail = body
+
+    text = str(detail or "").strip()
+    # 防止上游返回过大页面/调试内容冲刷日志和 UI。
+    return text[:800] if text else "上游未返回详细原因"
+
+
+def _raise_provider_error(resp: requests.Response) -> None:
+    if resp.ok:
+        return
+    detail = _response_error_detail(resp)
+    raise ValueError(f"图片服务请求失败（HTTP {resp.status_code}）：{detail}")
 
 
 def _fetch_image(url: str) -> tuple[bytes, str]:
@@ -108,7 +159,7 @@ class OpenAIImageGenerator(BaseImageGenerator):
             timeout=180,
             proxies={"http": None, "https": None},
         )
-        resp.raise_for_status()
+        _raise_provider_error(resp)
         url = self._parse_response(resp.json())
         w, h = _display_size(_image_size(url), (300, 300))
         return ImageResult(image_url=url, width=w, height=h, prompt=prompt)
@@ -123,19 +174,40 @@ class OpenAIImageGenerator(BaseImageGenerator):
             # 多图用 image[]（gpt-image-1），单图用 image（兼容 dall-e / 各网关）
             field = "image[]" if len(image_urls) > 1 else "image"
             files.append((field, (f"ref_{i}.{ext}", content, mime)))
-        resp = session.post(
-            self.edits_url,
-            headers={"Authorization": f"Bearer {self.api_key}"},
-            data={
-                "model": self.model,
-                "prompt": prompt,
-                "size": _norm_size(size),
-            },
-            files=files,
-            timeout=180,
-            proxies={"http": None, "https": None},
-        )
-        resp.raise_for_status()
+        requested_size = _norm_size(size)
+
+        def post_edit(request_size: str) -> requests.Response:
+            # requests 在重试 multipart 时需要重建 files，以免文件流位置留在末尾。
+            request_files = []
+            for field, (filename, content, mime) in files:
+                request_files.append((field, (filename, content, mime)))
+            return session.post(
+                self.edits_url,
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                data={"model": self.model, "prompt": prompt, "size": request_size},
+                files=request_files,
+                timeout=180,
+                proxies={"http": None, "https": None},
+            )
+
+        resp = post_edit(requested_size)
+        fallback_size = _fallback_edit_size(requested_size)
+        if resp.status_code == 400 and fallback_size:
+            first_error = _response_error_detail(resp)
+            logger.warning(
+                "图片编辑接口拒绝自定义尺寸 %s，降级为 %s 重试：%s",
+                requested_size,
+                fallback_size,
+                first_error,
+            )
+            resp = post_edit(fallback_size)
+            if not resp.ok:
+                detail = _response_error_detail(resp)
+                raise ValueError(
+                    f"图片服务请求失败（HTTP {resp.status_code}）：{detail}"
+                    f"（原尺寸 {requested_size} 被拒绝，已用兼容尺寸 {fallback_size} 重试）"
+                )
+        _raise_provider_error(resp)
         url = self._parse_response(resp.json())
         w, h = _display_size(_image_size(url), (300, 300))
         return ImageResult(image_url=url, width=w, height=h, prompt=prompt)
