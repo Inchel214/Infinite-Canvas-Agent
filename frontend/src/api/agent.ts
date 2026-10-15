@@ -148,7 +148,7 @@ export async function clearChatHistory(canvasId: string): Promise<void> {
 export interface StreamEvents {
   onStart?: (mode: "stream" | "estimated") => void;
   onPreview?: (url: string, progress: number) => void;
-  onDone?: (done: { success: boolean; message: string; canvas: CanvasState }) => void;
+  onDone?: (done: { success: boolean; message: string; canvas: CanvasState; node_id?: string }) => void;
 }
 
 export async function generateImageStream(
