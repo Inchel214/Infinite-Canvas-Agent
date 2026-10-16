@@ -2856,6 +2856,7 @@ const ContextMenu = ({
 }) => {
   // 输入模式（组合/变体/编辑）加宽，操作菜单保持紧凑
   const MENU_W = mode === "menu" || mode === "background" ? 260 : 340;
+  const [promptCopied, setPromptCopied] = useState(false);
   // 菜单可拖动：初始位置用传入坐标，拖动后用 offset 覆盖
   const [dragOffset, setDragOffset] = useState<{ dx: number; dy: number } | null>(null);
   const dragStart = useRef<{ mx: number; my: number; left: number; top: number } | null>(null);
@@ -2967,8 +2968,66 @@ const ContextMenu = ({
             userSelect: "text",
           }}
         >
-          <div style={{ fontSize: 10, color: "rgba(255,255,255,0.4)", marginBottom: 4 }}>
-            生成提示词
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              marginBottom: 4,
+            }}
+          >
+            <span style={{ fontSize: 10, color: "rgba(255,255,255,0.4)" }}>
+              生成提示词
+            </span>
+            <button
+              type="button"
+              aria-label="复制生成提示词"
+              title={promptCopied ? "已复制" : "复制生成提示词"}
+              onClick={() => {
+                void navigator.clipboard.writeText(selectedNodeContent).then(() => {
+                  setPromptCopied(true);
+                  window.setTimeout(() => setPromptCopied(false), 1200);
+                });
+              }}
+              style={{
+                width: 24,
+                height: 24,
+                padding: 0,
+                border: "none",
+                borderRadius: 5,
+                background: "transparent",
+                color: promptCopied ? "#c4b5fd" : "rgba(255,255,255,0.6)",
+                cursor: "pointer",
+                position: "relative",
+                flex: "0 0 auto",
+              }}
+            >
+              <span
+                aria-hidden="true"
+                style={{
+                  position: "absolute",
+                  width: 10,
+                  height: 10,
+                  left: 6,
+                  top: 6,
+                  border: "1.4px solid currentColor",
+                  borderRadius: 3,
+                }}
+              />
+              <span
+                aria-hidden="true"
+                style={{
+                  position: "absolute",
+                  width: 10,
+                  height: 10,
+                  left: 9,
+                  top: 9,
+                  border: "1.4px solid currentColor",
+                  borderRadius: 3,
+                  background: "rgba(26,26,46,0.97)",
+                }}
+              />
+            </button>
           </div>
           {selectedNodeContent}
         </div>
