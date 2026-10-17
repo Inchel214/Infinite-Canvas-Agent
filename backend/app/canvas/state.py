@@ -25,6 +25,8 @@ class CanvasNode:
     source_ids: list = field(default_factory=list)
     # 节点编号（画布内唯一、递增、删除不回收）：用户与 Agent 用 #N 指代图片
     index: int | None = None
+    # 分组标签（用于分区布局，如"需求"、"设计"、"流程"）
+    group: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -38,6 +40,7 @@ class CanvasNode:
             "image_url": self.image_url,
             "source_ids": self.source_ids,
             "index": self.index,
+            "group": self.group,
         }
 
     @classmethod
@@ -53,6 +56,7 @@ class CanvasNode:
             image_url=data.get("image_url", ""),
             source_ids=data.get("source_ids", []),
             index=data.get("index"),
+            group=data.get("group", ""),
         )
 
 

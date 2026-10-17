@@ -152,10 +152,10 @@ def next_position_near(
 
 def arrange_canvas(state: CanvasState) -> dict[str, tuple[float, float]]:
     """
-    按连线关系层次整理（DAG 分层布局，纵向族谱）：
-    - 根图（无来源连线）排最上排
-    - 派生图按依赖层级（最长路径深度）向下展开，生成链从上到下流动（滚轮即可浏览）
-    - 同层节点水平排列，顺序按父节点中心 x（中点启发式）对齐，连线更整齐
+    按分组 + 连线关系整理（分组分区 + DAG 分层布局）：
+    - 有 group 的节点按 group 分区（水平排列，每个 group 占据一列）
+    - 无 group 的节点按原 DAG 分层逻辑（纵向族谱）
+    - 每个分区/层级内部按父节点中心 x 对齐，连线更整齐
     返回 {node_id: (x, y)}；空画布返回空 dict。
     """
     nodes = [n for n in state.list_nodes() if n.type in ("image", "text")]
@@ -166,13 +166,11 @@ def arrange_canvas(state: CanvasState) -> dict[str, tuple[float, float]]:
     # 只统计存在的父节点（连线来源）
     parents = {n.id: [p for p in n.source_ids if p in by_id] for n in nodes}
 
-    # 1. 计算每个节点的深度（到根的最长路径）——迭代实现（Kahn 拓扑排序 + DP）：
-    #    递归版在长派生链（>1000 层）且链尾先被遍历时会 RecursionError → 接口 500
+    # 1. 计算每个节点的深度（到根的最长路径）——迭代实现（Kahn 拓扑排序 + DP）
     depth: dict[str, int] = {nid: 0 for nid in parents}
     children: dict[str, list[str]] = {}
     indeg: dict[str, int] = {}
     for nid, ps in parents.items():
-        # 去重父节点（多连线指向同一图时入度只算一次，避免漏处理）
         uniq_ps = list(dict.fromkeys(ps))
         indeg[nid] = len(uniq_ps)
         for p in uniq_ps:
@@ -187,40 +185,84 @@ def arrange_canvas(state: CanvasState) -> dict[str, tuple[float, float]]:
             indeg[c] -= 1
             if indeg[c] == 0:
                 queue.append(c)
-    # 剩余未处理的节点属于环（或挂在环下游）：深度保持 0，归入最上排，不阻塞整理
 
-    # 2. 按深度分行
-    layers: dict[int, list] = {}
+    # 2. 按 group 分组
+    groups: dict[str, list] = {}
     for n in nodes:
-        layers.setdefault(depth[n.id], []).append(n)
+        g = n.group or ""  # 空字符串表示"未分组"
+        groups.setdefault(g, []).append(n)
 
-    # 3. 逐行从上到下放置；行内按父节点中心 x（中点）排序，
-    #    使子图尽量对着父图，连线短且不交叉；无父的保持原顺序
+    # 3. 分区布局：有 group 的按水平排列，无 group 的按原逻辑
     gap_x, gap_y = 120.0, 160.0
+    group_gap = 200.0  # group 之间的水平间距
     start_x, start_y = 100.0, 100.0
     positions: dict[str, tuple[float, float]] = {}
     center_x: dict[str, float] = {}
 
-    y = start_y
-    for d in range(max(layers) + 1):
-        layer = layers.get(d, [])
-        if not layer:
-            continue  # 环回溯产生的空洞层
+    # 分离有 group 和无 group 的节点
+    grouped_nodes = {g: ns for g, ns in groups.items() if g}
+    ungrouped_nodes = groups.get("", [])
 
-        def bary(n) -> float:
-            ps = parents[n.id]
-            if not ps:
-                return 0.0
-            return sum(center_x.get(p, 0.0) for p in ps) / len(ps)
+    # 处理有 group 的节点：每个 group 占据一列
+    current_x = start_x
+    for group_name in sorted(grouped_nodes.keys()):
+        group_nodes = grouped_nodes[group_name]
+        # 按深度分行
+        layers: dict[int, list] = {}
+        for n in group_nodes:
+            layers.setdefault(depth[n.id], []).append(n)
 
-        # 稳定排序：bary 相同（如同为 0）时保持创建顺序
-        layer_sorted = sorted(layer, key=bary)
-        x = start_x
-        row_h = max(n.height for n in layer)
-        for n in layer_sorted:
-            positions[n.id] = (x, y)
-            center_x[n.id] = x + n.width / 2
-            x += n.width + gap_x
-        y += row_h + gap_y
+        # 逐行放置
+        y = start_y
+        max_width = 0
+        for d in range(max(layers) + 1):
+            layer = layers.get(d, [])
+            if not layer:
+                continue
+
+            def bary(n) -> float:
+                ps = parents[n.id]
+                if not ps:
+                    return 0.0
+                return sum(center_x.get(p, 0.0) for p in ps) / len(ps)
+
+            layer_sorted = sorted(layer, key=bary)
+            x = current_x
+            row_h = max(n.height for n in layer)
+            for n in layer_sorted:
+                positions[n.id] = (x, y)
+                center_x[n.id] = x + n.width / 2
+                x += n.width + gap_x
+            max_width = max(max_width, x - current_x)
+            y += row_h + gap_y
+
+        current_x += max_width + group_gap
+
+    # 处理无 group 的节点：按原 DAG 分层逻辑
+    if ungrouped_nodes:
+        layers: dict[int, list] = {}
+        for n in ungrouped_nodes:
+            layers.setdefault(depth[n.id], []).append(n)
+
+        y = start_y
+        for d in range(max(layers) + 1):
+            layer = layers.get(d, [])
+            if not layer:
+                continue
+
+            def bary(n) -> float:
+                ps = parents[n.id]
+                if not ps:
+                    return 0.0
+                return sum(center_x.get(p, 0.0) for p in ps) / len(ps)
+
+            layer_sorted = sorted(layer, key=bary)
+            x = current_x if grouped_nodes else start_x
+            row_h = max(n.height for n in layer)
+            for n in layer_sorted:
+                positions[n.id] = (x, y)
+                center_x[n.id] = x + n.width / 2
+                x += n.width + gap_x
+            y += row_h + gap_y
 
     return positions

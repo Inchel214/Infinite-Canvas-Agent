@@ -221,6 +221,26 @@ export async function updateNodePosition(
   return res.json();
 }
 
+// 批量更新节点（内容/位置/尺寸）
+export async function updateNodes(
+  canvasId: string,
+  updates: Array<{ nodeId: string; content?: string; x?: number; y?: number; width?: number; height?: number }>
+): Promise<CanvasState> {
+  const res = await fetch(
+    `${API_BASE}/canvas/${canvasId}/nodes/update`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ updates }),
+    }
+  );
+  if (!res.ok) {
+    throw new Error(`${res.status}`);
+  }
+  const data = await res.json();
+  return data.canvas;
+}
+
 // ===== 直接执行类操作（右键菜单/容器触发，不走 Agent）=====
 
 export async function generateImage(

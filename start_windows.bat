@@ -107,13 +107,25 @@ goto KEY_DONE
 echo 已跳过，使用演示模式
 :KEY_DONE
 
-REM ===== 7. 启动服务（两个独立窗口，关闭窗口即停止服务）=====
+REM ===== 7. 启动服务（一个窗口两个页签）=====
 echo.
 echo 启动服务中...
-cd /d "%~dp0backend"
-start "InfiniteCanvas-后端" cmd /k ".venv\Scripts\python -m uvicorn app.main:app --host 127.0.0.1 --port 8000"
-cd /d "%~dp0frontend"
-start "InfiniteCanvas-前端" cmd /k "npm run dev"
+set "BACKEND_DIR=%~dp0backend"
+set "FRONTEND_DIR=%~dp0frontend"
+
+where wt >nul 2>nul
+if %errorlevel%==0 (
+    REM Windows Terminal 可用：一个窗口，两个页签
+    wt --title "InfiniteCanvas-后端" --startingDirectory "%BACKEND_DIR%" -- cmd /k "%BACKEND_DIR%\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000"
+    timeout /t 1 /nobreak >nul
+    wt new-tab --title "InfiniteCanvas-前端" --startingDirectory "%FRONTEND_DIR%" -- cmd /k "cd /d %FRONTEND_DIR% && npm run dev"
+) else (
+    echo [提示] Windows Terminal 未安装，使用传统双窗口模式
+    cd /d "%BACKEND_DIR%"
+    start "InfiniteCanvas-后端" cmd /k ".venv\Scripts\python -m uvicorn app.main:app --host 127.0.0.1 --port 8000"
+    cd /d "%FRONTEND_DIR%"
+    start "InfiniteCanvas-前端" cmd /k "npm run dev"
+)
 cd /d "%~dp0"
 
 REM ===== 8. 等待后端就绪后打开浏览器 =====

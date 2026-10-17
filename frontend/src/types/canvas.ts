@@ -12,6 +12,8 @@ export interface CanvasNode {
   source_ids?: string[];
   /** 节点编号（画布内唯一递增，删除不回收）：用户与 Agent 用 #N 指代 */
   index?: number | null;
+  /** 分组标签（用于分区布局，如"需求"、"设计"、"流程"） */
+  group?: string;
 }
 
 export interface CanvasState {

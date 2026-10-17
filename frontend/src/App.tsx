@@ -7,6 +7,7 @@ import {
   createCanvas,
   getCanvas,
   updateNodePosition,
+  updateNodes,
   moveNodes,
   composeImages,
   variateImage,
@@ -73,6 +74,17 @@ function App() {
   }, []);
   // 守卫用：异步回调校验画布身份时读最新值（不经 React state 闭包）
   const canvasIdRef = useRef<string | null>(null);
+  // 外部写入感知（MCP/Codex）：轮询对比 version，变化才拉全量刷新画布
+  const canvasVersionRef = useRef<number>(-1);
+  const loadingRef = useRef(false);
+
+  useEffect(() => {
+    loadingRef.current = loading;
+  }, [loading]);
+
+  useEffect(() => {
+    canvasVersionRef.current = canvasState?.version ?? -1;
+  }, [canvasState]);
 
   // 应用画布身份：同步 state / ref / localStorage / URL（多标签直达 + 刷新恢复）
   const applyCanvasId = useCallback((id: string, state?: CanvasState) => {
@@ -197,6 +209,24 @@ function App() {
     };
   }, []);
 
+  // 外部写入感知：MCP/Codex 等外部工具改动画布时 version 会变化，
+  // 轻轮询对比 version，变化才拉全量状态刷新前端（本地操作无多余开销）
+  useEffect(() => {
+    if (!canvasId) return;
+    const timer = window.setInterval(async () => {
+      if (loadingRef.current) return; // 本地操作进行中，由其自身回调更新
+      try {
+        const state = await getCanvas(canvasId);
+        if (state.version !== canvasVersionRef.current) {
+          applyCanvasState(state);
+        }
+      } catch {
+        // 后端重启中等瞬时失败静默，下轮重试
+      }
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [canvasId, applyCanvasState]);
+
   // 顶栏红点总数：未查看的新图（生成中不算未读，只算状态提示）
   const totalPending = Object.values(badges).reduce((s, b) => s + b.pending, 0);
 
@@ -244,6 +274,10 @@ function App() {
         applyCanvasState(res.canvas);
         setStatusMsg(res.message);
         return res.success;
+      } else if (action.type === "update") {
+        const newCanvas = await updateNodes(canvasId, action.updates);
+        applyCanvasState(newCanvas);
+        return true;
       }
       return false;
     } catch (e) {

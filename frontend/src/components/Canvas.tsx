@@ -10,7 +10,8 @@ export type CanvasAction =
   | { type: "edit"; nodeId: string; prompt: string; size: string; x?: number; y?: number; experienceIds?: string[] }
   | { type: "generate"; prompt: string; size: string; x: number; y: number; experienceIds?: string[] }
   | { type: "delete"; nodeIds: string[] }
-  | { type: "arrange" };
+  | { type: "arrange" }
+  | { type: "update"; updates: Array<{ nodeId: string; content?: string; x?: number; y?: number; width?: number; height?: number }> };
 
 // 待生成图片容器（右键空白创建，接收连线作为参考图）
 export type PendingContainer = {
@@ -363,6 +364,24 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   panRef.current = pan;
   const zoomRef = useRef(zoom);
   zoomRef.current = zoom;
+  // 缩放手势进行中：期间世界层保持 willChange:transform（GPU 缩放缓存纹理，手势流畅），
+  // 手势停止 250ms 后摘掉 —— Chrome 会按最终 zoom 重新光栅化文字，
+  // 否则 will-change 会把光栅分辨率"钉"在初始缩放上，放大到 500% 文字发糊
+  const [zoomGesturing, setZoomGesturing] = useState(false);
+  const zoomGesturingRef = useRef(false);
+  const zoomGestureTimerRef = useRef<number | null>(null);
+  const markZoomGesture = useCallback(() => {
+    if (!zoomGesturingRef.current) {
+      zoomGesturingRef.current = true;
+      setZoomGesturing(true);
+    }
+    if (zoomGestureTimerRef.current !== null) window.clearTimeout(zoomGestureTimerRef.current);
+    zoomGestureTimerRef.current = window.setTimeout(() => {
+      zoomGesturingRef.current = false;
+      zoomGestureTimerRef.current = null;
+      setZoomGesturing(false);
+    }, 250);
+  }, []);
   // 视角变化即持久化（pan 拖拽已 rAF 合帧，写入频率可控）
   useEffect(() => {
     if (!camKey) return;
@@ -400,6 +419,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   const [draggingNode, setDraggingNode] = useState<string | null>(null);
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
   const [hoveredNode, setHoveredNode] = useState<string | null>(null);
+  // 文本卡编辑模式：双击进入，失焦/Esc 退出
+  const [editingTextId, setEditingTextId] = useState<string | null>(null);
   // 本地位置覆盖（拖拽时即时更新，不等待 API）
   const [localOverrides, setLocalOverrides] = useState<Record<string, { x: number; y: number }>>({});
   // 多选整组拖拽：按下多选集合内的图时，记录所有选中节点的原始位置 + 鼠标世界坐标起点
@@ -979,6 +1000,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         const z = zoomRef.current;
         const factor = Math.exp(delta);
         const newZoom = Math.min(Math.max(z * factor, 0.05), 5);
+        markZoomGesture();
         const worldX = (mx - p.x) / z;
         const worldY = (my - p.y) / z;
         setPan({ x: mx - worldX * newZoom, y: my - worldY * newZoom });
@@ -1417,6 +1439,15 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     setMenu(null);
   }, [onAction, selectedIds]);
 
+  // 更新节点内容（文本卡双击编辑后保存）
+  const handleUpdateNodeContent = useCallback(
+    (nodeId: string, content: string) => {
+      if (!onAction) return;
+      onAction({ type: "update", updates: [{ nodeId, content }] });
+    },
+    [onAction]
+  );
+
   // 画布内复制选中图片（存入剪贴板状态，Ctrl+V 粘贴到画布）
   const handleCopyImage = useCallback(() => {
     const copies = [...selectedIds]
@@ -1783,8 +1814,10 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
           position: "absolute",
           transformOrigin: "0 0",
           transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
-          // 提升为合成层：pan/zoom 变化时 GPU 缩放缓存纹理，不逐帧重光栅化所有图片
-          willChange: "transform",
+          // 仅缩放手势期间提升为合成层：GPU 拉伸缓存纹理，保证手势流畅；
+          // 停止后移除（见 markZoomGesture），让浏览器按最终 zoom 重新光栅化文字，
+          // 常驻 will-change 会把光栅分辨率钉死在初始缩放 → 高倍放大文字发糊
+          willChange: zoomGesturing ? "transform" : undefined,
         }}
       >
         {/* 连线层（实线 = 已生成谱系，虚线 = 待生成参考） */}
@@ -1937,6 +1970,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
             onMouseEnter={() => setHoveredNode(node.id)}
             onMouseLeave={() => setHoveredNode(null)}
             onContextMenu={(e) => handleNodeContextMenu(e, node)}
+            onUpdateNode={handleUpdateNodeContent}
           />
         ))}
 
@@ -3431,6 +3465,7 @@ const ImageNode = memo(function ImageNode({
   onMouseEnter,
   onMouseLeave,
   onContextMenu,
+  onUpdateNode,
 }: {
   node: CanvasNode;
   isDragging: boolean;
@@ -3443,8 +3478,12 @@ const ImageNode = memo(function ImageNode({
   onMouseEnter: () => void;
   onMouseLeave: () => void;
   onContextMenu: (e: React.MouseEvent) => void;
+  onUpdateNode?: (nodeId: string, content: string) => void;
 }) {
   const [hoveredPortIdx, setHoveredPortIdx] = useState<number | null>(null);
+  const [isEditing, setIsEditing] = useState(false);
+  const [editContent, setEditContent] = useState(node.content || "");
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   if (node.type === "image" && node.image_url) {
     // 四边中点连接点（相对 wrapper 的坐标）
     const ports = showPorts
@@ -3575,7 +3614,62 @@ const ImageNode = memo(function ImageNode({
   }
 
   // 文本节点
-  if (node.content) {
+  if (node.content || node.type === "text") {
+    // 编辑模式：显示 textarea
+    if (isEditing) {
+      return (
+        <div
+          style={{
+            position: "absolute",
+            left: node.x,
+            top: node.y,
+            width: node.width,
+            height: node.height,
+            padding: 0,
+            boxSizing: "border-box",
+          }}
+        >
+          <textarea
+            ref={textareaRef}
+            value={editContent}
+            onChange={(e) => setEditContent(e.target.value)}
+            onBlur={() => {
+              setIsEditing(false);
+              if (onUpdateNode && editContent.trim() !== node.content) {
+                onUpdateNode(node.id, editContent.trim());
+              }
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
+                setEditContent(node.content || "");
+                setIsEditing(false);
+              }
+              // 阻止事件冒泡，避免触发画布的键盘事件
+              e.stopPropagation();
+            }}
+            autoFocus
+            style={{
+              width: "100%",
+              height: "100%",
+              padding: "12px 16px",
+              boxSizing: "border-box",
+              border: "2px solid #6366f1",
+              borderRadius: 8,
+              fontSize: 14,
+              color: "#333",
+              background: "rgba(255,255,255,0.98)",
+              resize: "none",
+              outline: "none",
+              fontFamily: "inherit",
+              wordBreak: "break-word",
+              whiteSpace: "pre-wrap",
+            }}
+          />
+        </div>
+      );
+    }
+
+    // 显示模式
     return (
       <div
         style={{
@@ -3583,18 +3677,75 @@ const ImageNode = memo(function ImageNode({
           left: node.x,
           top: node.y,
           width: node.width,
+          // 高度必须与数据模型一致：连线锚点按 node.height 的完整框计算，
+          // 若此处按内容自适应，卡片视觉框与连线锚框错位 → 连线"飘"在卡片旁边
+          height: node.height,
           padding: "12px 16px",
+          boxSizing: "border-box",
+          display: "flex",
+          alignItems: "center",
           background: "rgba(255,255,255,0.95)",
           borderRadius: 8,
           fontSize: 14,
           color: "#333",
-          boxShadow: "0 2px 12px rgba(0,0,0,0.3)",
-          pointerEvents: "none",
+          // 选中态样式：与图片节点一致的 outline + boxShadow
+          boxShadow: isSelected
+            ? "0 0 0 2px #6366f1, 0 8px 40px rgba(99,102,241,0.6)"
+            : isDragging
+              ? "0 8px 40px rgba(99,102,241,0.5)"
+              : isHovered
+                ? "0 4px 24px rgba(99,102,241,0.4)"
+                : "0 2px 12px rgba(0,0,0,0.3)",
+          outline: isDragging
+            ? "2px solid #6366f1"
+            : isSelected
+              ? "2px solid #6366f1"
+              : isHovered
+                ? "1px solid rgba(99,102,241,0.5)"
+                : "none",
+          cursor: isDragging ? "move" : "pointer",
           userSelect: "none",
           wordBreak: "break-word",
+          whiteSpace: "pre-wrap",
+          overflow: "hidden",
+          transition: isDragging ? "none" : "box-shadow 0.2s, outline 0.2s",
+        }}
+        onMouseDown={onMouseDown}
+        onMouseEnter={onMouseEnter}
+        onMouseLeave={onMouseLeave}
+        onContextMenu={onContextMenu}
+        onDoubleClick={(e) => {
+          e.stopPropagation();
+          setEditContent(node.content || "");
+          setIsEditing(true);
         }}
       >
         {node.content}
+        {/* 编号标签：与图片节点一致，放在卡片上方 */}
+        {node.index != null && (
+          <div
+            title={`#${node.index}`}
+            style={{
+              position: "absolute",
+              left: 0,
+              bottom: "calc(100% + 4px)",
+              minWidth: 24,
+              padding: "1px 7px",
+              borderRadius: 6,
+              background: "rgba(55,55,65,0.94)",
+              color: "rgba(255,255,255,0.92)",
+              fontSize: 11,
+              fontWeight: 600,
+              lineHeight: "19px",
+              textAlign: "center",
+              pointerEvents: "none",
+              zIndex: 5,
+              boxShadow: "0 2px 8px rgba(0,0,0,0.28)",
+            }}
+          >
+            #{node.index}
+          </div>
+        )}
       </div>
     );
   }

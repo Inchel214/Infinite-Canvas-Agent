@@ -122,30 +122,29 @@ for port in 8000 5173; do
   fi
 done
 
-# ===== 8. 启动服务 =====
+# ===== 8. 启动服务（一个窗口两个页签）=====
 info "启动服务中..."
-cleanup() {
-  echo ""
-  warn "正在停止所有服务..."
-  [[ -n "$BACKEND_PID" ]]  && kill "$BACKEND_PID"  2>/dev/null
-  [[ -n "$FRONTEND_PID" ]] && kill "$FRONTEND_PID" 2>/dev/null
-  exit 0
-}
-trap cleanup INT TERM
 
-# 后端
-cd backend
-source .venv/bin/activate
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 &
-BACKEND_PID=$!
-deactivate
-cd ..
+PROJECT_DIR="$(pwd)"
 
-# 前端
-cd frontend
-npm run dev &
-FRONTEND_PID=$!
-cd ..
+# 使用 AppleScript 在 Terminal.app 中打开一个窗口 + 两个页签
+osascript <<APPLESCRIPT
+tell application "Terminal"
+    -- 先关闭当前脚本所在的终端窗口（避免重复）
+    set alreadyOpen to (count of windows)
+
+    -- 第一个页签：后端
+    do script "cd '${PROJECT_DIR}/backend' && source .venv/bin/activate && python -m uvicorn app.main:app --host 127.0.0.1 --port 8000"
+
+    -- 第二个页签：前端
+    tell application "System Events" to keystroke "t" using {command down}
+    delay 0.5
+    do script "cd '${PROJECT_DIR}/frontend' && npm run dev" in window 1
+
+    -- 设置窗口标题
+    set custom title of window 1 to "InfiniteCanvas-后端 | 前端"
+end tell
+APPLESCRIPT
 
 # 等待服务就绪后打开浏览器
 info "等待服务启动..."
@@ -168,7 +167,6 @@ echo ""
 echo "  前端页面:  http://localhost:5173"
 echo "  后端接口:  http://127.0.0.1:8000"
 echo ""
-warn "  按 Ctrl+C 停止所有服务"
+warn "  服务已在 Terminal.app 的一个窗口（两个页签）中运行"
+warn "  关闭该窗口即可停止所有服务"
 echo ""
-
-wait

@@ -137,6 +137,26 @@ def _apply_styles(req, prompt: str) -> str:
     return experiences.apply_experiences(ids, prompt) if ids else prompt
 
 
+def _resolve_node_ref(state: CanvasState, ref: str) -> CanvasNode | None:
+    """节点引用解析：支持节点 ID 与 '#N' 编号两种写法。
+
+    MCP/Codex 与用户对话统一用 '#N' 指代节点；解析失败返回 None（调用方跳过或告警）。
+    """
+    ref = (ref or "").strip()
+    if not ref:
+        return None
+    if ref.startswith("#"):
+        try:
+            idx = int(ref[1:])
+        except ValueError:
+            return None
+        for n in state.nodes.values():
+            if n.index == idx:
+                return n
+        return None
+    return state.get_node(ref)
+
+
 class CanvasCreateIn(BaseModel):
     """创建画布：可自定义名称，留空则自动编号"""
     name: str = ""
@@ -161,12 +181,39 @@ def list_canvases():
     ]
 
 
-@router.get("/canvas/{canvas_id}", summary="获取画布状态")
-def get_canvas(canvas_id: str):
+@router.get("/canvas/{canvas_id}", summary="获取画布状态（summary=1 时返回 LLM 精简视图）")
+def get_canvas(canvas_id: str, summary: int = 0):
     try:
         state = deps.store.get_canvas(canvas_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    if summary:
+        # LLM 精简视图（MCP/Codex 用）：编号 + 截断内容 + 连线引用，避免大 JSON 撑爆上下文
+        by_id = state.nodes
+        return {
+            "canvas_id": state.canvas_id,
+            "name": state.name,
+            "version": state.version,
+            "node_count": len(state.nodes),
+            "nodes": [
+                {
+                    "id": n.id,
+                    "index": n.index,
+                    "type": n.type,
+                    "x": n.x,
+                    "y": n.y,
+                    "width": n.width,
+                    "height": n.height,
+                    "content": (n.content or "")[:100],
+                    "image": bool(n.image_url),
+                    # 连线来源转为 "#N" 编号，与 add/update 的引用写法对齐
+                    "sources": [
+                        f"#{by_id[s].index}" if s in by_id else s for s in n.source_ids
+                    ],
+                }
+                for n in sorted(state.nodes.values(), key=lambda v: v.index or 0)
+            ],
+        }
     return state.to_dict()
 
 
@@ -345,9 +392,9 @@ def batch_delete_nodes(canvas_id: str, req: BatchDeleteRequest):
         raise HTTPException(status_code=404, detail=str(e))
     deleted = 0
     for nid in req.node_ids:
-        node = state.get_node(nid)
+        node = _resolve_node_ref(state, nid)
         if node:
-            state.remove_node(nid)
+            state.remove_node(node.id)
             deleted += 1
     if deleted > 0:
         deps.store.save_canvas(state)
@@ -356,6 +403,151 @@ def batch_delete_nodes(canvas_id: str, req: BatchDeleteRequest):
         "message": f"已删除 {deleted} 张图片",
         "canvas": state.to_dict(),
     }
+
+
+class TextNodeIn(BaseModel):
+    """单个文本卡片：content 必填；x/y 缺省时自动寻找空白位置；parent_ids 建立连线"""
+    content: str
+    x: Optional[float] = None
+    y: Optional[float] = None
+    width: float = 280
+    height: float = 160
+    parent_ids: Optional[List[str]] = None  # 节点 ID 或 "#N" 编号
+
+
+class TextNodesRequest(BaseModel):
+    nodes: List[TextNodeIn]
+
+
+@router.post(
+    "/canvas/{canvas_id}/nodes/text",
+    summary="批量添加文本节点（MCP 初稿主干；单次保存=单次撤销）",
+)
+def add_text_nodes(canvas_id: str, req: TextNodesRequest):
+    from app.tools.layout import next_position
+
+    try:
+        state = deps.store.get_canvas(canvas_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    if not req.nodes:
+        raise HTTPException(status_code=400, detail="nodes 不能为空")
+
+    created: list[dict] = []
+    skipped_parents: list[str] = []
+    for item in req.nodes:
+        content = item.content.strip()
+        if not content:
+            continue
+        width = max(120.0, item.width)
+        height = max(60.0, item.height)
+        x, y = item.x, item.y
+        if x is None or y is None:
+            x, y = next_position(state, width, height)
+        parents: list[str] = []
+        for ref in item.parent_ids or []:
+            p = _resolve_node_ref(state, ref)
+            if p is not None:
+                parents.append(p.id)
+            else:
+                skipped_parents.append(ref)
+        node = CanvasNode(
+            id=str(uuid.uuid4()),
+            type="text",
+            x=float(x),
+            y=float(y),
+            width=width,
+            height=height,
+            content=content,
+            source_ids=parents,
+        )
+        state.add_node(node)
+        created.append(
+            {"node_id": node.id, "index": node.index, "x": node.x, "y": node.y}
+        )
+
+    if not created:
+        raise HTTPException(status_code=400, detail="没有有效的文本内容")
+    deps.store.save_canvas(state)
+    result = {
+        "success": True,
+        "message": f"已添加 {len(created)} 个文本节点",
+        "created": created,
+        "canvas_version": state.version,
+    }
+    if skipped_parents:
+        result["warning"] = f"未找到的连线引用（已忽略）: {', '.join(skipped_parents)}"
+    return result
+
+
+class NodeUpdateIn(BaseModel):
+    """节点更新：node_id 支持节点 ID 或 "#N"；只更新给出的字段"""
+    node_id: str
+    x: Optional[float] = None
+    y: Optional[float] = None
+    width: Optional[float] = None
+    height: Optional[float] = None
+    content: Optional[str] = None
+    source_ids: Optional[List[str]] = None  # 节点 ID 或 "#N" 列表（整体覆盖连线）
+    group: Optional[str] = None  # 分组标签（用于分区布局）
+
+
+class NodesUpdateRequest(BaseModel):
+    updates: List[NodeUpdateIn]
+
+
+@router.post(
+    "/canvas/{canvas_id}/nodes/update",
+    summary="批量更新节点（位置/尺寸/内容/连线；单次撤销）",
+)
+def batch_update_nodes(canvas_id: str, req: NodesUpdateRequest):
+    try:
+        state = deps.store.get_canvas(canvas_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    if not req.updates:
+        raise HTTPException(status_code=400, detail="updates 不能为空")
+
+    updated: list[str] = []
+    missing: list[str] = []
+    for u in req.updates:
+        node = _resolve_node_ref(state, u.node_id)
+        if node is None:
+            missing.append(u.node_id)
+            continue
+        if u.x is not None:
+            node.x = float(u.x)
+        if u.y is not None:
+            node.y = float(u.y)
+        if u.width is not None:
+            node.width = max(40.0, float(u.width))
+        if u.height is not None:
+            node.height = max(40.0, float(u.height))
+        if u.content is not None:
+            node.content = u.content
+        if u.source_ids is not None:
+            resolved: list[str] = []
+            for ref in u.source_ids:
+                p = _resolve_node_ref(state, ref)
+                if p is not None and p.id != node.id:
+                    resolved.append(p.id)
+            node.source_ids = resolved
+        if u.group is not None:
+            node.group = u.group
+        updated.append(f"#{node.index}" if node.index is not None else node.id)
+
+    if updated:
+        state.version += 1
+        deps.store.save_canvas(state)
+    result = {
+        "success": True,
+        "message": f"已更新 {len(updated)} 个节点",
+        "updated": updated,
+        "canvas_version": state.version,
+    }
+    if missing:
+        result["warning"] = f"未找到的节点（已跳过）: {', '.join(missing)}"
+    return result
 
 
 @router.post("/canvas/{canvas_id}/undo", summary="撤销最近一次操作")
@@ -426,12 +618,31 @@ def generate_image(canvas_id: str, req: GenerateRequest):
     if req.y is not None:
         kwargs["y"] = req.y
     result = tool.run(state, **kwargs)
-    if result.state:
-        deps.store.save_canvas(result.state)
+    if not result.success or result.state is None:
+        return {
+            "success": False,
+            "message": result.message,
+            "canvas": (result.state or state).to_dict(),
+        }
+    # 并发安全提交：生成耗时期间其他请求可能已写入画布（如 MCP 批量并发生图），
+    # 锁内重读最新状态增量添加，避免整体覆盖丢图（与 /generate_stream 的 _add_node 同模式）
+    node_id = (result.data or {}).get("node_id")
+    node = result.state.nodes.get(node_id) if node_id else None
+    if node is None:
+        return {
+            "success": False,
+            "message": "生成失败：未返回节点",
+            "canvas": result.state.to_dict(),
+        }
+    with _canvas_lock(canvas_id):
+        latest = deps.store.get_canvas(canvas_id)
+        node.index = None  # 旧快照上的编号可能与并发写入撞号，按最新画布重新分配
+        latest.add_node(node)
+        deps.store.save_canvas(latest)
     return {
-        "success": result.success,
+        "success": True,
         "message": result.message,
-        "canvas": result.state.to_dict(),
+        "canvas": latest.to_dict(),
     }
 
 
@@ -1224,3 +1435,69 @@ def receive_client_logs(req: ClientLogsRequest):
             _front_logger.info(line)
         accepted += 1
     return {"success": True, "accepted": accepted}
+
+
+# ==================== 画布快照管理 ====================
+
+
+class SnapshotRequest(BaseModel):
+    name: str = ""  # 快照名称（可选，缺省自动生成时间戳名称）
+
+
+@router.post("/canvas/{canvas_id}/snapshots", summary="保存画布快照")
+def save_canvas_snapshot(canvas_id: str, req: SnapshotRequest):
+    from app.canvas.snapshot import save_snapshot
+
+    try:
+        state = deps.store.get_canvas(canvas_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    result = save_snapshot(state, req.name)
+    return {"success": True, "snapshot": result}
+
+
+@router.get("/canvas/{canvas_id}/snapshots", summary="列出画布的所有快照")
+def list_canvas_snapshots(canvas_id: str):
+    from app.canvas.snapshot import list_snapshots
+
+    snapshots = list_snapshots(canvas_id)
+    return {"snapshots": snapshots}
+
+
+@router.get("/canvas/{canvas_id}/snapshots/{snapshot_id}", summary="获取快照详情")
+def get_canvas_snapshot(canvas_id: str, snapshot_id: str):
+    from app.canvas.snapshot import load_snapshot
+
+    data = load_snapshot(canvas_id, snapshot_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="快照不存在")
+    return data
+
+
+@router.post("/canvas/{canvas_id}/snapshots/{snapshot_id}/restore", summary="从快照恢复画布")
+def restore_canvas_snapshot(canvas_id: str, snapshot_id: str):
+    from app.canvas.snapshot import load_snapshot, restore_from_snapshot
+
+    data = load_snapshot(canvas_id, snapshot_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="快照不存在")
+
+    # 恢复画布状态
+    restored = restore_from_snapshot(data)
+    deps.store.save_canvas(restored)
+    return {
+        "success": True,
+        "message": f"已恢复到快照：{data['name']}",
+        "canvas": restored.to_dict(),
+    }
+
+
+@router.delete("/canvas/{canvas_id}/snapshots/{snapshot_id}", summary="删除快照")
+def delete_canvas_snapshot(canvas_id: str, snapshot_id: str):
+    from app.canvas.snapshot import delete_snapshot
+
+    ok = delete_snapshot(canvas_id, snapshot_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="快照不存在")
+    return {"success": True, "message": "已删除快照"}
