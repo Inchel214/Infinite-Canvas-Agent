@@ -111,10 +111,15 @@ export function CanvasPickerPanel({
     }
   };
 
-  const handleClickDelete = (id: string) => {
-    if (confirmDeleteId !== id) {
+  const handleClickDelete = (canvas: CanvasSummary) => {
+    if (busy) return;
+    if (canvas.node_count === 0) {
+      void handleDelete(canvas.canvas_id);
+      return;
+    }
+    if (confirmDeleteId !== canvas.canvas_id) {
       // 第一次点：进入确认态，3 秒未确认自动还原
-      setConfirmDeleteId(id);
+      setConfirmDeleteId(canvas.canvas_id);
       if (confirmTimer.current !== null) window.clearTimeout(confirmTimer.current);
       confirmTimer.current = window.setTimeout(
         () => setConfirmDeleteId(null),
@@ -123,7 +128,7 @@ export function CanvasPickerPanel({
       return;
     }
     // 第二次点：真正删除
-    void handleDelete(id);
+    void handleDelete(canvas.canvas_id);
   };
 
   const handleDelete = async (id: string) => {
@@ -407,7 +412,7 @@ export function CanvasPickerPanel({
                     <span
                       onClick={(e) => {
                         e.stopPropagation();
-                        handleClickDelete(c.canvas_id);
+                        handleClickDelete(c);
                       }}
                       style={{
                         fontSize: 12,
@@ -418,7 +423,13 @@ export function CanvasPickerPanel({
                         cursor: "pointer",
                         userSelect: "none",
                       }}
-                      title={isConfirming ? "再点一次确认删除" : "删除"}
+                      title={
+                        c.node_count === 0
+                          ? "删除空画布"
+                          : isConfirming
+                            ? "再点一次确认删除"
+                            : "删除"
+                      }
                     >
                       {isConfirming ? "确认？" : "🗑"}
                     </span>

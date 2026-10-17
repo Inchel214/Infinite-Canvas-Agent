@@ -227,8 +227,10 @@ function App() {
     return () => window.clearInterval(timer);
   }, [canvasId, applyCanvasState]);
 
-  // 顶栏红点总数：未查看的新图（生成中不算未读，只算状态提示）
-  const totalPending = Object.values(badges).reduce((s, b) => s + b.pending, 0);
+  // 顶栏红点只提醒其他画布的未读成图；当前画布正在查看，不参与提醒。
+  const hasOtherCanvasPending = Object.entries(badges).some(
+    ([id, badge]) => id !== canvasId && badge.pending > 0
+  );
 
   // 服务商显示名（徽标用）
   const providerName = (key: string): string =>
@@ -349,6 +351,7 @@ function App() {
         <div
           onClick={() => setShowPicker(true)}
           style={{
+            position: "relative",
             display: "flex",
             alignItems: "center",
             gap: 8,
@@ -365,31 +368,25 @@ function App() {
           }}
           title="切换 / 新建 / 管理画布"
         >
-          <span style={{ fontSize: 15, position: "relative" }}>
-            🗂
-            {totalPending > 0 && (
-              <span
-                style={{
-                  position: "absolute",
-                  top: -4,
-                  right: -8,
-                  minWidth: 16,
-                  height: 16,
-                  padding: "0 4px",
-                  borderRadius: 8,
-                  background: "#e5484d",
-                  color: "#fff",
-                  fontSize: 10,
-                  fontWeight: 600,
-                  lineHeight: "16px",
-                  textAlign: "center",
-                  boxShadow: "0 0 4px rgba(229,72,77,0.6)",
-                }}
-              >
-                {totalPending > 99 ? "99+" : totalPending}
-              </span>
-            )}
-          </span>
+          {hasOtherCanvasPending && (
+            <span
+              aria-label="其他画布有新生成图片"
+              title="其他画布有新生成图片待查看"
+              style={{
+                position: "absolute",
+                top: -5,
+                right: -5,
+                width: 10,
+                height: 10,
+                borderRadius: "50%",
+                background: "#e5484d",
+                border: "2px solid rgba(26,26,46,0.98)",
+                boxShadow: "0 0 5px rgba(229,72,77,0.65)",
+                pointerEvents: "none",
+              }}
+            />
+          )}
+          <span style={{ fontSize: 15 }}>🗂</span>
           <span
             style={{
               overflow: "hidden",
@@ -485,6 +482,7 @@ function App() {
                 .filter((n): n is NonNullable<typeof n> => !!n)
             : []
         }
+        canvasNodes={canvasState ? Object.values(canvasState.nodes) : []}
         onRemoveRef={(nodeId) => setChatRefIds((prev) => prev.filter((id) => id !== nodeId))}
         onClearRefs={() => setChatRefIds([])}
         onCanvasUpdate={applyCanvasState}

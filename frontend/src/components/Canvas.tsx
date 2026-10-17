@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useCallback, useState, useMemo, memo } from "react";
 import { createPortal } from "react-dom";
 import type { CanvasState, CanvasNode } from "../types/canvas";
-import { generateImageStream, uploadImageNode, cloneNode, undoCanvas, redoCanvas, listExperiences, revealImageFile, type ExperienceMeta } from "../api/agent";
+import { generateImageStream, updateNodePosition, uploadImageNode, cloneNode, undoCanvas, redoCanvas, listExperiences, revealImageFile, type ExperienceMeta } from "../api/agent";
 
 // 右键菜单可触发的操作类型（experienceIds：风格库多选的风格，直连生图时后端确定性拼接）
 export type CanvasAction =
@@ -53,6 +53,55 @@ function parseRatio(ratioKey: string): { w: number; h: number } {
 
 const RESOLUTIONS = ["1K", "2K", "4K"] as const;
 
+const EXPERIENCE_USAGE_KEY = "ica:experienceUsage";
+const EXPERIENCE_USAGE_EVENT = "ica:experienceUsageChanged";
+
+function readExperienceUsage(): Record<string, number> {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(EXPERIENCE_USAGE_KEY) ?? "{}");
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+// 只在真正发起生成时累计，风格下拉据此把常用项逐步排到前面。
+function recordExperienceUsage(ids?: string[]) {
+  if (!ids?.length) return;
+  try {
+    const usage = readExperienceUsage();
+    ids.forEach((id) => {
+      usage[id] = (Number(usage[id]) || 0) + 1;
+    });
+    localStorage.setItem(EXPERIENCE_USAGE_KEY, JSON.stringify(usage));
+    window.dispatchEvent(new Event(EXPERIENCE_USAGE_EVENT));
+  } catch {
+    // 本地统计不可用时不应阻断图片生成。
+  }
+}
+
+const IMAGE_MENTION_RE = /@图片(\d+)/g;
+
+// 删除参考图时让图片提及继续指向原图；槽位交换会显式跳过这一步。
+function remapImageMentions(prompt: string, oldRefIds: string[], newRefIds: string[]): string {
+  return prompt
+    .replace(IMAGE_MENTION_RE, (mention, rawIndex: string) => {
+      const refId = oldRefIds[Number(rawIndex) - 1];
+      if (!refId) return mention;
+      const nextIndex = newRefIds.indexOf(refId);
+      return nextIndex >= 0 ? `@图片${nextIndex + 1}` : "";
+    })
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/[ \t]+\n/g, "\n");
+}
+
+function swapReferences(refIds: string[], fromIndex: number, toIndex: number): string[] {
+  if (fromIndex === toIndex || fromIndex < 0 || toIndex < 0) return refIds;
+  const next = [...refIds];
+  [next[fromIndex], next[toIndex]] = [next[toIndex], next[fromIndex]];
+  return next;
+}
+
 // 按节点当前宽高比找最接近的预设或返回自定义比例（编辑图片时默认继承原图比例）
 function closestAspectKey(w: number, h: number): string {
   const target = w / h;
@@ -72,6 +121,16 @@ function closestAspectKey(w: number, h: number): string {
     return `${w / g}:${h / g}`;
   }
   return best.key;
+}
+
+// 参考图接入容器时只选现有画布预设，不生成难以理解的自定义比例。
+function closestPresetAspectKey(w: number, h: number): string {
+  const target = w / h;
+  return ASPECT_RATIOS.reduce((best, ratio) =>
+    Math.abs(ratio.w / ratio.h - target) < Math.abs(best.w / best.h - target)
+      ? ratio
+      : best,
+  ).key;
 }
 
 // 按图片像素长边找最接近的分辨率档位（编辑图片时默认继承原图分辨率）
@@ -302,7 +361,7 @@ type MenuState = {
 // 编辑图片框：独立于右键菜单，可与之并存
 // 连线在画布 SVG 层（世界坐标系）渲染，与图片间连线同风格
 type EditPanelState = {
-  nodeId: string;   // 被编辑的图片节点
+  refIds: string[];  // 图1固定为被编辑底图，其余为附加参考图
   x: number;         // 屏幕坐标（fixed 定位）
   y: number;
   prompt: string;
@@ -497,6 +556,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
 
   // ===== 待生成图片容器 + 连线 =====
   const [containers, setContainers] = useState<PendingContainer[]>([]);
+  // 生成请求携带启动时的位置；拖动期间用 ref 留住最新坐标，供异步完成回调读取。
+  const generatingPositionsRef = useRef<Record<string, { x: number; y: number }>>({});
   const [connecting, setConnecting] = useState<{ fromId: string; x: number; y: number; sx: number; sy: number } | null>(null);
   const [draggingContainer, setDraggingContainer] = useState<{ id: string; offsetX: number; offsetY: number } | null>(null);
   // 按容器独立跟踪生成状态：生成中的容器锁定自身，其它容器完全可操作（可并发生成）
@@ -746,19 +807,20 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     const h = CONTAINER_BASE_H;
     const x = wx - w / (2 * zoom);
     const y = wy - h / (2 * zoom);
+    const refNode = refId ? nodes.find((node) => node.id === refId) : undefined;
     const c: PendingContainer = {
       id: `pending-${Date.now()}-${containerSeqRef.current}`,
       x: Math.round(x),
       y: Math.round(y),
       w,
       h,
-      aspect: "1:1",
+      aspect: refNode ? closestPresetAspectKey(refNode.width, refNode.height) : "1:1",
       resolution: "2K",
       prompt: "",
       refIds: refId ? [refId] : [],
     };
     setContainers((prev) => [...prev, c]);
-  }, [zoom]);
+  }, [nodes, zoom]);
 
   const updateContainer = useCallback((id: string, patch: Partial<PendingContainer>) => {
     setContainers((prev) => prev.map((c) => (c.id === id ? { ...c, ...patch } : c)));
@@ -1066,10 +1128,14 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     if (draggingContainer) {
       // 拖拽容器
       const w = screenToWorld(e.clientX, e.clientY);
+      const nextPosition = { x: w.x - draggingContainer.offsetX, y: w.y - draggingContainer.offsetY };
+      if (generatingIdsRef.current.has(draggingContainer.id)) {
+        generatingPositionsRef.current[draggingContainer.id] = nextPosition;
+      }
       setContainers((prev) =>
         prev.map((c) =>
           c.id === draggingContainer.id
-            ? { ...c, x: w.x - draggingContainer.offsetX, y: w.y - draggingContainer.offsetY }
+            ? { ...c, ...nextPosition }
             : c
         )
       );
@@ -1134,6 +1200,21 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     // 连线结束：面板是屏幕尺度浮层，按其钳制后的真实屏幕矩形判定命中。
     if (connecting) {
       const w = screenToWorld(e.clientX, e.clientY);
+      const hitEditPanel = editPanel &&
+        e.clientX >= editPanelRect.x &&
+        e.clientX <= editPanelRect.x + editPanelRect.w &&
+        e.clientY >= editPanelRect.y &&
+        e.clientY <= editPanelRect.y + editPanelRect.h;
+      if (hitEditPanel) {
+        if (!editPanel.refIds.includes(connecting.fromId)) {
+          setEditPanel((current) => current
+            ? { ...current, refIds: [...current.refIds, connecting.fromId] }
+            : current
+          );
+        }
+        setConnecting(null);
+        return;
+      }
       const hit = containers.find((c) => {
         const p = getContainerPlacement(c);
         return (
@@ -1145,7 +1226,10 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       });
       if (hit && !hit.refIds.includes(connecting.fromId)) {
         // 命中容器：添加参考图
-        updateContainer(hit.id, { refIds: [...hit.refIds, connecting.fromId], error: undefined });
+        updateContainer(hit.id, {
+          refIds: [...hit.refIds, connecting.fromId],
+          error: undefined,
+        });
       } else if (!hit) {
         // 空白处松手：原地新建容器（居中于落点），并自动连上该参考图
         createContainer(w.x, w.y, connecting.fromId);
@@ -1241,7 +1325,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       backgroundDownRef.current = null;
       setIsPanning(false);
     }
-  }, [marquee, draggingNode, localOverrides, onNodeMoved, onNodesMoved, isPanning, pan, zoom, nodes, connecting, containers, updateContainer, screenToWorld, draggingContainer, createContainer, menu, getContainerPlacement]);
+  }, [marquee, draggingNode, localOverrides, onNodeMoved, onNodesMoved, isPanning, pan, zoom, nodes, connecting, containers, updateContainer, screenToWorld, draggingContainer, createContainer, menu, getContainerPlacement, editPanel, editPanelRect]);
 
   // 图片节点拖拽开始（记录起点用于 click/drag 判定）
   const handleNodeMouseDown = useCallback((e: React.MouseEvent, node: CanvasNode) => {
@@ -1310,7 +1394,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         if (mx + PANEL_W > window.innerWidth - 8) mx = Math.max(8, sx - PANEL_W - 28); // 空间不够放左侧
         const my = Math.max(8, Math.min(sy + sh / 2 - PANEL_H / 2, window.innerHeight - PANEL_H - 8));
         setEditPanel({
-          nodeId: node.id,
+          refIds: [node.id],
           x: mx,
           y: my,
           prompt: c && c !== "本地图片" ? c : "",
@@ -1327,7 +1411,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
             const longEdge = Math.max(img.naturalWidth, img.naturalHeight);
             if (longEdge > 0) {
               setEditPanel((p) =>
-                p && p.nodeId === nid ? { ...p, resolution: closestResolutionKey(longEdge) } : p
+                p && p.refIds[0] === nid ? { ...p, resolution: closestResolutionKey(longEdge) } : p
               );
             }
           };
@@ -1396,6 +1480,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     const box = buildProcessingBox(aspect, srcNodes);
 
     if (menu.mode === "compose" && ids.length >= 2) {
+      recordExperienceUsage(menuStyleIds);
       setMenu(null);
       setPromptInput("");
       const sname = styleNamesByIds(menuStyleIds);
@@ -1404,6 +1489,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         onAction({ type: "compose", nodeIds: ids, prompt, size, x: box.x, y: box.y, experienceIds: menuStyleIds.length ? menuStyleIds : undefined })
       ).finally(() => removeProcessingBox(boxId));
     } else if (menu.mode === "variate" && ids.length === 1) {
+      recordExperienceUsage(menuStyleIds);
       setMenu(null);
       setPromptInput("");
       const sname = styleNamesByIds(menuStyleIds);
@@ -1414,23 +1500,34 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     }
   }, [onAction, menu, selectedIds, nodes, promptInput, aspect, resolution, buildProcessingBox, menuStyleIds, styleNamesByIds, addProcessingBox, removeProcessingBox]);
 
-  // 编辑框执行：使用编辑框自身的 nodeId 和 prompt（不依赖菜单/选中状态）
+  // 编辑框执行：图1始终是编辑底图；追加参考图时按当前顺序走多图组合能力。
   // 点生成 → 面板关闭 → 在新图位置（原图右侧）画占位框显示"正在编辑图片..."
   const handleEditPanelExecute = useCallback(() => {
     if (!onAction || !editPanel) return;
     const prompt = editPanel.prompt.trim();
     if (!prompt) return;
     const size = calcSize(editPanel.aspect, editPanel.resolution);
-    const node = nodes.find((n) => n.id === editPanel.nodeId);
-    if (!node) return;
-    const box = buildProcessingBox(editPanel.aspect, [node]);
+    const refNodes = editPanel.refIds
+      .map((id) => nodes.find((n) => n.id === id))
+      .filter((node): node is CanvasNode => !!node);
+    if (refNodes.length === 0) return;
+    const box = buildProcessingBox(editPanel.aspect, refNodes);
     const sname = styleNamesByIds(editPanel.experienceIds);
     const expIds = editPanel.experienceIds;
+    recordExperienceUsage(expIds);
     setEditPanel(null);
-    const boxId = addProcessingBox(box, sname ? `正在按《${sname}》编辑图片...` : "正在编辑图片...");
-    Promise.resolve(
-      onAction({ type: "edit", nodeId: node.id, prompt, size, x: box.x, y: box.y, experienceIds: expIds?.length ? expIds : undefined })
-    ).finally(() => removeProcessingBox(boxId));
+    const boxId = addProcessingBox(
+      box,
+      sname
+        ? `正在按《${sname}》编辑图片...`
+        : refNodes.length > 1
+          ? `正在参考 ${refNodes.length} 张图片编辑...`
+          : "正在编辑图片...",
+    );
+    const action: CanvasAction = refNodes.length > 1
+      ? { type: "compose", nodeIds: refNodes.map((node) => node.id), prompt, size, x: box.x, y: box.y, experienceIds: expIds?.length ? expIds : undefined }
+      : { type: "edit", nodeId: refNodes[0].id, prompt, size, x: box.x, y: box.y, experienceIds: expIds?.length ? expIds : undefined };
+    Promise.resolve(onAction(action)).finally(() => removeProcessingBox(boxId));
   }, [onAction, editPanel, nodes, buildProcessingBox, styleNamesByIds, addProcessingBox, removeProcessingBox]);
 
   const handleDelete = useCallback(() => {
@@ -1605,7 +1702,9 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       const op =
         c.refIds.length === 0 ? "generate" : c.refIds.length === 1 ? "variate" : "compose";
 
+      recordExperienceUsage(c.experienceIds);
       setGeneratingIds((prev) => new Set(prev).add(c.id));
+      generatingPositionsRef.current[c.id] = { x: c.x, y: c.y };
       setGenProgressMap((prev) => ({ ...prev, [c.id]: 5 }));
       // 估算进度：流式模式下收到真实 preview 事件后自动停用
       let estimating = true;
@@ -1628,7 +1727,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       }, 120);
 
       const ref = {
-        done: null as { success: boolean; message: string; canvas: CanvasState } | null,
+        done: null as { success: boolean; message: string; canvas: CanvasState; node_id?: string } | null,
       };
       try {
         await generateImageStream(
@@ -1663,11 +1762,23 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
 
         window.clearInterval(timer);
         if (ref.done && ref.done.success) {
+          let completedCanvas = ref.done.canvas;
+          const finalPosition = generatingPositionsRef.current[c.id];
+          if (ref.done.node_id && finalPosition &&
+              (finalPosition.x !== c.x || finalPosition.y !== c.y)) {
+            try {
+              completedCanvas = await updateNodePosition(
+                canvasId, ref.done.node_id, finalPosition.x, finalPosition.y
+              );
+            } catch {
+              setLocalStatusMsg("图片已生成，但拖动后的位置保存失败，请重新移动成图");
+            }
+          }
           // 1) 进度到 100%，短暂停留让用户看到"完成"
           setGenProgressMap((prev) => ({ ...prev, [c.id]: 100 }));
           await new Promise((r) => setTimeout(r, 160));
           // 2) 图片入场（淡入缩放 0.35s）与容器退场（淡出缩小 0.32s）交叉进行
-          onCanvasUpdate?.(ref.done.canvas);
+          onCanvasUpdate?.(completedCanvas);
           updateContainer(c.id, { exiting: true });
           // 3) 等待退场动画完成后再移除容器节点
           await new Promise((r) => setTimeout(r, 380));
@@ -1685,6 +1796,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         updateContainer(c.id, { error: "生成失败，请重试" });
       } finally {
         window.clearInterval(timer);
+        delete generatingPositionsRef.current[c.id];
         // 只解除本容器的生成态（其它容器的进度不受影响）
         setGeneratingIds((prev) => {
           const next = new Set(prev);
@@ -1998,9 +2110,6 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
                 setDraggingContainer({ id: c.id, offsetX: w.x - p.x, offsetY: w.y - p.y });
               }}
               onChange={(patch) => updateContainer(c.id, patch)}
-              onRemoveRef={(rid) =>
-                updateContainer(c.id, { refIds: c.refIds.filter((rr) => rr !== rid) })
-              }
               onRemove={() => removeContainer(c.id)}
               onGenerate={() => handleContainerGenerate(c)}
               onActivate={() => {
@@ -2147,10 +2256,21 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
           x={editPanel.x}
           y={editPanel.y}
           nodeContent={
-            nodes.find((n) => n.id === editPanel.nodeId)?.content ?? ""
+            nodes.find((n) => n.id === editPanel.refIds[0])?.content ?? ""
           }
+          refNodes={editPanel.refIds
+            .map((id) => nodes.find((n) => n.id === id))
+            .filter((node): node is CanvasNode => !!node)}
           prompt={editPanel.prompt}
           onPromptChange={(v) => setEditPanel((p) => (p ? { ...p, prompt: v } : p))}
+          onRefIdsChange={(nextIds, preserveSlotMentions = false) => setEditPanel((p) => p
+            ? {
+                ...p,
+                prompt: preserveSlotMentions ? p.prompt : remapImageMentions(p.prompt, p.refIds, nextIds),
+                refIds: nextIds,
+              }
+            : p
+          )}
           aspect={editPanel.aspect}
           resolution={editPanel.resolution}
           onAspectChange={(v) => setEditPanel((p) => (p ? { ...p, aspect: v } : p))}
@@ -2162,6 +2282,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
           onClose={() => setEditPanel(null)}
           onMove={(nx, ny) => setEditPanel((p) => (p ? { ...p, x: nx, y: ny } : p))}
           onRect={setEditPanelRect}
+          onConnectionMouseUp={connecting ? handleMouseUp : undefined}
         />,
         document.body,
       )}
@@ -2172,16 +2293,9 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
           故原点取 world 元素真实 rect，而非 container 原点 + pan */}
       {editPanel &&
         (() => {
-          const node = nodes.find((n) => n.id === editPanel.nodeId);
           const worldEl = containerRef.current?.querySelector("[data-role=world]");
-          if (!node || !worldEl) return null;
+          if (!worldEl) return null;
           const wr = worldEl.getBoundingClientRect();
-          const nodeRect: BBox = {
-            x: wr.left + node.x * zoom,
-            y: wr.top + node.y * zoom,
-            width: node.width * zoom,
-            height: node.height * zoom,
-          };
           const panelRect: BBox = {
             x: editPanelRect.x,
             y: editPanelRect.y,
@@ -2189,7 +2303,19 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
             height: editPanelRect.h,
           };
           return createPortal(
-            <EditPanelConnector nodeRect={nodeRect} panelRect={panelRect} />,
+            <>
+              {editPanel.refIds.map((refId) => {
+                const node = nodes.find((candidate) => candidate.id === refId);
+                if (!node) return null;
+                const nodeRect: BBox = {
+                  x: wr.left + node.x * zoom,
+                  y: wr.top + node.y * zoom,
+                  width: node.width * zoom,
+                  height: node.height * zoom,
+                };
+                return <EditPanelConnector key={refId} nodeRect={nodeRect} panelRect={panelRect} />;
+              })}
+            </>,
             document.body,
           );
         })()}
@@ -2386,6 +2512,7 @@ function StyleSelect({
   onChange: (v: string[]) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const [usageVersion, setUsageVersion] = useState(0);
   const rootRef = useRef<HTMLDivElement>(null);
   const btnRef = useRef<HTMLButtonElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
@@ -2400,6 +2527,16 @@ function StyleSelect({
     const maxH = Math.max(120, Math.min(208, window.innerHeight - r.bottom - 12));
     setListPos({ left: r.left, top: r.bottom + 4, width: r.width, maxH });
   }, [open]);
+
+  useEffect(() => {
+    const refresh = () => setUsageVersion((current) => current + 1);
+    window.addEventListener(EXPERIENCE_USAGE_EVENT, refresh);
+    window.addEventListener("storage", refresh);
+    return () => {
+      window.removeEventListener(EXPERIENCE_USAGE_EVENT, refresh);
+      window.removeEventListener("storage", refresh);
+    };
+  }, []);
 
   // 点击组件外部/按 Esc 关闭下拉。
   // 用捕获阶段监听：EditPanel/ContextMenu 根节点对 mousedown stopPropagation（阻止画布拖拽），
@@ -2425,6 +2562,17 @@ function StyleSelect({
       document.removeEventListener("keydown", onKey, true);
     };
   }, [open]);
+
+  const sortedExperiences = useMemo(() => {
+    const usage = readExperienceUsage();
+    return experiences
+      .map((experience, index) => ({ experience, index }))
+      .sort((a, b) =>
+        (Number(usage[b.experience.id]) || 0) - (Number(usage[a.experience.id]) || 0) ||
+        a.index - b.index
+      )
+      .map(({ experience }) => experience);
+  }, [experiences, usageVersion]);
 
   if (experiences.length === 0) return null;
 
@@ -2496,7 +2644,7 @@ function StyleSelect({
             padding: 4,
           }}
         >
-          {experiences.map((e) => {
+          {sortedExperiences.map((e) => {
             const checked = value.includes(e.id);
             return (
               <div
@@ -2577,15 +2725,15 @@ function AspectRatioButtons({
   const activeBg = variant === "context" ? "#6366f1" : "#a78bfa";
   const activeColor = variant === "container" ? "#1a1a2e" : "white";
   const inactiveColor = variant === "container" ? "rgba(255,255,255,0.85)" : "rgba(255,255,255,0.6)";
-  const btnFont = variant === "container" ? 15 : 11;
+  const btnFont = 11;
 
   const btnStyle = (active: boolean): React.CSSProperties => ({
     flex: 1,
-    padding: variant === "container" ? "9px 0" : "5px 0",
+    padding: "5px 0",
     background: active ? activeBg : "rgba(255,255,255,0.08)",
     color: active ? activeColor : inactiveColor,
     border: "none",
-    borderRadius: variant === "container" ? 6 : 5,
+    borderRadius: 5,
     fontSize: btnFont,
     cursor: "pointer",
     fontWeight: active && variant === "container" ? 600 : 400,
@@ -2742,6 +2890,7 @@ const ContextMenu = ({
 }) => {
   // 输入模式（组合/变体/编辑）加宽，操作菜单保持紧凑
   const MENU_W = mode === "menu" || mode === "background" ? 260 : 340;
+  const [promptCopied, setPromptCopied] = useState(false);
   // 菜单可拖动：初始位置用传入坐标，拖动后用 offset 覆盖
   const [dragOffset, setDragOffset] = useState<{ dx: number; dy: number } | null>(null);
   const dragStart = useRef<{ mx: number; my: number; left: number; top: number } | null>(null);
@@ -2853,8 +3002,66 @@ const ContextMenu = ({
             userSelect: "text",
           }}
         >
-          <div style={{ fontSize: 10, color: "rgba(255,255,255,0.4)", marginBottom: 4 }}>
-            生成提示词
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              marginBottom: 4,
+            }}
+          >
+            <span style={{ fontSize: 10, color: "rgba(255,255,255,0.4)" }}>
+              生成提示词
+            </span>
+            <button
+              type="button"
+              aria-label="复制生成提示词"
+              title={promptCopied ? "已复制" : "复制生成提示词"}
+              onClick={() => {
+                void navigator.clipboard.writeText(selectedNodeContent).then(() => {
+                  setPromptCopied(true);
+                  window.setTimeout(() => setPromptCopied(false), 1200);
+                });
+              }}
+              style={{
+                width: 24,
+                height: 24,
+                padding: 0,
+                border: "none",
+                borderRadius: 5,
+                background: "transparent",
+                color: promptCopied ? "#c4b5fd" : "rgba(255,255,255,0.6)",
+                cursor: "pointer",
+                position: "relative",
+                flex: "0 0 auto",
+              }}
+            >
+              <span
+                aria-hidden="true"
+                style={{
+                  position: "absolute",
+                  width: 10,
+                  height: 10,
+                  left: 6,
+                  top: 6,
+                  border: "1.4px solid currentColor",
+                  borderRadius: 3,
+                }}
+              />
+              <span
+                aria-hidden="true"
+                style={{
+                  position: "absolute",
+                  width: 10,
+                  height: 10,
+                  left: 9,
+                  top: 9,
+                  border: "1.4px solid currentColor",
+                  borderRadius: 3,
+                  background: "rgba(26,26,46,0.97)",
+                }}
+              />
+            </button>
           </div>
           {selectedNodeContent}
         </div>
@@ -3075,8 +3282,10 @@ const EditPanel = ({
   x,
   y,
   nodeContent,
+  refNodes,
   prompt,
   onPromptChange,
+  onRefIdsChange,
   aspect,
   resolution,
   onAspectChange,
@@ -3088,13 +3297,16 @@ const EditPanel = ({
   onClose,
   onMove,
   onRect,
+  onConnectionMouseUp,
 }: {
   ref: React.RefObject<HTMLDivElement | null>;
   x: number;
   y: number;
   nodeContent: string;
+  refNodes: CanvasNode[];
   prompt: string;
   onPromptChange: (v: string) => void;
+  onRefIdsChange: (refIds: string[], preserveSlotMentions?: boolean) => void;
   aspect: string;
   resolution: string;
   onAspectChange: (v: string) => void;
@@ -3106,6 +3318,7 @@ const EditPanel = ({
   onClose: () => void;
   onMove: (x: number, y: number) => void;
   onRect: (rect: { x: number; y: number; w: number; h: number }) => void;
+  onConnectionMouseUp?: (e: React.MouseEvent) => void;
 }) => {
   // 可拉伸尺寸：宽度持久化；高度默认自适应（null），拉伸过一次后固定并持久化
   const [panelW, setPanelW] = useState<number>(() => {
@@ -3117,30 +3330,54 @@ const EditPanel = ({
     return Number.isFinite(v) && v >= 420 ? v : null;
   });
   const [resizeHover, setResizeHover] = useState(false);
+  const [sourcePromptExpanded, setSourcePromptExpanded] = useState(false);
+  const [sourcePromptCopied, setSourcePromptCopied] = useState(false);
+  const [draggingRefId, setDraggingRefId] = useState<string | null>(null);
+  const [dragGhost, setDragGhost] = useState<{ imageUrl: string; x: number; y: number } | null>(null);
+  const referenceDragRef = useRef<{ pointerId: number; refId: string; order: string[] } | null>(null);
   const left = Math.min(x, window.innerWidth - panelW - 8);
   // 固定高度时按真实高度钳制；自适应时按含风格选择/原始提示词的最大内容估算
   const estH = panelH ?? (nodeContent && nodeContent !== "本地图片" ? 500 : 435);
   const top = Math.min(y, window.innerHeight - estH - 8);
 
-  const onTitleMouseDown = useCallback((e: React.MouseEvent) => {
+  const titleDragCleanupRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => () => titleDragCleanupRef.current?.(), []);
+
+  const onTitlePointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
     if (e.button !== 0) return;
     e.stopPropagation();
     e.preventDefault();
+    titleDragCleanupRef.current?.();
     const startX = e.clientX;
     const startY = e.clientY;
     const origLeft = left;
     const origTop = top;
-    const onMov = (ev: MouseEvent) => {
+    const pointerId = e.pointerId;
+    const target = e.currentTarget;
+    target.setPointerCapture(pointerId);
+    const onMov = (ev: PointerEvent) => {
+      if (ev.pointerId !== pointerId) return;
       const nl = Math.max(0, Math.min(origLeft + ev.clientX - startX, window.innerWidth - panelW - 8));
       const nt = Math.max(0, Math.min(origTop + ev.clientY - startY, window.innerHeight - 40));
       onMove(nl, nt);
     };
-    const onUp = () => {
-      document.removeEventListener("mousemove", onMov);
-      document.removeEventListener("mouseup", onUp);
+    const cleanup = () => {
+      window.removeEventListener("pointermove", onMov);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+      window.removeEventListener("blur", cleanup);
+      if (target.hasPointerCapture(pointerId)) target.releasePointerCapture(pointerId);
+      if (titleDragCleanupRef.current === cleanup) titleDragCleanupRef.current = null;
     };
-    document.addEventListener("mousemove", onMov);
-    document.addEventListener("mouseup", onUp);
+    const onUp = (ev: PointerEvent) => {
+      if (ev.pointerId === pointerId) cleanup();
+    };
+    titleDragCleanupRef.current = cleanup;
+    window.addEventListener("pointermove", onMov);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+    window.addEventListener("blur", cleanup);
   }, [left, top, onMove, panelW]);
 
   // 拉伸：角落同时调宽高（宽 340~720）；四边逐轴拉伸（e/w 调宽、n/s 调高，对边锚定）
@@ -3220,6 +3457,17 @@ const EditPanel = ({
 
   const canExecute = prompt.trim().length > 0;
 
+  const finishReferenceDrag = (e: React.PointerEvent<HTMLElement>) => {
+    const drag = referenceDragRef.current;
+    if (!drag || drag.pointerId !== e.pointerId) return;
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+    referenceDragRef.current = null;
+    setDraggingRefId(null);
+    setDragGhost(null);
+  };
+
   return (
     <div
       ref={ref}
@@ -3240,11 +3488,15 @@ const EditPanel = ({
         backdropFilter: "blur(8px)",
       }}
       onMouseDown={(e) => e.stopPropagation()}
+      onMouseUp={(e) => {
+        e.stopPropagation();
+        onConnectionMouseUp?.(e);
+      }}
       onContextMenu={(e) => e.preventDefault()}
     >
       {/* 标题栏（可拖拽移动） */}
       <div
-        onMouseDown={onTitleMouseDown}
+        onPointerDown={onTitlePointerDown}
         style={{
           padding: "6px 14px 8px",
           fontSize: 13,
@@ -3253,80 +3505,293 @@ const EditPanel = ({
           marginBottom: 4,
           cursor: "move",
           userSelect: "none",
+          touchAction: "none",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
         }}
       >
-        ✏️ 编辑图片
-        <span style={{ float: "right", opacity: 0.4, fontSize: 10 }}>⠿ 拖</span>
+        <span>✏️ 编辑图片</span>
+        <button
+          type="button"
+          aria-label="关闭编辑图片"
+          title="关闭"
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={onClose}
+          style={{
+            width: 24,
+            height: 24,
+            padding: 0,
+            border: "none",
+            borderRadius: 5,
+            background: "transparent",
+            color: "rgba(255,255,255,0.68)",
+            fontSize: 18,
+            lineHeight: "24px",
+            cursor: "pointer",
+          }}
+        >
+          ×
+        </button>
       </div>
 
-      {/* 源图原始提示词（可鼠标选中复制） */}
+      {/* 编号属于槽位；拖动时交换两个槽位里的图片，@图片N 文本保持不变。 */}
+      <div
+        style={{
+          margin: "2px 6px 6px",
+          padding: "7px 8px 6px",
+          borderRadius: 7,
+          background: "rgba(167,139,250,0.07)",
+          border: "1px dashed rgba(167,139,250,0.34)",
+        }}
+      >
+        <div style={{ display: "flex", gap: 8, alignItems: "flex-start", flexWrap: "wrap" }}>
+          {refNodes.map((node, index) => {
+            const isBase = index === 0;
+            return (
+              <div
+                key={node.id}
+                data-edit-reference-id={node.id}
+                onPointerDown={(e) => {
+                  if (e.button !== 0 || (e.target as HTMLElement).closest("button")) return;
+                  e.stopPropagation();
+                  e.preventDefault();
+                  e.currentTarget.setPointerCapture(e.pointerId);
+                  referenceDragRef.current = {
+                    pointerId: e.pointerId,
+                    refId: node.id,
+                    order: refNodes.map((ref) => ref.id),
+                  };
+                  setDraggingRefId(node.id);
+                  setDragGhost({ imageUrl: node.image_url ?? "", x: e.clientX, y: e.clientY });
+                }}
+                onPointerMove={(e) => {
+                  const drag = referenceDragRef.current;
+                  if (!drag || drag.pointerId !== e.pointerId) return;
+                  e.preventDefault();
+                  setDragGhost((current) => current ? { ...current, x: e.clientX, y: e.clientY } : current);
+                  const hit = document
+                    .elementFromPoint(e.clientX, e.clientY)
+                    ?.closest<HTMLElement>("[data-edit-reference-id]");
+                  const hitId = hit?.dataset.editReferenceId;
+                  if (!hitId || hitId === drag.refId) return;
+                  const fromIndex = drag.order.indexOf(drag.refId);
+                  const toIndex = drag.order.indexOf(hitId);
+                  if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) return;
+                  const nextOrder = swapReferences(drag.order, fromIndex, toIndex);
+                  drag.order = nextOrder;
+                  onRefIdsChange(nextOrder, true);
+                }}
+                onPointerUp={finishReferenceDrag}
+                onPointerCancel={finishReferenceDrag}
+                title="拖动与另一张参考图交换"
+                style={{
+                  position: "relative",
+                  width: 42,
+                  paddingBottom: 11,
+                  touchAction: "none",
+                  cursor: draggingRefId === node.id ? "grabbing" : "grab",
+                  opacity: draggingRefId === node.id ? 0.28 : 1,
+                  userSelect: "none",
+                }}
+              >
+                <img
+                  src={node.image_url}
+                  alt={node.content || `图片${index + 1}`}
+                  draggable={false}
+                  style={{
+                    width: 42,
+                    height: 42,
+                    display: "block",
+                    objectFit: "cover",
+                    borderRadius: 7,
+                    border: isBase
+                      ? "1.5px solid rgba(196,181,253,0.95)"
+                      : "1px solid rgba(167,139,250,0.62)",
+                  }}
+                />
+                <span
+                  style={{
+                    position: "absolute",
+                    left: -3,
+                    right: -3,
+                    bottom: -2,
+                    color: isBase ? "#c4b5fd" : "rgba(255,255,255,0.66)",
+                    fontSize: 9,
+                    lineHeight: "11px",
+                    textAlign: "center",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  图片{index + 1}
+                </span>
+                {!isBase && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onRefIdsChange(refNodes.filter((ref) => ref.id !== node.id).map((ref) => ref.id));
+                    }}
+                    onPointerDown={(e) => e.stopPropagation()}
+                    title="移除此参考图"
+                    style={{
+                      position: "absolute",
+                      top: -6,
+                      right: -6,
+                      width: 18,
+                      height: 18,
+                      padding: 0,
+                      border: "none",
+                      borderRadius: "50%",
+                      background: "#f87171",
+                      color: "white",
+                      fontSize: 11,
+                      fontWeight: 700,
+                      lineHeight: "18px",
+                      cursor: "pointer",
+                    }}
+                  >
+                    ×
+                  </button>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* 源图原始提示词：默认显示摘要，需要时再展开全文。 */}
       {nodeContent && nodeContent !== "本地图片" && (
         <div
           style={{
-            padding: "8px 14px",
-            fontSize: 12,
-            color: "#c7d2fe",
-            background: "rgba(167,139,250,0.08)",
+            padding: "8px 12px 7px",
+            color: "rgba(255,255,255,0.92)",
+            background: "rgba(10,10,16,0.48)",
             borderRadius: 6,
-            margin: "0 6px 6px",
-            lineHeight: 1.5,
-            maxHeight: 72,
-            overflowY: "auto",
-            wordBreak: "break-word",
-            userSelect: "text",
+            margin: "0 6px 2px",
+            border: "1px solid rgba(255,255,255,0.07)",
           }}
         >
-          <div style={{ fontSize: 10, color: "rgba(255,255,255,0.4)", marginBottom: 4 }}>
-            原始提示词
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              marginBottom: 4,
+            }}
+          >
+            <span style={{ fontSize: 10, fontWeight: 650, color: "rgba(255,255,255,0.42)" }}>
+              PROMPT
+            </span>
+            <button
+              type="button"
+              aria-label="复制原始提示词"
+              title={sourcePromptCopied ? "已复制" : "复制原始提示词"}
+              onClick={() => {
+                void navigator.clipboard.writeText(nodeContent).then(() => {
+                  setSourcePromptCopied(true);
+                  window.setTimeout(() => setSourcePromptCopied(false), 1200);
+                });
+              }}
+              style={{
+                width: 24,
+                height: 24,
+                padding: 0,
+                border: "none",
+                borderRadius: 5,
+                background: "transparent",
+                color: sourcePromptCopied ? "#c4b5fd" : "rgba(255,255,255,0.6)",
+                cursor: "pointer",
+                position: "relative",
+              }}
+            >
+              <span
+                aria-hidden="true"
+                style={{
+                  position: "absolute",
+                  width: 10,
+                  height: 10,
+                  left: 6,
+                  top: 6,
+                  border: "1.4px solid currentColor",
+                  borderRadius: 3,
+                }}
+              />
+              <span
+                aria-hidden="true"
+                style={{
+                  position: "absolute",
+                  width: 10,
+                  height: 10,
+                  left: 9,
+                  top: 9,
+                  border: "1.4px solid currentColor",
+                  borderRadius: 3,
+                  background: "rgba(10,10,16,0.9)",
+                }}
+              />
+            </button>
           </div>
-          {nodeContent}
+          <div
+            style={{
+              fontSize: 12,
+              lineHeight: 1.55,
+              wordBreak: "break-word",
+              userSelect: "text",
+              ...(sourcePromptExpanded
+                ? { maxHeight: 180, overflowY: "auto" as const }
+                : {
+                    display: "-webkit-box",
+                    WebkitBoxOrient: "vertical" as const,
+                    WebkitLineClamp: 3,
+                    overflow: "hidden",
+                  }),
+            }}
+          >
+            {nodeContent}
+          </div>
+          <button
+            type="button"
+            onClick={() => setSourcePromptExpanded((current) => !current)}
+            style={{
+              display: "block",
+              margin: "4px 0 0 auto",
+              padding: 0,
+              border: "none",
+              background: "transparent",
+              color: "rgba(255,255,255,0.64)",
+              fontSize: 11,
+              fontWeight: 650,
+              cursor: "pointer",
+            }}
+          >
+            {sourcePromptExpanded ? "See Less" : "See More"}
+          </button>
         </div>
       )}
 
       <div
         style={{
-          padding: "8px 10px",
+          padding: "2px 10px 8px",
           flex: 1,
           minHeight: 0,
-          overflow: "hidden",
+          overflowY: "auto",
+          overflowX: "hidden",
           display: "flex",
           flexDirection: "column",
         }}
       >
-        <textarea
-          autoFocus
+        <ImageMentionPrompt
           value={prompt}
-          onChange={(e) => onPromptChange(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey && canExecute) {
-              e.preventDefault();
-              onExecute();
-            }
-            if (e.key === "Escape") {
-              e.preventDefault();
-              onClose();
-            }
+          refNodes={refNodes}
+          placeholder="编辑描述（必填），输入 @ 可引用图片"
+          onChange={onPromptChange}
+          onGenerate={() => {
+            if (canExecute) onExecute();
           }}
-          placeholder="编辑描述（必填），如：把背景改成星空"
-          rows={3}
-          style={{
-            width: "100%",
-            boxSizing: "border-box",
-            padding: "8px 10px",
-            background: "rgba(255,255,255,0.08)",
-            border: "1px solid rgba(167,139,250,0.5)",
-            borderRadius: 6,
-            color: "white",
-            fontSize: 13,
-            outline: "none",
-            resize: "none",
-            fontFamily: "inherit",
-            lineHeight: 1.5,
-            // 拉伸过高度后（panelH 固定），输入框弹性填满剩余空间；
-            // 空间不足时允许收缩到 0，保证底部按钮永远在边框内（minHeight 60 会顶住收缩导致按钮溢出）
-            flex: panelH ? "1 1 auto" : undefined,
-            minHeight: panelH ? 0 : 60,
-          }}
+          onEscape={onClose}
+          resizable
+          initialHeight={112}
         />
 
         {/* 尺寸选择：宽高比 + 分辨率 */}
@@ -3397,6 +3862,28 @@ const EditPanel = ({
           </button>
         </div>
       </div>
+
+      {dragGhost && createPortal(
+        <div
+          style={{
+            position: "fixed",
+            left: dragGhost.x + 12,
+            top: dragGhost.y + 12,
+            width: 54,
+            height: 54,
+            zIndex: 2000,
+            pointerEvents: "none",
+            borderRadius: 9,
+            overflow: "hidden",
+            border: "2px solid #c4b5fd",
+            boxShadow: "0 10px 28px rgba(0,0,0,0.5)",
+            transform: "rotate(2deg)",
+          }}
+        >
+          <img src={dragGhost.imageUrl} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+        </div>,
+        document.body,
+      )}
 
       {/* 四边拉伸热区：跨边框的隐形热区，仅光标形状反馈（与容器一致）；
           两端各让出 32px 避开右下角手柄 */}
@@ -3799,6 +4286,396 @@ function ContainerResizeHandle({
   return <div style={style} onMouseDown={(e) => onDown(e, dir)} />;
 }
 
+function ImageMentionPrompt({
+  value,
+  refNodes,
+  placeholder,
+  onChange,
+  onGenerate,
+  onEscape,
+  resizable = false,
+  initialHeight = 128,
+}: {
+  value: string;
+  refNodes: CanvasNode[];
+  placeholder: string;
+  onChange: (value: string) => void;
+  onGenerate: () => void;
+  onEscape?: () => void;
+  resizable?: boolean;
+  initialHeight?: number;
+}) {
+  const editorRef = useRef<HTMLDivElement>(null);
+  const renderedValueRef = useRef("");
+  const renderedRefsRef = useRef("");
+  const [mentionRange, setMentionRange] = useState<Range | null>(null);
+  const [mentionIndex, setMentionIndex] = useState(0);
+  const [editorHeight, setEditorHeight] = useState(initialHeight);
+  const promptResizeRef = useRef<{ pointerId: number; startY: number; startHeight: number } | null>(null);
+
+  const createMentionNode = useCallback((node: CanvasNode, index: number) => {
+    const mention = document.createElement("span");
+    mention.contentEditable = "false";
+    mention.dataset.imageMentionRef = node.id;
+    Object.assign(mention.style, {
+      display: "inline-flex",
+      alignItems: "center",
+      gap: "4px",
+      margin: "0 2px",
+      verticalAlign: "-5px",
+      whiteSpace: "nowrap",
+    });
+
+    const image = document.createElement("img");
+    image.src = node.image_url ?? "";
+    image.alt = "";
+    image.draggable = false;
+    Object.assign(image.style, {
+      width: "20px",
+      height: "20px",
+      objectFit: "cover",
+      borderRadius: "4px",
+      border: "1px solid rgba(196,181,253,0.58)",
+    });
+
+    const label = document.createElement("span");
+    label.textContent = `@图片${index + 1}`;
+    Object.assign(label.style, {
+      color: "#c4b5fd",
+      fontWeight: "650",
+    });
+    mention.append(image, label);
+    return mention;
+  }, []);
+
+  const readEditorValue = useCallback(() => {
+    const editor = editorRef.current;
+    if (!editor) return "";
+    let result = "";
+    const visit = (node: Node) => {
+      if (node.nodeType === Node.TEXT_NODE) {
+        result += node.textContent ?? "";
+        return;
+      }
+      if (!(node instanceof HTMLElement)) return;
+      const refId = node.dataset.imageMentionRef;
+      if (refId) {
+        const index = refNodes.findIndex((ref) => ref.id === refId);
+        if (index >= 0) result += `@图片${index + 1}`;
+        return;
+      }
+      if (node.tagName === "BR") {
+        result += "\n";
+        return;
+      }
+      node.childNodes.forEach(visit);
+    };
+    editor.childNodes.forEach(visit);
+    return result;
+  }, [refNodes]);
+
+  const emitChange = useCallback(() => {
+    const next = readEditorValue();
+    renderedValueRef.current = next;
+    onChange(next);
+  }, [onChange, readEditorValue]);
+
+  useLayoutEffect(() => {
+    const editor = editorRef.current;
+    const refSignature = refNodes.map((node) => node.id).join("|");
+    if (
+      !editor ||
+      (renderedValueRef.current === value && renderedRefsRef.current === refSignature)
+    ) {
+      return;
+    }
+    const fragment = document.createDocumentFragment();
+    let lastIndex = 0;
+    for (const match of value.matchAll(IMAGE_MENTION_RE)) {
+      const start = match.index ?? 0;
+      if (start > lastIndex) fragment.append(document.createTextNode(value.slice(lastIndex, start)));
+      const node = refNodes[Number(match[1]) - 1];
+      fragment.append(
+        node
+          ? createMentionNode(node, Number(match[1]) - 1)
+          : document.createTextNode(match[0]),
+      );
+      lastIndex = start + match[0].length;
+    }
+    if (lastIndex < value.length) fragment.append(document.createTextNode(value.slice(lastIndex)));
+    editor.replaceChildren(fragment);
+    renderedValueRef.current = value;
+    renderedRefsRef.current = refSignature;
+  }, [createMentionNode, refNodes, value]);
+
+  const detectTypedMention = () => {
+    const editor = editorRef.current;
+    const selection = window.getSelection();
+    if (!editor || !selection?.rangeCount) {
+      setMentionRange(null);
+      return;
+    }
+    const caret = selection.getRangeAt(0);
+    const node = caret.startContainer;
+    if (node.nodeType !== Node.TEXT_NODE) {
+      setMentionRange(null);
+      return;
+    }
+    const before = (node.textContent ?? "").slice(0, caret.startOffset);
+    const match = before.match(/@[^@\s]*$/);
+    if (!match || refNodes.length === 0) {
+      setMentionRange(null);
+      return;
+    }
+    const range = document.createRange();
+    range.setStart(node, caret.startOffset - match[0].length);
+    range.setEnd(node, caret.startOffset);
+    setMentionRange(range);
+    setMentionIndex(0);
+  };
+
+  const insertMention = (index: number) => {
+    const editor = editorRef.current;
+    const node = refNodes[index];
+    if (!editor || !node) return;
+    const range = mentionRange ?? (() => {
+      const fallback = document.createRange();
+      fallback.selectNodeContents(editor);
+      fallback.collapse(false);
+      return fallback;
+    })();
+    range.deleteContents();
+    const mention = createMentionNode(node, index);
+    const spacer = document.createTextNode(" ");
+    range.insertNode(spacer);
+    range.insertNode(mention);
+    const selection = window.getSelection();
+    range.setStartAfter(spacer);
+    range.collapse(true);
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    setMentionRange(null);
+    emitChange();
+    editor.focus();
+  };
+
+  const insertPlainText = (text: string) => {
+    const editor = editorRef.current;
+    const selection = window.getSelection();
+    if (!editor || !selection?.rangeCount) return;
+    const range = selection.getRangeAt(0);
+    range.deleteContents();
+    const textNode = document.createTextNode(text);
+    range.insertNode(textNode);
+    range.setStartAfter(textNode);
+    range.collapse(true);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    emitChange();
+  };
+
+  const finishPromptResize = (e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = promptResizeRef.current;
+    if (!drag || drag.pointerId !== e.pointerId) return;
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+    promptResizeRef.current = null;
+  };
+
+  return (
+    <div
+      style={{
+        position: "relative",
+        flex: resizable ? "0 0 auto" : 1,
+        height: resizable ? editorHeight : undefined,
+        minHeight: resizable ? 96 : 128,
+        marginTop: resizable ? 4 : 9,
+      }}
+    >
+      <div
+        ref={editorRef}
+        contentEditable
+        autoFocus
+        suppressContentEditableWarning
+        role="textbox"
+        aria-multiline="true"
+        data-placeholder={placeholder}
+        onInput={() => {
+          emitChange();
+          detectTypedMention();
+        }}
+        onPaste={(e) => {
+          e.preventDefault();
+          insertPlainText(e.clipboardData.getData("text/plain"));
+        }}
+        onKeyDown={(e) => {
+          if (mentionRange && refNodes.length > 0) {
+            if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+              e.preventDefault();
+              const step = e.key === "ArrowDown" ? 1 : -1;
+              setMentionIndex((current) => (current + step + refNodes.length) % refNodes.length);
+              return;
+            }
+            if (e.key === "Enter" || e.key === "Tab") {
+              e.preventDefault();
+              insertMention(mentionIndex);
+              return;
+            }
+            if (e.key === "Escape") {
+              e.preventDefault();
+              setMentionRange(null);
+              return;
+            }
+          }
+          if (e.key === "Enter" && e.shiftKey) {
+            e.preventDefault();
+            insertPlainText("\n");
+            return;
+          }
+          if (e.key === "Enter" && !e.shiftKey) {
+            e.preventDefault();
+            onGenerate();
+            return;
+          }
+          if (e.key === "Escape" && onEscape) {
+            e.preventDefault();
+            onEscape();
+          }
+        }}
+        onBlur={() => window.setTimeout(() => setMentionRange(null), 80)}
+        style={{
+          width: "100%",
+          height: "100%",
+          minHeight: resizable ? 0 : 128,
+          boxSizing: "border-box",
+          padding: resizable ? "8px 22px 16px 10px" : "8px 10px",
+          background: "rgba(0,0,0,0.25)",
+          border: "1px solid rgba(167,139,250,0.5)",
+          borderRadius: 6,
+          color: "white",
+          fontSize: 13,
+          lineHeight: 1.55,
+          outline: "none",
+          fontFamily: "inherit",
+          whiteSpace: "pre-wrap",
+          overflowY: "auto",
+          wordBreak: "break-word",
+        }}
+      />
+      {resizable && (
+        <div
+          role="separator"
+          aria-label="调整提示词输入区高度"
+          aria-orientation="vertical"
+          title="拖动调整提示词输入区高度"
+          onPointerDown={(e) => {
+            if (e.button !== 0) return;
+            e.preventDefault();
+            e.stopPropagation();
+            e.currentTarget.setPointerCapture(e.pointerId);
+            promptResizeRef.current = {
+              pointerId: e.pointerId,
+              startY: e.clientY,
+              startHeight: editorHeight,
+            };
+          }}
+          onPointerMove={(e) => {
+            const drag = promptResizeRef.current;
+            if (!drag || drag.pointerId !== e.pointerId) return;
+            e.preventDefault();
+            setEditorHeight(Math.max(96, Math.min(520, drag.startHeight + e.clientY - drag.startY)));
+          }}
+          onPointerUp={finishPromptResize}
+          onPointerCancel={finishPromptResize}
+          style={{
+            position: "absolute",
+            right: 0,
+            bottom: 0,
+            width: 24,
+            height: 24,
+            cursor: "ns-resize",
+            touchAction: "none",
+            zIndex: 2,
+          }}
+        >
+          <svg width="24" height="24" viewBox="0 0 24 24" aria-hidden="true">
+            <line x1="20" y1="11" x2="11" y2="20" stroke="rgba(196,181,253,0.5)" strokeWidth="1.4" strokeLinecap="round" />
+            <line x1="20" y1="16" x2="16" y2="20" stroke="rgba(196,181,253,0.5)" strokeWidth="1.4" strokeLinecap="round" />
+          </svg>
+        </div>
+      )}
+      {!value && (
+        <span
+          style={{
+            position: "absolute",
+            left: 11,
+            top: 9,
+            color: "rgba(255,255,255,0.34)",
+            fontSize: 13,
+            pointerEvents: "none",
+          }}
+        >
+          {placeholder}
+        </span>
+      )}
+      {mentionRange && refNodes.length > 0 && (
+        <div
+          style={{
+            position: "absolute",
+            left: 8,
+            bottom: 30,
+            width: 190,
+            maxHeight: 148,
+            overflowY: "auto",
+            padding: 4,
+            borderRadius: 8,
+            background: "rgba(25,24,43,0.98)",
+            border: "1px solid rgba(167,139,250,0.5)",
+            boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
+            zIndex: 60,
+          }}
+        >
+          {refNodes.map((node, index) => (
+            <button
+              key={node.id}
+              type="button"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => insertMention(index)}
+              onMouseEnter={() => setMentionIndex(index)}
+              style={{
+                width: "100%",
+                display: "flex",
+                alignItems: "center",
+                gap: 7,
+                padding: "5px 7px",
+                border: "none",
+                borderRadius: 6,
+                background: mentionIndex === index ? "rgba(167,139,250,0.22)" : "transparent",
+                color: "rgba(255,255,255,0.9)",
+                fontSize: 11,
+                cursor: "pointer",
+                textAlign: "left",
+              }}
+            >
+              <img
+                src={node.image_url}
+                alt=""
+                draggable={false}
+                style={{ width: 26, height: 26, objectFit: "cover", borderRadius: 5 }}
+              />
+              <span style={{ color: "#c4b5fd", fontWeight: 650 }}>@图片{index + 1}</span>
+              <span style={{ marginLeft: "auto", color: "rgba(255,255,255,0.38)", fontSize: 9 }}>
+                {node.index != null ? `#${node.index}` : ""}
+              </span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /**
  * 待生成图片容器：位置锚定画布世界，视觉尺寸反向抵消相机 zoom。
  * 面板始终保持可读的屏幕尺度，同时仍能跟随画布平移、连线和拖动。
@@ -3816,7 +4693,6 @@ function PendingContainerNode({
   experiences,
   onHeaderMouseDown,
   onChange,
-  onRemoveRef,
   onRemove,
   onGenerate,
   onActivate,
@@ -3833,7 +4709,6 @@ function PendingContainerNode({
   experiences: ExperienceMeta[];
   onHeaderMouseDown: (e: React.MouseEvent) => void;
   onChange: (patch: Partial<PendingContainer>) => void;
-  onRemoveRef: (nodeId: string) => void;
   onRemove: () => void;
   onGenerate: () => void;
   onActivate: () => void;
@@ -3853,12 +4728,12 @@ function PendingContainerNode({
 
   // 与右侧编辑面板共用紧凑字号层级，避免浮层之间出现明显的视觉尺度差。
   const smallBtn = (active: boolean): React.CSSProperties => ({
-    padding: "6px 0",
+    padding: "5px 0",
     background: active ? "#a78bfa" : "rgba(255,255,255,0.08)",
     color: active ? "#1a1a2e" : "rgba(255,255,255,0.85)",
     border: "none",
-    borderRadius: 6,
-    fontSize: 12,
+    borderRadius: 5,
+    fontSize: 11,
     cursor: "pointer",
     fontWeight: active ? 600 : 400,
   });
@@ -3870,6 +4745,43 @@ function PendingContainerNode({
   // ===== 拉伸：边柄逐轴拉伸（重排不变形），角柄整体等比缩放 =====
   const [resizeDir, setResizeDir] = useState<string | null>(null);
   const resizeStartRef = useRef<{ mx: number; my: number; x: number; y: number; w: number; h: number } | null>(null);
+
+  // Pointer Events 同时覆盖鼠标和触屏。拖动过程中以本地快照连续换位，避免 React
+  // 状态异步更新导致快速跨过多个缩略图时顺序跳回。
+  const [draggingRefId, setDraggingRefId] = useState<string | null>(null);
+  const [dragGhost, setDragGhost] = useState<{ imageUrl: string; x: number; y: number } | null>(null);
+  const dragRef = useRef<{
+    pointerId: number;
+    refId: string;
+    order: string[];
+  } | null>(null);
+
+  const applyReferenceOrder = useCallback(
+    (oldOrder: string[], nextOrder: string[], oldPrompt: string, preserveSlotMentions = false) => {
+      const nextPrompt = preserveSlotMentions
+        ? oldPrompt
+        : remapImageMentions(oldPrompt, oldOrder, nextOrder);
+      const firstNode = nodes.find((node) => node.id === nextOrder[0]);
+      onChange({
+        refIds: nextOrder,
+        prompt: nextPrompt,
+        ...(firstNode ? { aspect: closestPresetAspectKey(firstNode.width, firstNode.height) } : {}),
+        error: undefined,
+      });
+      return nextPrompt;
+    },
+    [nodes, onChange],
+  );
+
+  const finishReferenceDrag = (e: React.PointerEvent<HTMLElement>) => {
+    if (!dragRef.current || dragRef.current.pointerId !== e.pointerId) return;
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+    dragRef.current = null;
+    setDraggingRefId(null);
+    setDragGhost(null);
+  };
 
   const onHandleDown = (e: React.MouseEvent, dir: string) => {
     if (e.button !== 0) return;
@@ -4038,24 +4950,92 @@ function PendingContainerNode({
 
       {/* 参考图缩略 */}
       {refNodes.length > 0 && (
-        <div style={{ display: "flex", gap: 7, marginTop: 6, flexWrap: "wrap" }}>
-          {refNodes.map((n) => (
-            <div key={n.id} style={{ position: "relative" }}>
+        <div style={{ display: "flex", gap: 8, marginTop: 6, flexWrap: "wrap", minHeight: 46 }}>
+          {refNodes.map((n, index) => (
+            <div
+              key={n.id}
+              data-reference-id={n.id}
+              onPointerDown={(e) => {
+                if (e.button !== 0 || (e.target as HTMLElement).closest("button")) return;
+                e.stopPropagation();
+                e.preventDefault();
+                e.currentTarget.setPointerCapture(e.pointerId);
+                dragRef.current = {
+                  pointerId: e.pointerId,
+                  refId: n.id,
+                  order: [...container.refIds],
+                };
+                setDraggingRefId(n.id);
+                setDragGhost({ imageUrl: n.image_url ?? "", x: e.clientX, y: e.clientY });
+              }}
+              onPointerMove={(e) => {
+                const drag = dragRef.current;
+                if (!drag || drag.pointerId !== e.pointerId) return;
+                e.preventDefault();
+                setDragGhost((current) =>
+                  current ? { ...current, x: e.clientX, y: e.clientY } : current,
+                );
+                const hit = document
+                  .elementFromPoint(e.clientX, e.clientY)
+                  ?.closest<HTMLElement>("[data-reference-id]");
+                const hitId = hit?.dataset.referenceId;
+                if (!hitId || hitId === drag.refId) return;
+                const fromIndex = drag.order.indexOf(drag.refId);
+                const toIndex = drag.order.indexOf(hitId);
+                if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) return;
+                const nextOrder = swapReferences(drag.order, fromIndex, toIndex);
+                applyReferenceOrder(drag.order, nextOrder, container.prompt, true);
+                drag.order = nextOrder;
+              }}
+              onPointerUp={finishReferenceDrag}
+              onPointerCancel={finishReferenceDrag}
+              style={{
+                position: "relative",
+                width: 40,
+                paddingBottom: 6,
+                touchAction: "none",
+                cursor: draggingRefId === n.id ? "grabbing" : "grab",
+                opacity: draggingRefId === n.id ? 0.3 : 1,
+                transition: "transform 120ms ease, opacity 120ms ease",
+                userSelect: "none",
+              }}
+              title="拖动与另一张参考图交换"
+            >
               <img
                 src={n.image_url}
                 alt={n.content || "ref"}
                 draggable={false}
                 style={{
-                  width: 36,
-                  height: 36,
+                  width: 40,
+                  height: 40,
                   objectFit: "cover",
                   borderRadius: 8,
-                  border: "1px solid rgba(167,139,250,0.6)",
+                  border: "1px solid rgba(167,139,250,0.75)",
+                  display: "block",
                 }}
               />
+              <span
+                style={{
+                  position: "absolute",
+                  left: 2,
+                  bottom: -5,
+                  right: 2,
+                  color: "rgba(255,255,255,0.7)",
+                  fontSize: 9,
+                  lineHeight: "11px",
+                  textAlign: "center",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                图片{index + 1}
+              </span>
               <button
-                onClick={() => onRemoveRef(n.id)}
-                onMouseDown={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  const nextOrder = container.refIds.filter((refId) => refId !== n.id);
+                  applyReferenceOrder(container.refIds, nextOrder, container.prompt);
+                }}
+                onPointerDown={(e) => e.stopPropagation()}
                 title="断开此参考图"
                 style={{
                   position: "absolute",
@@ -4091,6 +5071,28 @@ function PendingContainerNode({
               </button>
             </div>
           ))}
+          {dragGhost &&
+            createPortal(
+              <img
+                src={dragGhost.imageUrl}
+                alt=""
+                draggable={false}
+                style={{
+                  position: "fixed",
+                  left: dragGhost.x + 12,
+                  top: dragGhost.y + 12,
+                  width: 58,
+                  height: 58,
+                  objectFit: "cover",
+                  borderRadius: 10,
+                  border: "2px solid #a78bfa",
+                  boxShadow: "0 12px 30px rgba(0,0,0,0.55)",
+                  pointerEvents: "none",
+                  zIndex: 99999,
+                }}
+              />,
+              document.body,
+            )}
         </div>
       )}
 
@@ -4112,13 +5114,13 @@ function PendingContainerNode({
                 display: "inline-block",
                 width:
                   aspectRatio.w >= aspectRatio.h
-                    ? 26
-                    : Math.round((26 * aspectRatio.w) / aspectRatio.h),
+                    ? 20
+                    : Math.round((20 * aspectRatio.w) / aspectRatio.h),
                 height:
                   aspectRatio.w >= aspectRatio.h
-                    ? Math.round((26 * aspectRatio.h) / aspectRatio.w)
-                    : 26,
-                border: "1.5px solid #a78bfa",
+                    ? Math.round((20 * aspectRatio.h) / aspectRatio.w)
+                    : 20,
+                border: "1px solid #a78bfa",
                 borderRadius: 3,
                 background: "rgba(167,139,250,0.22)",
                 transition: "width 0.15s ease, height 0.15s ease",
@@ -4126,7 +5128,7 @@ function PendingContainerNode({
             />
             <span
               style={{
-                fontSize: 11,
+                fontSize: 10,
                 color: "rgba(255,255,255,0.7)",
                 fontVariantNumeric: "tabular-nums",
               }}
@@ -4162,39 +5164,18 @@ function PendingContainerNode({
       <StyleSelect experiences={experiences} value={container.experienceIds ?? []} onChange={(v) => onChange({ experienceIds: v.length ? v : undefined })} />
 
       {/* 描述 */}
-      <textarea
+      <ImageMentionPrompt
         value={container.prompt}
-        onChange={(e) => onChange({ prompt: e.target.value, error: undefined })}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" && !e.shiftKey) {
-            e.preventDefault();
-            onGenerate();
-          }
-        }}
+        refNodes={refNodes}
+        onChange={(prompt) => onChange({ prompt, error: undefined })}
+        onGenerate={onGenerate}
         placeholder={
           refNodes.length === 0
             ? "图片描述（必填）"
             : refNodes.length === 1
-              ? "变体描述，留空直接生成"
-              : "组合描述，留空自动融合"
+              ? "变体描述，输入 @ 可引用图片"
+              : "组合描述，输入 @ 可指定图片关系"
         }
-        style={{
-          width: "100%",
-          boxSizing: "border-box",
-          flex: 1,
-          minHeight: 128,
-          marginTop: 9,
-          padding: "8px 10px",
-          background: "rgba(0,0,0,0.25)",
-          border: "1px solid rgba(167,139,250,0.5)",
-          borderRadius: 6,
-          color: "white",
-          fontSize: 13,
-          lineHeight: 1.5,
-          outline: "none",
-          resize: "none",
-          fontFamily: "inherit",
-        }}
       />
 
       {container.error && (
@@ -4227,10 +5208,10 @@ function PendingContainerNode({
           <ContainerResizeHandle key={dir} dir={dir} thickness={handleT} onDown={onHandleDown} />
         ))}
 
-      {/* 生成中覆盖层：整个面板显示流式预览与进度；
-          zIndex 45 盖过关闭按钮(40)/拉伸柄(30)，拦截一切交互——生成中不可再改风格/比例/描述等 */}
+      {/* 生成中覆盖层：保留遮挡设置项，但允许拖动整个容器。 */}
       {isGenerating && (
         <div
+          onMouseDown={progress < 100 ? onHeaderMouseDown : undefined}
           style={{
             position: "absolute",
             inset: 0,
@@ -4246,6 +5227,8 @@ function PendingContainerNode({
             justifyContent: "center",
             gap: 8,
             overflow: "hidden",
+            cursor: progress < 100 ? "move" : "default",
+            userSelect: "none",
           }}
         >
           {/* 流式预览图（模糊→清晰渐进，贴合容器形状） */}
