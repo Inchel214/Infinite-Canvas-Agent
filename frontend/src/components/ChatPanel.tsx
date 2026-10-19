@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -13,7 +13,6 @@ import type { AgentStep, CanvasNode, CanvasState } from "../types/canvas";
 interface ChatEntry {
   role: "user" | "assistant";
   content: string;
-  refs?: ChatReference[]; // 本条用户消息携带的画布图片引用
   steps?: AgentStep[];
   plan?: string; // 执行计划（流式 plan 事件，展示为路线图卡片）
   reasoning?: string; // 深度思考过程（reasoning_content 流，与正文分离）
@@ -38,11 +37,10 @@ interface ChatPanelProps {
   // 面板宽度（受控，状态在 App：画布层的缩放指示器需据此避让）
   width: number;
   onWidthChange: (w: number) => void;
-  // 右键"添加到对话"引用的图片（App 从画布状态解析）
+  // 右键"添加到对话"引用的图片（App 从画布状态解析，作为待插入收件箱）
   refNodes: CanvasNode[];
   // 当前画布全部节点：用于恢复历史消息中已持久化的引用缩略图
   canvasNodes: CanvasNode[];
-  onRemoveRef: (nodeId: string) => void;
   onClearRefs: () => void;
   // Agent 操作画布后（生成/移动/删除节点）通知上层刷新画布状态
   onCanvasUpdate: (canvas: CanvasState) => void;
@@ -156,46 +154,146 @@ const mdComponents = {
 const MIN_PANEL_WIDTH = 360;
 const MAX_PANEL_WIDTH = 720;
 
-const REF_LINE_RE = /^\[引用图片\s+(\S+).*?\(node_id=([^)]+)\)\]$/;
+// 引用标记：与后端 Agent/历史持久化契约保持一致。行内出现（位置即语义），可位于文本任意处
+const REF_INLINE_RE = /\[引用图片\s+(\S+)[\s\S]*?\(node_id=([^)]+)\)\]/g;
 
-function snapshotRefs(nodes: CanvasNode[]): ChatReference[] {
-  return nodes.map((n) => ({
-    id: n.id,
-    label: n.index != null ? `#${n.index}` : "图",
-    content: n.content,
-    imageUrl: n.image_url,
-  }));
+// 用户消息展示段落：文本与图片引用芯片交替，气泡按原位置渲染
+type DisplaySegment =
+  | { type: "text"; text: string }
+  | { type: "image"; ref: ChatReference };
+
+/**
+ * 把含行内引用标记的用户消息解析成展示段落。
+ * 节点已被删除时回退到标记里的持久化标签（无缩略图）。
+ */
+function parseMessageSegments(
+  content: string,
+  nodeById: Map<string, CanvasNode>
+): DisplaySegment[] {
+  const segments: DisplaySegment[] = [];
+  let last = 0;
+  for (const m of content.matchAll(REF_INLINE_RE)) {
+    if (m.index > last) segments.push({ type: "text", text: content.slice(last, m.index) });
+    const [, persistedLabel, nodeId] = m;
+    const node = nodeById.get(nodeId);
+    segments.push({
+      type: "image",
+      ref: {
+        id: nodeId,
+        label: node?.index != null ? `#${node.index}` : persistedLabel,
+        content: node?.content,
+        imageUrl: node?.image_url,
+      },
+    });
+    last = m.index + m[0].length;
+  }
+  if (last < content.length) segments.push({ type: "text", text: content.slice(last) });
+  // 压缩夹在芯片之间或贴边的纯空白文本段（旧格式标记逐行堆叠会残留 "\n" 段）
+  return segments.filter((seg, i) => {
+    if (seg.type !== "text" || seg.text.trim() !== "") return true;
+    const prev = segments[i - 1];
+    const next = segments[i + 1];
+    if (!prev || !next) return false;
+    return !(prev.type === "image" && next.type === "image");
+  });
+}
+
+// 芯片 → 发送给 Agent 的标记文本（格式与旧版逐行前置完全一致，仅位置改为行内）
+function chipMarker(dataset: DOMStringMap): string {
+  const label = dataset.label || "图";
+  const desc = dataset.content ? `「${dataset.content.slice(0, 60)}」` : "";
+  return `[引用图片 ${label} ${desc}(node_id=${dataset.nodeId})]`;
 }
 
 /**
- * 后端为了给 Agent 定位节点，会把引用作为用户消息开头的标记行持久化。
- * 加载历史时把这些行还原成消息元数据，避免技术标记出现在气泡里。
+ * 序列化编辑器内容为纯文本：文本原样保留，引用芯片在原位置展开为标记。
+ * 兼容浏览器产生的 <br> 与 <div>/<p> 块级换行。
  */
-function parsePersistedUserMessage(
-  content: string,
-  nodeById: Map<string, CanvasNode>
-): { content: string; refs?: ChatReference[] } {
-  const lines = content.split("\n");
-  const refs: ChatReference[] = [];
-  let firstContentLine = 0;
-
-  for (; firstContentLine < lines.length; firstContentLine++) {
-    const match = lines[firstContentLine].match(REF_LINE_RE);
-    if (!match) break;
-    const [, persistedLabel, nodeId] = match;
-    const node = nodeById.get(nodeId);
-    refs.push({
-      id: nodeId,
-      label: node?.index != null ? `#${node.index}` : persistedLabel,
-      content: node?.content,
-      imageUrl: node?.image_url,
-    });
-  }
-
-  return {
-    content: lines.slice(firstContentLine).join("\n"),
-    refs: refs.length > 0 ? refs : undefined,
+function serializeEditor(root: HTMLElement): string {
+  let out = "";
+  const walk = (node: Node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      out += node.textContent || "";
+      return;
+    }
+    if (!(node instanceof HTMLElement)) return;
+    if (node.dataset.nodeId) {
+      out += chipMarker(node.dataset);
+      return;
+    }
+    if (node.tagName === "BR") {
+      out += "\n";
+      return;
+    }
+    const isBlock = node.tagName === "DIV" || node.tagName === "P";
+    if (isBlock && out && !out.endsWith("\n")) out += "\n";
+    node.childNodes.forEach(walk);
+    if (isBlock && !out.endsWith("\n")) out += "\n";
   };
+  root.childNodes.forEach(walk);
+  return out;
+}
+
+// 构建输入框内的引用芯片（DOM 直建，脱离 React 渲染，避免 contenteditable 光标问题）
+function buildRefChip(node: CanvasNode): HTMLElement {
+  const label = node.index != null ? `#${node.index}` : node.id.slice(0, 8);
+  const chip = document.createElement("span");
+  chip.className = "ref-chip";
+  chip.contentEditable = "false"; // 作为原子单位参与编辑：Backspace 整体删除
+  chip.dataset.nodeId = node.id;
+  chip.dataset.label = label;
+  if (node.content) chip.dataset.content = node.content;
+  chip.title = node.content || "引用图片";
+  if (node.image_url) {
+    const img = document.createElement("img");
+    img.src = node.image_url;
+    img.alt = label;
+    chip.appendChild(img);
+  }
+  const text = document.createElement("span");
+  text.textContent = label;
+  chip.appendChild(text);
+  const remove = document.createElement("span");
+  remove.className = "ref-chip-remove";
+  remove.textContent = "✕";
+  remove.title = "移除引用";
+  chip.appendChild(remove);
+  return chip;
+}
+
+// 在光标处插入节点（光标不在编辑器内时追加到末尾），插入后光标落到节点之后
+function insertAtCursor(root: HTMLElement, el: HTMLElement) {
+  root.focus();
+  const sel = window.getSelection();
+  let range: Range | null = sel && sel.rangeCount > 0 ? sel.getRangeAt(0) : null;
+  if (!range || !root.contains(range.commonAncestorContainer)) {
+    range = document.createRange();
+    range.selectNodeContents(root);
+    range.collapse(false);
+  }
+  range.deleteContents();
+  range.insertNode(el);
+  range.setStartAfter(el);
+  range.collapse(true);
+  sel?.removeAllRanges();
+  sel?.addRange(range);
+}
+
+// 粘贴纯文本：execCommand 虽已废弃，但能并入 contenteditable 原生撤销栈，浏览器支持最好
+function insertTextAtCursor(root: HTMLElement, text: string) {
+  root.focus();
+  if (!document.execCommand("insertText", false, text)) {
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0 || !root.contains(sel.getRangeAt(0).commonAncestorContainer)) {
+      return;
+    }
+    const range = sel.getRangeAt(0);
+    range.deleteContents();
+    range.insertNode(document.createTextNode(text));
+    range.collapse(false);
+    sel.removeAllRanges();
+    sel.addRange(range);
+  }
 }
 
 export function ChatPanel({
@@ -206,29 +304,58 @@ export function ChatPanel({
   onWidthChange,
   refNodes,
   canvasNodes,
-  onRemoveRef,
   onClearRefs,
   onCanvasUpdate,
 }: ChatPanelProps) {
   const [entries, setEntries] = useState<ChatEntry[]>([]);
-  const [input, setInput] = useState("");
+  // 输入区是否有内容（文本或引用芯片）：驱动发送按钮禁用态
+  const [hasContent, setHasContent] = useState(false);
   const [sending, setSending] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
   const [resizing, setResizing] = useState(false);
   const [hoverHandle, setHoverHandle] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const editorRef = useRef<HTMLDivElement>(null);
   const resizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
-  const canvasNodesRef = useRef(canvasNodes);
 
-  useEffect(() => {
-    canvasNodesRef.current = canvasNodes;
-  }, [canvasNodes]);
+  // 渲染期解析引用标记（含历史消息）：节点可能后被删除，查找失败回退到持久化标签
+  const nodeById = useMemo(
+    () => new Map(canvasNodes.map((n) => [n.id, n])),
+    [canvasNodes]
+  );
 
-  // 引用变化（右键"添加到对话"）时聚焦输入框，引导用户直接下指令
+  // 输入事件后同步空态/有内容状态；浏览器会在清空的 contenteditable 里留 <br>，归一化为空让 :empty 占位符生效
+  const syncEditorState = () => {
+    const editor = editorRef.current;
+    if (!editor) return;
+    if (!editor.textContent?.trim() && !editor.querySelector("[data-node-id]")) {
+      editor.innerHTML = "";
+      setHasContent(false);
+    } else {
+      setHasContent(true);
+    }
+  };
+
+  // 消费 App 侧"添加到对话"收件箱：引用以芯片形式插入光标处（位置即语义），随后清空收件箱
   useEffect(() => {
-    if (refNodes.length > 0 && open) inputRef.current?.focus();
-  }, [refNodes.length, open]);
+    if (refNodes.length === 0 || !open) return;
+    const editor = editorRef.current;
+    if (!editor) return;
+    const fresh = refNodes.filter((n) => !editor.querySelector(`[data-node-id="${n.id}"]`));
+    fresh.forEach((n) => insertAtCursor(editor, buildRefChip(n)));
+    if (fresh.length > 0) setHasContent(true);
+    onClearRefs();
+  }, [refNodes, open, onClearRefs]);
+
+  // 画布节点被删除时同步移除编辑器里的失效芯片，避免发出不存在的引用
+  useEffect(() => {
+    const editor = editorRef.current;
+    if (!editor || canvasNodes.length === 0) return;
+    editor.querySelectorAll("[data-node-id]").forEach((el) => {
+      if (!nodeById.has((el as HTMLElement).dataset.nodeId || "")) el.remove();
+    });
+    syncEditorState();
+  }, [nodeById]);
 
   // 左边缘拖拽拉伸：往左拖变宽，往右拖变窄，clamp 到 [MIN, MAX]
   const startResize = (e: React.MouseEvent) => {
@@ -258,24 +385,18 @@ export function ChatPanel({
     };
   }, [resizing]);
 
-  // 挂载时加载该画布的持久化对话历史（组件按 canvasId 重挂载，天然隔离）
+  // 挂载时加载该画布的持久化对话历史（组件按 canvasId 重挂载，天然隔离）。
+  // 历史里的行内引用标记在渲染气泡时还原成芯片（见 renderUserContent）
   useEffect(() => {
     if (!canvasId) return;
-    const nodeById = new Map(canvasNodesRef.current.map((node) => [node.id, node]));
     getChatHistory(canvasId)
       .then((messages) => {
         setEntries(
-          messages.map((m) => {
-            const restored =
-              m.role === "user"
-                ? parsePersistedUserMessage(m.content, nodeById)
-                : { content: m.content };
-            return {
-              role: m.role,
-              ...restored,
-              timestamp: 0, // 历史不展示时间戳
-            };
-          })
+          messages.map((m) => ({
+            role: m.role,
+            content: m.content,
+            timestamp: 0, // 历史不展示时间戳
+          }))
         );
       })
       .catch(() => {
@@ -308,35 +429,42 @@ export function ChatPanel({
       // 清空失败不阻断本地清空展示
     }
     setEntries([]);
-    setInput("");
+    const editor = editorRef.current;
+    if (editor) editor.innerHTML = "";
+    setHasContent(false);
     setConfirmClear(false);
   };
 
+  // 用户气泡：按行内标记把引用还原成芯片，与发送时的输入版式一致
+  const renderUserContent = (content: string) =>
+    parseMessageSegments(content, nodeById).map((seg, i) =>
+      seg.type === "text" ? (
+        <span key={i}>{seg.text}</span>
+      ) : (
+        <span key={i} className="msg-ref-chip" title={seg.ref.content || "引用图片"}>
+          {seg.ref.imageUrl && <img src={seg.ref.imageUrl} alt={seg.ref.label} />}
+          <span>{seg.ref.label}</span>
+        </span>
+      )
+    );
+
   const handleSend = async () => {
-    const text = input.trim();
-    if (!text || !canvasId || sending) return;
-    // 引用块拼进发给 Agent 的 prompt（本地气泡仍显示原文）：
-    // Agent 侧快照与 system prompt 均支持按 #N 定位，自然语言即可关联图片
-    const refBlock =
-      refNodes.length > 0
-        ? refNodes
-            .map((n) => {
-              const label = n.index != null ? `#${n.index}` : n.id.slice(0, 8);
-              const desc = n.content ? `「${n.content.slice(0, 60)}」` : "";
-              return `[引用图片 ${label} ${desc}(node_id=${n.id})]`;
-            })
-            .join("\n") + "\n"
-        : "";
-    const messageRefs = snapshotRefs(refNodes);
-    setInput("");
-    // 引用在发送时就归属到这条消息，不再停留在输入区等待 Agent 完成。
+    const editor = editorRef.current;
+    if (!editor || !canvasId || sending) return;
+    // 序列化编辑器：文本原样保留，引用芯片在原位置展开为 [引用图片 ...] 标记。
+    // 本地气泡与历史持久化共用这份文本，渲染时再解析回芯片
+    const message = serializeEditor(editor).trim();
+    if (!message) return;
+    editor.innerHTML = "";
+    setHasContent(false);
+    // 引用已随消息序列化，清空 App 侧收件箱避免残留
     onClearRefs();
     setSending(true);
     const ts = Date.now();
     // 立刻挂一条空的 assistant 条目作为"直播位"，流式事件逐步填充它
     setEntries((prev) => [
       ...prev,
-      { role: "user", content: text, refs: messageRefs, timestamp: ts },
+      { role: "user", content: message, timestamp: ts },
       { role: "assistant", content: "", steps: [], timestamp: ts },
     ]);
 
@@ -353,7 +481,7 @@ export function ChatPanel({
     };
 
     try {
-      await chatWithAgentStream(canvasId, refBlock + text, (evt) => {
+      await chatWithAgentStream(canvasId, message, (evt) => {
         if (evt.type === "plan_delta" && evt.content) {
           // 计划逐字流出（打字机），追加渲染
           updateLive((e) => ({ ...e, plan: (e.plan || "") + evt.content }));
@@ -592,7 +720,7 @@ export function ChatPanel({
 
         {entries.map((entry, i) =>
           entry.role === "user" ? (
-            /* 用户消息：右对齐气泡 */
+            /* 用户消息：右对齐气泡（引用以行内芯片还原在原文位置） */
             <div
               key={i}
               style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 5 }}
@@ -610,46 +738,8 @@ export function ChatPanel({
                   wordBreak: "break-word",
                 }}
               >
-                {entry.content}
+                {renderUserContent(entry.content)}
               </div>
-              {entry.refs && entry.refs.length > 0 && (
-                <div
-                  style={{
-                    display: "flex",
-                    justifyContent: "flex-end",
-                    gap: 6,
-                    flexWrap: "wrap",
-                    maxWidth: "86%",
-                  }}
-                >
-                  {entry.refs.map((ref) => (
-                    <div
-                      key={ref.id}
-                      title={ref.content || "引用图片"}
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 6,
-                        background: "rgba(99,102,241,0.14)",
-                        border: "1px solid rgba(99,102,241,0.45)",
-                        borderRadius: 8,
-                        padding: "3px 7px 3px 4px",
-                      }}
-                    >
-                      {ref.imageUrl && (
-                        <img
-                          src={ref.imageUrl}
-                          alt={ref.content || "引用图"}
-                          style={{ width: 26, height: 26, objectFit: "cover", borderRadius: 4 }}
-                        />
-                      )}
-                      <span style={{ color: "#c7d2fe", fontSize: 12, fontWeight: 600 }}>
-                        {ref.label}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              )}
             </div>
           ) : (
             /* Agent 回复：执行计划卡片 + 左对齐气泡 + 工具调用过程 */
@@ -849,63 +939,7 @@ export function ChatPanel({
         )}
       </div>
 
-      {/* 引用图片（右键"添加到对话"）：缩略图 chips，发送时随指令注入 Agent 上下文 */}
-      {refNodes.length > 0 && (
-        <div
-          style={{
-            borderTop: "1px solid rgba(255,255,255,0.08)",
-            padding: "8px 10px 4px",
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-            flexWrap: "wrap",
-          }}
-        >
-          <span style={{ color: "#888", fontSize: 11, flexShrink: 0 }}>引用</span>
-          {refNodes.map((n) => (
-            <div
-              key={n.id}
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 6,
-                background: "rgba(99,102,241,0.18)",
-                border: "1px solid rgba(99,102,241,0.5)",
-                borderRadius: 8,
-                padding: "3px 6px 3px 4px",
-                maxWidth: 180,
-              }}
-              title={n.content || "本地图片"}
-            >
-              {n.image_url && (
-                <img
-                  src={n.image_url}
-                  alt={n.content || "引用图"}
-                  style={{ width: 26, height: 26, objectFit: "cover", borderRadius: 4 }}
-                />
-              )}
-              <span style={{ color: "#c7d2fe", fontSize: 12, fontWeight: 600, flexShrink: 0 }}>
-                {n.index != null ? `#${n.index}` : "图"}
-              </span>
-              <span
-                onClick={() => onRemoveRef(n.id)}
-                style={{ color: "#888", fontSize: 12, cursor: "pointer", userSelect: "none", flexShrink: 0 }}
-                title="移除引用"
-              >
-                ✕
-              </span>
-            </div>
-          ))}
-          <span
-            onClick={onClearRefs}
-            style={{ color: "#666", fontSize: 11, cursor: "pointer", userSelect: "none", marginLeft: "auto", flexShrink: 0 }}
-          >
-            清空
-          </span>
-        </div>
-      )}
-
-      {/* 输入区 */}
+      {/* 输入区：contenteditable 富文本，引用图片以行内芯片混排在文字中 */}
       <div
         style={{
           borderTop: "1px solid rgba(255,255,255,0.08)",
@@ -915,22 +949,68 @@ export function ChatPanel({
           alignItems: "flex-end",
         }}
       >
-        <textarea
-          ref={inputRef}
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
+        <div
+          ref={editorRef}
+          className="chat-editor"
+          contentEditable={!!canvasId && !sending}
+          suppressContentEditableWarning
+          data-placeholder={
+            canvasId ? "输入指令，Enter 发送，Shift+Enter 换行" : "画布加载中..."
+          }
+          onInput={syncEditorState}
           onKeyDown={(e) => {
+            // 中文输入法组词期间的 Enter 是选词，不触发发送
+            if (e.nativeEvent.isComposing) return;
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
               handleSend();
+              return;
             }
-            // Shift+Enter 换行
+            // Shift+Enter 换行（浏览器原生行为）
+            // JS 放置的光标紧贴芯片时，浏览器原生 Backspace/Delete 常常不响应，
+            // 手动识别相邻芯片并整体删除
+            if (e.key === "Backspace" || e.key === "Delete") {
+              const editor = editorRef.current;
+              const sel = window.getSelection();
+              if (!editor || !sel || !sel.isCollapsed || sel.rangeCount === 0) return;
+              const { startContainer, startOffset } = sel.getRangeAt(0);
+              let candidate: Node | null = null;
+              if (startContainer.nodeType === Node.ELEMENT_NODE) {
+                candidate =
+                  e.key === "Backspace"
+                    ? startContainer.childNodes[startOffset - 1]
+                    : startContainer.childNodes[startOffset];
+              } else if (startContainer.nodeType === Node.TEXT_NODE) {
+                if (e.key === "Backspace" && startOffset === 0) {
+                  candidate = startContainer.previousSibling;
+                } else if (
+                  e.key === "Delete" &&
+                  startOffset === (startContainer.textContent?.length ?? 0)
+                ) {
+                  candidate = startContainer.nextSibling;
+                }
+              }
+              if (candidate instanceof HTMLElement && candidate.classList.contains("ref-chip")) {
+                e.preventDefault();
+                candidate.remove();
+                syncEditorState();
+              }
+            }
           }}
-          rows={2}
-          placeholder={
-            canvasId ? "输入指令，Enter 发送，Shift+Enter 换行" : "画布加载中..."
-          }
-          disabled={!canvasId || sending}
+          onPaste={(e) => {
+            // 只接受纯文本，避免粘贴进来的富文本破坏芯片结构
+            e.preventDefault();
+            const text = e.clipboardData.getData("text/plain");
+            if (text && editorRef.current) insertTextAtCursor(editorRef.current, text);
+          }}
+          onClick={(e) => {
+            // 事件委托处理芯片上的 ✕ 移除按钮
+            const removeBtn = (e.target as HTMLElement).closest(".ref-chip-remove");
+            if (removeBtn) {
+              removeBtn.closest(".ref-chip")?.remove();
+              syncEditorState();
+            }
+          }}
           style={{
             flex: 1,
             background: "rgba(255,255,255,0.06)",
@@ -939,10 +1019,17 @@ export function ChatPanel({
             color: "#eee",
             fontSize: 14,
             padding: "8px 10px",
-            resize: "none",
             outline: "none",
             fontFamily: "inherit",
-            lineHeight: 1.5,
+            // 固定行高 22px，芯片高 20px：所有行保持同一高度，不因芯片起伏
+            lineHeight: "22px",
+            minHeight: 60,
+            maxHeight: 126,
+            overflowY: "auto",
+            boxSizing: "border-box",
+            whiteSpace: "pre-wrap",
+            wordBreak: "break-word",
+            opacity: !canvasId || sending ? 0.55 : 1,
           }}
         />
         {sending ? (
@@ -966,15 +1053,15 @@ export function ChatPanel({
         ) : (
           <button
             onClick={handleSend}
-            disabled={!input.trim() || !canvasId}
+            disabled={!hasContent || !canvasId}
             style={{
-              background: !input.trim() || !canvasId ? "rgba(99,102,241,0.35)" : "rgba(99,102,241,0.95)",
+              background: !hasContent || !canvasId ? "rgba(99,102,241,0.35)" : "rgba(99,102,241,0.95)",
               border: "none",
               color: "#fff",
               borderRadius: 10,
               padding: "10px 16px",
               fontSize: 14,
-              cursor: !input.trim() || !canvasId ? "default" : "pointer",
+              cursor: !hasContent || !canvasId ? "default" : "pointer",
               flexShrink: 0,
             }}
           >
@@ -987,6 +1074,72 @@ export function ChatPanel({
         @keyframes chatblink {
           0%, 60%, 100% { opacity: 0.25; }
           30% { opacity: 1; }
+        }
+        /* 输入框占位符（contenteditable 无原生 placeholder） */
+        .chat-editor:empty::before {
+          content: attr(data-placeholder);
+          color: #777;
+          pointer-events: none;
+        }
+        /* 输入框内的引用芯片：高 20px ≤ 行高 22px，垂直居中，保证各行高度一致 */
+        .ref-chip {
+          display: inline-flex;
+          align-items: center;
+          gap: 4px;
+          box-sizing: border-box;
+          height: 20px;
+          padding: 0 3px 0 2px;
+          background: rgba(99,102,241,0.22);
+          border: 1px solid rgba(99,102,241,0.55);
+          border-radius: 6px;
+          margin: 0 2px;
+          vertical-align: middle;
+          font-size: 12px;
+          font-weight: 600;
+          line-height: 1;
+          color: #c7d2fe;
+          user-select: none;
+        }
+        .ref-chip img {
+          width: 16px;
+          height: 16px;
+          object-fit: cover;
+          border-radius: 3px;
+        }
+        .ref-chip-remove {
+          cursor: pointer;
+          color: #8f8fb0;
+          font-size: 11px;
+          padding: 2px 3px;
+          border-radius: 4px;
+          line-height: 1;
+        }
+        .ref-chip-remove:hover {
+          color: #fff;
+          background: rgba(248,113,113,0.85);
+        }
+        /* 用户气泡内的引用芯片（只读展示，无移除按钮） */
+        .msg-ref-chip {
+          display: inline-flex;
+          align-items: center;
+          gap: 4px;
+          box-sizing: border-box;
+          height: 20px;
+          padding: 0 6px 0 2px;
+          background: rgba(255,255,255,0.16);
+          border: 1px solid rgba(255,255,255,0.35);
+          border-radius: 6px;
+          margin: 0 2px;
+          vertical-align: middle;
+          font-size: 12px;
+          font-weight: 600;
+          line-height: 1;
+        }
+        .msg-ref-chip img {
+          width: 16px;
+          height: 16px;
+          object-fit: cover;
+          border-radius: 3px;
         }
       `}</style>
     </div>

@@ -478,8 +478,6 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   const [draggingNode, setDraggingNode] = useState<string | null>(null);
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
   const [hoveredNode, setHoveredNode] = useState<string | null>(null);
-  // 文本卡编辑模式：双击进入，失焦/Esc 退出
-  const [editingTextId, setEditingTextId] = useState<string | null>(null);
   // 本地位置覆盖（拖拽时即时更新，不等待 API）
   const [localOverrides, setLocalOverrides] = useState<Record<string, { x: number; y: number }>>({});
   // 多选整组拖拽：按下多选集合内的图时，记录所有选中节点的原始位置 + 鼠标世界坐标起点

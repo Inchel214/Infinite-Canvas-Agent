@@ -483,7 +483,6 @@ function App() {
             : []
         }
         canvasNodes={canvasState ? Object.values(canvasState.nodes) : []}
-        onRemoveRef={(nodeId) => setChatRefIds((prev) => prev.filter((id) => id !== nodeId))}
         onClearRefs={() => setChatRefIds([])}
         onCanvasUpdate={applyCanvasState}
       />
