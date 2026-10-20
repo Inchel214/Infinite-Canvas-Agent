@@ -18,8 +18,8 @@ export type PendingContainer = {
   id: string;
   x: number;            // 世界坐标锚点（左上角）
   y: number;
-  w: number;            // 屏幕像素宽：不随画布 zoom 改变
-  h: number;            // 屏幕像素高
+  w: number;            // 编辑态屏幕像素宽；生成后作为画布世界尺寸随视角缩放
+  h: number;            // 编辑态屏幕像素高；生成后作为画布世界尺寸随视角缩放
   aspect: string;
   resolution: string;
   prompt: string;
@@ -180,8 +180,8 @@ async function fetchImageBlob(url: string, attempts = 3): Promise<Blob> {
   throw lastError instanceof Error ? lastError : new Error("图片加载失败");
 }
 
-// 容器面板基准尺寸（屏幕像素）：面板保留画布锚点，但采用屏幕尺度渲染，
-// 因此缩放/平移时仍跟随画布位置，文字和控件不会随 zoom 变得过小或过大。
+// 容器面板基准尺寸：编辑态按屏幕像素渲染以保证可读；开始生成后同一数值
+// 转为画布世界尺寸，使整张卡片随相机 zoom 自然退远。
 const CONTAINER_BASE_W = 320; // 与右侧编辑面板接近的紧凑宽度，比例按钮仍保持一行
 const CONTAINER_BASE_H = 480; // 紧凑字号体系下的自然高度；基准须覆盖内容高度，避免拉伸柄错位
 
@@ -770,10 +770,10 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     [pan, zoom]
   );
 
-  // 待生成面板的锚点属于画布世界，但面板自身使用屏幕像素尺寸。
-  // 当锚点靠近视口边缘或右侧聊天栏时，仅钳制显示位置，不改写世界锚点；
-  // 用户拖动面板后才会把新的显示位置写回锚点。
-  const getContainerPlacement = useCallback((c: PendingContainer) => {
+  // 待生成面板的锚点属于画布世界；编辑态面板自身使用屏幕像素尺寸。
+  // 编辑态靠近视口边缘或右侧聊天栏时，仅钳制显示位置，不改写世界锚点；
+  // 一旦开始生成，容器已经“落入画布”，必须完全使用世界坐标，不再受视口安全区限制。
+  const getContainerPlacement = useCallback((c: PendingContainer, isCanvasCard = false) => {
     const pad = 8;
     const left = pad;
     const top = pad;
@@ -781,6 +781,16 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     const bottom = Math.max(top, viewport.height - 56); // 避让底部画布工具栏
     const desiredX = pan.x + c.x * zoom;
     const desiredY = pan.y + c.y * zoom;
+    if (isCanvasCard) {
+      return {
+        x: c.x,
+        y: c.y,
+        screenX: desiredX,
+        screenY: desiredY,
+        screenW: c.w * zoom,
+        screenH: c.h * zoom,
+      };
+    }
     const screenX = right - left >= c.w
       ? Math.min(Math.max(desiredX, left), right - c.w)
       : left;
@@ -798,7 +808,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   }, [pan, zoom, viewport, chatDockWidth]);
 
   // 创建待生成容器（居中于世界坐标 wx/wy 处，可带初始参考图）：
-  // 尺寸始终以屏幕像素保存，锚点则保存在画布世界坐标中。
+  // 尺寸以编辑态屏幕像素保存，锚点保存在画布世界坐标中；生成后尺寸按世界单位解释。
   const createContainer = useCallback((wx: number, wy: number, refId?: string) => {
     containerSeqRef.current += 1;
     const w = CONTAINER_BASE_W;
@@ -1195,7 +1205,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   }, [connecting, draggingContainer, draggingNode, isPanning, pan, zoom, dragOffset, screenToWorld]);
 
   const handleMouseUp = useCallback((e: React.MouseEvent) => {
-    // 连线结束：面板是屏幕尺度浮层，按其钳制后的真实屏幕矩形判定命中。
+    // 连线结束：编辑态按钳制后的屏幕矩形命中；生成态按世界卡片的实际屏幕投影命中。
     if (connecting) {
       const w = screenToWorld(e.clientX, e.clientY);
       const hitEditPanel = editPanel &&
@@ -1214,7 +1224,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         return;
       }
       const hit = containers.find((c) => {
-        const p = getContainerPlacement(c);
+        const isGenerating = generatingIds.has(c.id);
+        const p = getContainerPlacement(c, isGenerating);
         return (
           e.clientX >= p.screenX &&
           e.clientX <= p.screenX + p.screenW &&
@@ -1323,7 +1334,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       backgroundDownRef.current = null;
       setIsPanning(false);
     }
-  }, [marquee, draggingNode, localOverrides, onNodeMoved, onNodesMoved, isPanning, pan, zoom, nodes, connecting, containers, updateContainer, screenToWorld, draggingContainer, createContainer, menu, getContainerPlacement, editPanel, editPanelRect]);
+  }, [marquee, draggingNode, localOverrides, onNodeMoved, onNodesMoved, isPanning, pan, zoom, nodes, connecting, containers, generatingIds, updateContainer, screenToWorld, draggingContainer, createContainer, menu, getContainerPlacement, editPanel, editPanelRect]);
 
   // 图片节点拖拽开始（记录起点用于 click/drag 判定）
   const handleNodeMouseDown = useCallback((e: React.MouseEvent, node: CanvasNode) => {
@@ -1990,10 +2001,16 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
               })
             )}
 
-          {/* 容器的待生成参考连线（虚线），目标为容器世界矩形 */}
+          {/* 容器参考连线：编辑态指向固定屏幕尺寸面板；生成后随卡片一起落入画布尺度。 */}
           {containers.map((c) => {
-            const p = getContainerPlacement(c);
-            const tgtRect: BBox = { x: p.x, y: p.y, width: c.w / zoom, height: c.h / zoom };
+            const isGenerating = generatingIds.has(c.id);
+            const p = getContainerPlacement(c, isGenerating);
+            const tgtRect: BBox = {
+              x: p.x,
+              y: p.y,
+              width: isGenerating ? c.w : c.w / zoom,
+              height: isGenerating ? c.h : c.h / zoom,
+            };
             return c.refIds.map((rid) => {
               const src = nodes.find((n) => n.id === rid);
               if (!src) return null;
@@ -2084,9 +2101,10 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
           />
         ))}
 
-        {/* 待生成图片容器：保留世界锚点，同时反向抵消相机缩放，维持舒适的屏幕阅读尺寸。 */}
+        {/* 待生成图片容器：编辑时保持屏幕可读；生成后落入世界层并随画布视角一起缩放。 */}
         {containers.map((c) => {
-          const p = getContainerPlacement(c);
+          const isGenerating = generatingIds.has(c.id);
+          const p = getContainerPlacement(c, isGenerating);
           return (
             <PendingContainerNode
               key={c.id}
@@ -2095,7 +2113,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
               displayY={p.y}
               nodes={nodes}
               zoom={zoom}
-              isGenerating={generatingIds.has(c.id)}
+              isGenerating={isGenerating}
               isDragActive={draggingContainer?.id === c.id}
               isConnectTarget={!!connecting}
               progress={genProgressMap[c.id] ?? 0}
@@ -4675,8 +4693,8 @@ function ImageMentionPrompt({
 }
 
 /**
- * 待生成图片容器：位置锚定画布世界，视觉尺寸反向抵消相机 zoom。
- * 面板始终保持可读的屏幕尺度，同时仍能跟随画布平移、连线和拖动。
+ * 待生成图片容器：位置始终锚定画布世界。
+ * 编辑时反向抵消相机 zoom 保持可读；开始生成后解除抵消，像卡片落到画布上随视角退远。
  */
 function PendingContainerNode({
   container,
@@ -4840,8 +4858,12 @@ function PendingContainerNode({
     };
   }, [resizeDir, zoom, onChange]);
 
-  // 相机 zoom 已被抵消；拉伸柄只需按用户对面板的缩放 s 补偿，屏幕热区恒定约 12px。
+  // 编辑态相机 zoom 已被抵消；生成态覆盖层锁住操作，因此无需继续维持拉伸热区。
   const handleT = Math.max(5, Math.min(12 / s, Math.min(container.w / s, container.h / s) / 10));
+
+  // 编辑态保持固定屏幕尺寸；生成后切到普通画布卡片尺度。
+  // 内层 transform 做 420ms 的“落入画布”过渡，随后自然跟随相机 zoom。
+  const cameraCompensation = isGenerating ? 1 : 1 / zoom;
 
   return (
     <div
@@ -4851,9 +4873,8 @@ function PendingContainerNode({
         position: "absolute",
         left: displayX,
         top: displayY,
-        // 外框仍在世界层，尺寸按 1/zoom 换算，使命中盒与屏幕上的视觉面板一致。
-        width: container.w / zoom,
-        height: container.h / zoom,
+        width: container.w * cameraCompensation,
+        height: container.h * cameraCompensation,
         zIndex: 20,
         // 退场：淡出 + 轻微缩小（0 0 原点），与图片入场动画重叠
         transformOrigin: "0 0",
@@ -4868,17 +4889,21 @@ function PendingContainerNode({
       }}
       onContextMenu={(e) => e.preventDefault()}
     >
-      {/* 内层：scale(s / zoom) 抵消世界层的相机缩放；s 只表达用户主动拉伸面板的比例。 */}
+      {/* 编辑态 scale(s / zoom) 抵消相机；生成态回到 scale(s)，成为普通画布卡片。 */}
       <div
         style={{
-          transform: `scale(${s / zoom})`,
+          transform: `scale(${s * cameraCompensation})`,
           transformOrigin: "0 0",
+          transition: "transform 420ms cubic-bezier(0.22, 0.8, 0.24, 1)",
           width: container.w / s,
-          minHeight: container.h / s,
+          height: container.h / s,
+          minHeight: 0,
           display: "flex",
           flexDirection: "column",
           padding: 10,
           boxSizing: "border-box",
+          overflowY: "auto",
+          overflowX: "hidden",
           background: isGenerating
             ? "rgba(167,139,250,0.12)"
             : "rgba(20,20,35,0.82)",
@@ -5187,6 +5212,9 @@ function PendingContainerNode({
         style={{
           width: "100%",
           marginTop: 9,
+          position: "sticky",
+          bottom: 0,
+          zIndex: 2,
           padding: "8px 0",
           background: isGenerating ? "rgba(167,139,250,0.4)" : "#a78bfa",
           color: "#1a1a2e",

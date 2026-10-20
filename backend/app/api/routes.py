@@ -1,4 +1,6 @@
 """REST API 路由"""
+from __future__ import annotations
+
 import json
 import logging
 import queue
@@ -851,13 +853,30 @@ def generate_image_stream(canvas_id: str, req: StreamGenRequest):
             generated_node_id = None
             if result.success:
                 # 并发安全：锁内只把本次新增节点合并进最新画布（旧快照整体覆盖会丢并发结果）
+                # 工具会原地修改 state，因此不能在工具执行后再靠新旧 ID 集合做差；
+                # 直接使用本次工具返回的 node_id，和非流式 /generate 路径保持一致。
+                generated_node_id = (result.data or {}).get("node_id")
+                generated_node = (
+                    result.state.nodes.get(generated_node_id)
+                    if result.state is not None and generated_node_id
+                    else None
+                )
+                if generated_node is None:
+                    yield _sse(
+                        {
+                            "type": "done",
+                            "success": False,
+                            "message": "生成失败：未返回节点",
+                            "canvas": state.to_dict(),
+                            "node_id": None,
+                        }
+                    )
+                    return
                 with _canvas_lock(canvas_id):
                     latest = deps.store.get_canvas(canvas_id)
-                    old_ids = {n.id for n in state.nodes}
-                    for n in result.state.nodes:
-                        if n.id not in old_ids:
-                            latest.add_node(n)
-                            generated_node_id = n.id
+                    # 生成期间可能有其它并发请求先写入；按最新画布重新分配编号，避免撞号。
+                    generated_node.index = None
+                    latest.add_node(generated_node)
                     deps.store.save_canvas(latest)
                     final_state = latest
             yield _sse(
@@ -1101,7 +1120,10 @@ def add_experience_route(req: ExperienceIn):
 
 @router.put("/experiences/{exp_id}", summary="编辑风格名称/描述")
 def update_experience_route(exp_id: str, req: ExperienceUpdate):
-    item = experiences.update_experience(exp_id, req.name, req.description)
+    try:
+        item = experiences.update_experience(exp_id, req.name, req.description)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     if not item:
         raise HTTPException(status_code=404, detail="风格不存在")
     return {"success": True, "experience": item}

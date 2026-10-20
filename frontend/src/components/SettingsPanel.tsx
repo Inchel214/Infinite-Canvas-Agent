@@ -224,6 +224,7 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
     description: string;
     content: string;
   } | null>(null);
+  const [draftSource, setDraftSource] = useState<"file" | "manual" | null>(null);
   const [importing, setImporting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -262,14 +263,15 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
         .trim();
       const autoDesc = plain.slice(0, 100) + (plain.length > 100 ? "…" : "");
       setImportDraft({ name: autoName, description: autoDesc, content });
+      setDraftSource("file");
       setExpNotice("");
     } catch {
       setExpNotice("读取文件失败");
     }
   };
 
-  // 确认导入 → 立即生效（后端写文件 + 注册，热加载）
-  const handleImport = async () => {
+  // 手动新建/文件导入共用保存链路：后端写成独立 MD 并热加载。
+  const handleSaveExperience = async () => {
     if (!importDraft) return;
     setImporting(true);
     try {
@@ -277,10 +279,15 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
       const exps = await listExperiences();
       setExperiences(exps);
       setImportDraft(null);
-      setExpNotice(`已导入《${importDraft.name}》，生成图片时可在面板风格中选择`);
+      setDraftSource(null);
+      setExpNotice(
+        draftSource === "manual"
+          ? `已保存《${importDraft.name}》为 MD，生成图片时可直接选择`
+          : `已导入《${importDraft.name}》，生成图片时可在面板风格中选择`
+      );
       setTimeout(() => setExpNotice(""), 2600);
     } catch (e) {
-      setExpNotice("导入失败：" + (e as Error).message);
+      setExpNotice(`${draftSource === "manual" ? "保存" : "导入"}失败：${(e as Error).message}`);
     } finally {
       setImporting(false);
     }
@@ -621,13 +628,13 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
         {/* ===== 风格库（经验文档） ===== */}
         <div style={sectionTitleStyle}>🎨 风格库（风格指南）</div>
         <div style={{ color: "#777", fontSize: 12, margin: "4px 0 8px" }}>
-          导入设计师总结的风格 MD，生成图片时可在面板中选择；Agent 对话也会按需引用
+          手动沉淀或导入风格 MD，生成图片时可在面板中选择；Agent 对话也会按需引用
         </div>
 
         {/* 风格列表 */}
         {experiences.length === 0 && !importDraft && (
           <div style={{ color: "#666", fontSize: 12, padding: "6px 0" }}>
-            暂无风格，点击下方按钮导入第一个
+            暂无风格，可手动新建或导入第一个 MD
           </div>
         )}
         {experiences.map((exp) =>
@@ -746,7 +753,7 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
           )
         )}
 
-        {/* 导入表单：选文件后出现，名称/描述可编辑 */}
+        {/* 新建/导入表单：手动模式可直接编辑 Markdown 正文 */}
         {importDraft ? (
           <div
             style={{
@@ -757,6 +764,9 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
               border: "1px solid rgba(167,139,250,0.25)",
             }}
           >
+            <div style={{ color: "#ddd", fontSize: 13, fontWeight: 650, marginBottom: 8 }}>
+              {draftSource === "manual" ? "手动新建风格" : "确认导入风格"}
+            </div>
             <label style={labelStyle}>风格名称</label>
             <input
               style={inputStyle}
@@ -764,33 +774,62 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
               onChange={(e) => setImportDraft({ ...importDraft, name: e.target.value })}
               placeholder="如：赛博朋克海报"
             />
-            <label style={labelStyle}>一句话描述（Agent 按此判断何时使用）</label>
-            <input
-              style={inputStyle}
-              value={importDraft.description}
-              onChange={(e) => setImportDraft({ ...importDraft, description: e.target.value })}
-              placeholder="如：霓虹、雨夜、高对比、科技感，适合未来题材海报"
-            />
-            <div
-              style={{
-                marginTop: 8,
-                maxHeight: 120,
-                overflowY: "auto",
-                padding: "6px 8px",
-                background: "rgba(0,0,0,0.25)",
-                borderRadius: 6,
-                color: "#999",
-                fontSize: 11,
-                whiteSpace: "pre-wrap",
-                wordBreak: "break-word",
-              }}
-            >
-              {importDraft.content.slice(0, 500)}
-              {importDraft.content.length > 500 ? "\n…" : ""}
-            </div>
+            {draftSource === "file" && (
+              <>
+                <label style={labelStyle}>一句话描述（Agent 按此判断何时使用）</label>
+                <input
+                  style={inputStyle}
+                  value={importDraft.description}
+                  onChange={(e) => setImportDraft({ ...importDraft, description: e.target.value })}
+                  placeholder="如：霓虹、雨夜、高对比、科技感，适合未来题材海报"
+                />
+              </>
+            )}
+            <label style={labelStyle}>
+              Markdown 正文
+              {draftSource === "manual" ? "（保存后自动生成描述）" : "（内容预览）"}
+            </label>
+            {draftSource === "manual" ? (
+              <textarea
+                style={{
+                  ...inputStyle,
+                  minHeight: 170,
+                  resize: "vertical",
+                  lineHeight: 1.55,
+                  fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+                }}
+                value={importDraft.content}
+                onChange={(e) => setImportDraft({ ...importDraft, content: e.target.value })}
+                placeholder={"# 风格说明\n\n写下色彩、构图、材质、光线和适用场景……"}
+                autoFocus
+                onKeyDown={(e) => {
+                  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") handleSaveExperience();
+                }}
+              />
+            ) : (
+              <div
+                style={{
+                  maxHeight: 120,
+                  overflowY: "auto",
+                  padding: "6px 8px",
+                  background: "rgba(0,0,0,0.25)",
+                  borderRadius: 6,
+                  color: "#999",
+                  fontSize: 11,
+                  whiteSpace: "pre-wrap",
+                  wordBreak: "break-word",
+                }}
+              >
+                {importDraft.content.slice(0, 500)}
+                {importDraft.content.length > 500 ? "\n…" : ""}
+              </div>
+            )}
             <div style={{ display: "flex", gap: 8, marginTop: 10, justifyContent: "flex-end" }}>
               <button
-                onClick={() => setImportDraft(null)}
+                onClick={() => {
+                  setImportDraft(null);
+                  setDraftSource(null);
+                }}
                 disabled={importing}
                 style={{
                   ...inputStyle,
@@ -804,8 +843,10 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
                 取消
               </button>
               <button
-                onClick={handleImport}
-                disabled={importing || !importDraft.name.trim()}
+                onClick={handleSaveExperience}
+                disabled={
+                  importing || !importDraft.name.trim() || !importDraft.content.trim()
+                }
                 style={{
                   ...inputStyle,
                   width: "auto",
@@ -815,24 +856,50 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
                   color: "#eee",
                 }}
               >
-                {importing ? "导入中..." : "确认导入"}
+                {importing
+                  ? draftSource === "manual"
+                    ? "保存中..."
+                    : "导入中..."
+                  : draftSource === "manual"
+                    ? "保存为 MD"
+                    : "确认导入"}
               </button>
             </div>
           </div>
         ) : (
-          <button
-            onClick={() => fileInputRef.current?.click()}
-            disabled={importing}
-            style={{
-              ...inputStyle,
-              marginTop: 10,
-              cursor: "pointer",
-              background: "rgba(255,255,255,0.08)",
-              color: "#ddd",
-            }}
-          >
-            📁 导入风格 MD 文件
-          </button>
+          <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+            <button
+              onClick={() => {
+                setImportDraft({ name: "", description: "", content: "" });
+                setDraftSource("manual");
+                setExpNotice("");
+              }}
+              disabled={importing}
+              style={{
+                ...inputStyle,
+                flex: 1,
+                cursor: "pointer",
+                background: "rgba(167,139,250,0.22)",
+                borderColor: "rgba(167,139,250,0.42)",
+                color: "#eee",
+              }}
+            >
+              ＋ 手动新建
+            </button>
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              disabled={importing}
+              style={{
+                ...inputStyle,
+                flex: 1,
+                cursor: "pointer",
+                background: "rgba(255,255,255,0.08)",
+                color: "#ddd",
+              }}
+            >
+              📁 导入 MD 文件
+            </button>
+          </div>
         )}
         <input
           ref={fileInputRef}

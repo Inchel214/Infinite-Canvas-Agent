@@ -689,8 +689,8 @@ export async function addExperience(
     body: JSON.stringify({ name, description, content }),
   });
   if (!res.ok) {
-    const msg = await res.text().catch(() => "");
-    throw new Error(msg || `${res.status}`);
+    const payload = await res.json().catch(() => null);
+    throw new Error(payload?.detail || `${res.status}`);
   }
   const data = await res.json();
   return data.experience;
@@ -707,8 +707,8 @@ export async function updateExperience(
     body: JSON.stringify(patch),
   });
   if (!res.ok) {
-    const msg = await res.text().catch(() => "");
-    throw new Error(msg || `${res.status}`);
+    const payload = await res.json().catch(() => null);
+    throw new Error(payload?.detail || `${res.status}`);
   }
   const data = await res.json();
   return data.experience;

@@ -129,6 +129,12 @@ def add_experience(name: str, description: str, content: str) -> dict:
     with _lock:
         _ensure_dir()
         reg = _load_registry()
+        normalized_name = name.strip().casefold()
+        if any(
+            str(meta.get("name", "")).strip().casefold() == normalized_name
+            for meta in reg.values()
+        ):
+            raise ValueError(f"已存在同名风格《{name.strip()}》，请换一个名称")
         exp_id = uuid.uuid4().hex[:12]
         filename = f"{_safe_filename(name)}-{exp_id}.md"
         (EXP_DIR / filename).write_text(content, encoding="utf-8")
@@ -149,6 +155,13 @@ def update_experience(exp_id: str, name: str | None = None, description: str | N
         if not meta:
             return None
         if name is not None and name.strip():
+            normalized_name = name.strip().casefold()
+            if any(
+                other_id != exp_id
+                and str(other.get("name", "")).strip().casefold() == normalized_name
+                for other_id, other in reg.items()
+            ):
+                raise ValueError(f"已存在同名风格《{name.strip()}》，请换一个名称")
             meta["name"] = name.strip()
         if description is not None:
             meta["description"] = description.strip()

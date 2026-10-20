@@ -310,12 +310,16 @@ export function ChatPanel({
   const [entries, setEntries] = useState<ChatEntry[]>([]);
   // 输入区是否有内容（文本或引用芯片）：驱动发送按钮禁用态
   const [hasContent, setHasContent] = useState(false);
+  // “@数字”引用菜单：null 表示关闭，空字符串表示刚输入 @、展示全部画布图片
+  const [mentionQuery, setMentionQuery] = useState<string | null>(null);
+  const [mentionIndex, setMentionIndex] = useState(0);
   const [sending, setSending] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
   const [resizing, setResizing] = useState(false);
   const [hoverHandle, setHoverHandle] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<HTMLDivElement>(null);
+  const mentionRangeRef = useRef<Range | null>(null);
   const resizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
 
   // 渲染期解析引用标记（含历史消息）：节点可能后被删除，查找失败回退到持久化标签
@@ -323,6 +327,70 @@ export function ChatPanel({
     () => new Map(canvasNodes.map((n) => [n.id, n])),
     [canvasNodes]
   );
+
+  const mentionCandidates = useMemo(() => {
+    if (mentionQuery === null) return [];
+    return canvasNodes
+      .filter(
+        (node) =>
+          node.type === "image" &&
+          !!node.image_url &&
+          node.index != null &&
+          String(node.index).includes(mentionQuery)
+      )
+      .sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+  }, [canvasNodes, mentionQuery]);
+
+  const closeMentionMenu = () => {
+    mentionRangeRef.current = null;
+    setMentionQuery(null);
+    setMentionIndex(0);
+  };
+
+  // 仅识别光标所在文本节点末尾的 @数字，避免误解析已插入的引用芯片。
+  const updateMentionMenu = () => {
+    const editor = editorRef.current;
+    const selection = window.getSelection();
+    if (!editor || !selection || !selection.isCollapsed || selection.rangeCount === 0) {
+      closeMentionMenu();
+      return;
+    }
+    const range = selection.getRangeAt(0);
+    if (!editor.contains(range.startContainer) || range.startContainer.nodeType !== Node.TEXT_NODE) {
+      closeMentionMenu();
+      return;
+    }
+    const beforeCaret = (range.startContainer.textContent || "").slice(0, range.startOffset);
+    const match = beforeCaret.match(/@(\d*)$/);
+    if (!match) {
+      closeMentionMenu();
+      return;
+    }
+    const mentionRange = document.createRange();
+    mentionRange.setStart(range.startContainer, range.startOffset - match[0].length);
+    mentionRange.setEnd(range.startContainer, range.startOffset);
+    mentionRangeRef.current = mentionRange;
+    setMentionQuery(match[1]);
+    setMentionIndex(0);
+  };
+
+  const selectMentionNode = (node: CanvasNode) => {
+    const editor = editorRef.current;
+    const range = mentionRangeRef.current;
+    if (!editor || !range || !editor.contains(range.commonAncestorContainer)) return;
+    editor.focus();
+    range.deleteContents();
+    const chip = buildRefChip(node);
+    range.insertNode(chip);
+    const caret = document.createRange();
+    caret.setStartAfter(chip);
+    caret.collapse(true);
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(caret);
+    setHasContent(true);
+    closeMentionMenu();
+  };
 
   // 输入事件后同步空态/有内容状态；浏览器会在清空的 contenteditable 里留 <br>，归一化为空让 :empty 占位符生效
   const syncEditorState = () => {
@@ -949,18 +1017,85 @@ export function ChatPanel({
           alignItems: "flex-end",
         }}
       >
-        <div
-          ref={editorRef}
-          className="chat-editor"
-          contentEditable={!!canvasId && !sending}
-          suppressContentEditableWarning
-          data-placeholder={
-            canvasId ? "输入指令，Enter 发送，Shift+Enter 换行" : "画布加载中..."
-          }
-          onInput={syncEditorState}
-          onKeyDown={(e) => {
+        <div style={{ flex: 1, minWidth: 0, position: "relative" }}>
+          {mentionQuery !== null && (
+            <div className="mention-menu" role="listbox" aria-label="画布图片引用">
+              <div className="mention-menu-header">
+                <span>引用画布图片</span>
+                <span>{mentionCandidates.length} 张</span>
+              </div>
+              <div className="mention-menu-list">
+                {mentionCandidates.length > 0 ? (
+                  mentionCandidates.map((node, index) => (
+                    <button
+                      key={node.id}
+                      type="button"
+                      role="option"
+                      aria-selected={index === mentionIndex}
+                      className={`mention-option${index === mentionIndex ? " active" : ""}`}
+                      onMouseDown={(e) => {
+                        e.preventDefault();
+                        selectMentionNode(node);
+                      }}
+                      onMouseEnter={() => setMentionIndex(index)}
+                    >
+                      <img src={node.image_url} alt="" />
+                      <span className="mention-option-label">#{node.index}</span>
+                      <span className="mention-option-content">
+                        {node.content || "画布图片"}
+                      </span>
+                    </button>
+                  ))
+                ) : (
+                  <div className="mention-empty">
+                    没有匹配“{mentionQuery ? `#${mentionQuery}` : "画布图片"}”的图片
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+          <div
+            ref={editorRef}
+            className="chat-editor"
+            contentEditable={!!canvasId && !sending}
+            suppressContentEditableWarning
+            data-placeholder={
+              canvasId ? "输入指令，@ 引用图片，Enter 发送" : "画布加载中..."
+            }
+            onInput={() => {
+              syncEditorState();
+              updateMentionMenu();
+            }}
+            onBlur={() => {
+              window.setTimeout(() => closeMentionMenu(), 120);
+            }}
+            onKeyDown={(e) => {
             // 中文输入法组词期间的 Enter 是选词，不触发发送
             if (e.nativeEvent.isComposing) return;
+            if (mentionQuery !== null) {
+              if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                e.preventDefault();
+                if (mentionCandidates.length > 0) {
+                  const step = e.key === "ArrowDown" ? 1 : -1;
+                  setMentionIndex(
+                    (current) =>
+                      (current + step + mentionCandidates.length) % mentionCandidates.length
+                  );
+                }
+                return;
+              }
+              if ((e.key === "Enter" || e.key === "Tab") && !e.shiftKey) {
+                e.preventDefault();
+                const candidate = mentionCandidates[mentionIndex];
+                if (candidate) selectMentionNode(candidate);
+                return;
+              }
+              if (e.key === "Escape") {
+                e.preventDefault();
+                closeMentionMenu();
+                return;
+              }
+            }
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
               handleSend();
@@ -997,13 +1132,13 @@ export function ChatPanel({
               }
             }
           }}
-          onPaste={(e) => {
+            onPaste={(e) => {
             // 只接受纯文本，避免粘贴进来的富文本破坏芯片结构
             e.preventDefault();
             const text = e.clipboardData.getData("text/plain");
             if (text && editorRef.current) insertTextAtCursor(editorRef.current, text);
           }}
-          onClick={(e) => {
+            onClick={(e) => {
             // 事件委托处理芯片上的 ✕ 移除按钮
             const removeBtn = (e.target as HTMLElement).closest(".ref-chip-remove");
             if (removeBtn) {
@@ -1011,8 +1146,8 @@ export function ChatPanel({
               syncEditorState();
             }
           }}
-          style={{
-            flex: 1,
+            style={{
+            width: "100%",
             background: "rgba(255,255,255,0.06)",
             border: "1px solid rgba(255,255,255,0.12)",
             borderRadius: 10,
@@ -1030,8 +1165,9 @@ export function ChatPanel({
             whiteSpace: "pre-wrap",
             wordBreak: "break-word",
             opacity: !canvasId || sending ? 0.55 : 1,
-          }}
-        />
+            }}
+          />
+        </div>
         {sending ? (
           /* 执行中可随时中断：后端在下一个操作边界停止，done(stopped) 事件到达后复位 */
           <button
@@ -1074,6 +1210,82 @@ export function ChatPanel({
         @keyframes chatblink {
           0%, 60%, 100% { opacity: 0.25; }
           30% { opacity: 1; }
+        }
+        @keyframes mentionIn {
+          from { opacity: 0; transform: translateY(4px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
+        .mention-menu {
+          position: absolute;
+          z-index: 30;
+          left: 0;
+          right: 0;
+          bottom: calc(100% + 7px);
+          overflow: hidden;
+          border: 1px solid rgba(129,140,248,0.42);
+          border-radius: 10px;
+          background: rgba(25,25,43,0.98);
+          box-shadow: 0 12px 34px rgba(0,0,0,0.42);
+          animation: mentionIn 160ms ease-out;
+        }
+        .mention-menu-header {
+          display: flex;
+          justify-content: space-between;
+          padding: 8px 10px 6px;
+          color: #9292aa;
+          font-size: 11px;
+          border-bottom: 1px solid rgba(255,255,255,0.07);
+        }
+        .mention-menu-list {
+          max-height: 232px;
+          overflow-y: auto;
+          padding: 5px;
+        }
+        .mention-option {
+          width: 100%;
+          display: grid;
+          grid-template-columns: 38px auto minmax(0, 1fr);
+          align-items: center;
+          gap: 9px;
+          min-height: 46px;
+          padding: 4px 7px;
+          color: #d8d8e6;
+          border: 1px solid transparent;
+          border-radius: 7px;
+          background: transparent;
+          font-family: inherit;
+          text-align: left;
+          cursor: pointer;
+        }
+        .mention-option.active {
+          background: rgba(99,102,241,0.18);
+          border-color: rgba(129,140,248,0.32);
+        }
+        .mention-option img {
+          width: 38px;
+          height: 38px;
+          object-fit: cover;
+          border-radius: 6px;
+          background: rgba(255,255,255,0.05);
+        }
+        .mention-option-label {
+          color: #c7d2fe;
+          font-size: 13px;
+          font-weight: 700;
+          white-space: nowrap;
+        }
+        .mention-option-content {
+          overflow: hidden;
+          color: #8f8fa5;
+          font-size: 12px;
+          white-space: nowrap;
+          text-overflow: ellipsis;
+        }
+        .mention-empty {
+          padding: 18px 10px;
+          color: #77778d;
+          font-size: 12px;
+          text-align: center;
         }
         /* 输入框占位符（contenteditable 无原生 placeholder） */
         .chat-editor:empty::before {

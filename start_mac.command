@@ -59,27 +59,38 @@ if ! command -v node >/dev/null 2>&1; then
 fi
 ok "Node: $(node --version)"
 
-# ===== 4. 后端依赖（venv 隔离，不污染系统）=====
+# ===== 4. 后端依赖（仅在首次或依赖清单变化时安装）=====
 info "准备后端环境..."
 cd backend
 if [[ ! -d .venv ]]; then
   info "首次运行：创建 Python 虚拟环境..."
   python3 -m venv .venv
 fi
-# shellcheck disable=SC1091
-source .venv/bin/activate
-pip install -q --upgrade pip
-pip install -q -r requirements.txt
+BACKEND_DEPS_HASH="$(shasum -a 256 requirements.txt | awk '{print $1}')"
+BACKEND_STAMP="$PWD/.venv/.requirements.sha256"
+if [[ ! -x .venv/bin/python ]] || [[ ! -f "$BACKEND_STAMP" ]] || [[ "$(<"$BACKEND_STAMP")" != "$BACKEND_DEPS_HASH" ]]; then
+  info "检测到后端依赖需要更新..."
+  .venv/bin/python -m pip install -q --upgrade pip
+  .venv/bin/python -m pip install -q -r requirements.txt
+  echo "$BACKEND_DEPS_HASH" > "$BACKEND_STAMP"
+else
+  ok "后端依赖未变化，跳过安装"
+fi
 ok "后端依赖就绪"
-deactivate
 cd ..
 
-# ===== 5. 前端依赖 =====
+# ===== 5. 前端依赖（仅在首次或锁定文件变化时安装）=====
 info "准备前端环境..."
 cd frontend
-# 每次都执行：幂等且增量——依赖齐全时几秒完成，更新后新增依赖自动补装
-info "检查/安装前端依赖（首次可能需要 1-2 分钟）..."
-npm install
+FRONTEND_DEPS_HASH="$(shasum -a 256 package.json package-lock.json | shasum -a 256 | awk '{print $1}')"
+FRONTEND_STAMP="$PWD/node_modules/.dependencies.sha256"
+if [[ ! -d node_modules ]] || [[ ! -f "$FRONTEND_STAMP" ]] || [[ "$(<"$FRONTEND_STAMP")" != "$FRONTEND_DEPS_HASH" ]]; then
+  info "检测到前端依赖需要更新（首次可能需要 1-2 分钟）..."
+  npm install
+  echo "$FRONTEND_DEPS_HASH" > "$FRONTEND_STAMP"
+else
+  ok "前端依赖未变化，跳过安装"
+fi
 ok "前端依赖就绪"
 cd ..
 
@@ -109,22 +120,37 @@ if [[ ! -f backend/.env ]]; then
   echo ""
 fi
 
-# ===== 7. 清理占用 8000/5173 端口的旧进程 =====
-info "检查并清理占用 8000/5173 端口的旧进程..."
+# ===== 7. 停止占用 8000/5173 端口的旧服务 =====
+info "正在停止旧的画布前后端..."
 for port in 8000 5173; do
-  pids=$(lsof -ti :$port 2>/dev/null)
+  pids="$(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)"
   if [[ -n "$pids" ]]; then
     for pid in $pids; do
-      pname=$(ps -p "$pid" -o comm= 2>/dev/null)
-      warn "  已清理端口 $port 上的进程 $pname (PID $pid)"
-      kill -9 "$pid" 2>/dev/null
+      pname="$(ps -p "$pid" -o comm= 2>/dev/null || true)"
+      warn "  停止端口 $port 上的 ${pname:-进程} (PID $pid)"
+      kill -TERM "$pid" 2>/dev/null || true
     done
   fi
 done
 
+# 给旧服务一点时间正常退出；超时后再强制释放端口。
+for _ in $(seq 1 20); do
+  remaining="$(
+    { lsof -tiTCP:8000 -sTCP:LISTEN 2>/dev/null || true; lsof -tiTCP:5173 -sTCP:LISTEN 2>/dev/null || true; } |
+      sort -u
+  )"
+  [[ -z "$remaining" ]] && break
+  sleep 0.1
+done
+if [[ -n "${remaining:-}" ]]; then
+  warn "  旧服务未及时退出，正在强制停止..."
+  for pid in $remaining; do
+    kill -KILL "$pid" 2>/dev/null || true
+  done
+fi
+
 # ===== 8. 启动服务（一个窗口两个页签）=====
 info "启动服务中..."
-
 PROJECT_DIR="$(pwd)"
 
 # 使用 AppleScript 在 Terminal.app 中打开一个窗口 + 两个页签
@@ -146,17 +172,20 @@ tell application "Terminal"
 end tell
 APPLESCRIPT
 
-# 等待服务就绪后打开浏览器
+# 等待前后端都就绪。不自动打开浏览器，避免切换或新建页签。
 info "等待服务启动..."
+SERVICES_READY=0
 for i in $(seq 1 30); do
-  if curl -s -o /dev/null http://127.0.0.1:8000/api/canvas 2>/dev/null; then
+  if curl -fsS -o /dev/null http://127.0.0.1:8000/api/providers 2>/dev/null &&
+     curl -fsS -o /dev/null http://localhost:5173/ 2>/dev/null; then
+    SERVICES_READY=1
     break
   fi
   sleep 1
 done
-sleep 2
-if ! open http://localhost:5173; then
-  warn "无法自动打开默认浏览器，请手动访问 http://localhost:5173"
+if [[ "$SERVICES_READY" -ne 1 ]]; then
+  warn "服务启动超时，请查看上方日志"
+  exit 1
 fi
 
 echo ""
@@ -166,6 +195,7 @@ ok "=========================================="
 echo ""
 echo "  前端页面:  http://localhost:5173"
 echo "  后端接口:  http://127.0.0.1:8000"
+echo "  浏览器:    保持当前页签，刷新即可继续使用"
 echo ""
 warn "  服务已在 Terminal.app 的一个窗口（两个页签）中运行"
 warn "  关闭该窗口即可停止所有服务"
