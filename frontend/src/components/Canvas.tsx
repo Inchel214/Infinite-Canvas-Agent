@@ -180,6 +180,41 @@ async function fetchImageBlob(url: string, attempts = 3): Promise<Blob> {
   throw lastError instanceof Error ? lastError : new Error("图片加载失败");
 }
 
+// 系统剪贴板对图片格式的支持并不统一，Chromium/macOS 下 PNG 最稳定。
+// JPEG、WebP、SVG 等先在浏览器内无损解码，再绘制为 PNG；透明背景会被保留。
+async function convertImageBlobToPng(blob: Blob): Promise<Blob> {
+  if (blob.type === "image/png") return blob;
+
+  const objectUrl = URL.createObjectURL(blob);
+  try {
+    const image = new Image();
+    image.decoding = "async";
+    await new Promise<void>((resolve, reject) => {
+      image.onload = () => resolve();
+      image.onerror = () => reject(new Error("图片解码失败"));
+      image.src = objectUrl;
+    });
+    const width = image.naturalWidth || image.width;
+    const height = image.naturalHeight || image.height;
+    if (!width || !height) throw new Error("图片尺寸无效");
+
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("浏览器无法转换图片");
+    context.drawImage(image, 0, 0, width, height);
+    return await new Promise<Blob>((resolve, reject) => {
+      canvas.toBlob(
+        (png) => (png ? resolve(png) : reject(new Error("PNG 转换失败"))),
+        "image/png",
+      );
+    });
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
 // 容器面板基准尺寸：编辑态按屏幕像素渲染以保证可读；开始生成后同一数值
 // 转为画布世界尺寸，使整张卡片随相机 zoom 自然退远。
 const CONTAINER_BASE_W = 320; // 与右侧编辑面板接近的紧凑宽度，比例按钮仍保持一行
@@ -1554,16 +1589,42 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     [onAction]
   );
 
-  // 画布内复制选中图片（存入剪贴板状态，Ctrl+V 粘贴到画布）
-  const handleCopyImage = useCallback(() => {
+  // 同时复制到系统剪贴板与画布内部剪贴板：外部应用可直接粘贴，
+  // 画布内仍保留原节点信息，Ctrl+V 时能维持尺寸、提示词和谱系。
+  const handleCopyImage = useCallback(async () => {
     const copies = [...selectedIds]
       .map((id) => nodes.find((n) => n.id === id))
       .filter((n): n is CanvasNode => !!n && !!n.image_url);
     setMenu(null);
     if (copies.length === 0) return;
     clipboardRef.current = copies;
-    setLocalStatusMsg(`已复制 ${copies.length} 张图片，Ctrl+V 粘贴到画布`);
-    setTimeout(() => setLocalStatusMsg(null), 2200);
+
+    const showMsg = (message: string) => {
+      setLocalStatusMsg(message);
+      window.setTimeout(() => setLocalStatusMsg(null), 2600);
+    };
+
+    if (!window.isSecureContext || !navigator.clipboard?.write || typeof ClipboardItem === "undefined") {
+      showMsg("已复制到画布；当前浏览器不支持复制图片到系统剪贴板");
+      return;
+    }
+
+    showMsg("正在复制图片...");
+    try {
+      // 先把 Promise 交给 ClipboardItem，再立即调用 write，保留菜单点击带来的用户激活。
+      const pngPromise = fetchImageBlob(copies[0].image_url).then(convertImageBlobToPng);
+      await navigator.clipboard.write([
+        new ClipboardItem({ "image/png": pngPromise }),
+      ]);
+      showMsg("图片已复制，可粘贴到微信、飞书或 PS");
+    } catch (error) {
+      const reason = error instanceof DOMException && error.name === "NotAllowedError"
+        ? "浏览器未授予剪贴板权限，请保持页面在前台后重试"
+        : error instanceof Error
+          ? error.message
+          : "未知错误";
+      showMsg(`已复制到画布；系统剪贴板写入失败：${reason}`);
+    }
   }, [selectedIds, nodes]);
 
   // 另存为：优先用 File System Access API（弹「保存到…」对话框，可选桌面等任意文件夹），
