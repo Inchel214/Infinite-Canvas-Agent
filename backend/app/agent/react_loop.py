@@ -144,6 +144,13 @@ class ReActAgent:
                 emit({"type": "response", "content": chat_answer})
                 return AgentResult(success=True, message=chat_answer, state=state, steps=steps)
             if plan:
+                # 检查计划是否是询问用户（包含问号或询问句式，且没有明确的工具调用步骤）
+                if self._is_inquiry_plan(plan):
+                    # 询问性质的内容：只作为正文回复发出，不发 plan 事件
+                    # plan 卡片只用于工具任务的执行路线图，询问用户本质上是纯对话
+                    steps.append({"type": "response", "content": plan})
+                    emit({"type": "response", "content": plan})
+                    return AgentResult(success=True, message=plan, state=state, steps=steps)
                 steps.append({"type": "plan", "content": plan})
                 # 计划注入上下文，执行阶段模型能看到自己的计划
                 messages.append({"role": "assistant", "content": f"执行计划：\n{plan}"})
@@ -237,6 +244,31 @@ class ReActAgent:
             )
         finally:
             self.control.unregister(canvas_id, stop_evt)
+
+    @staticmethod
+    def _is_inquiry_plan(plan: str) -> bool:
+        """判断计划是否是询问用户（而非可执行的工具任务）。
+
+        特征：
+        - 包含问号或询问句式（"请告诉我"、"你想"、"你希望"等）
+        - 以询问结尾（"要我现在开始吗"、"请确认"等）
+        """
+        inquiry_keywords = [
+            "请告诉我", "你想", "你希望", "请确认", "请选择", "你想要",
+            "告诉我", "确认一下", "你更", "哪种", "哪个",
+        ]
+        has_inquiry = any(kw in plan for kw in inquiry_keywords) or "？" in plan or "?" in plan
+
+        # 检查是否以询问结尾（即使有工具调用步骤，只要结尾是询问也算）
+        inquiry_endings = [
+            "要我现在开始吗", "要我开始吗", "请确认", "请选择",
+            "你想", "你希望", "告诉我", "可以吗", "好不好",
+        ]
+        ends_with_inquiry = any(plan.rstrip().endswith(kw + "？") or plan.rstrip().endswith(kw + "?")
+                                for kw in inquiry_endings)
+
+        # 有询问关键词，或以询问结尾 → 是询问性质的计划
+        return has_inquiry or ends_with_inquiry
 
     def _make_plan(
         self,
