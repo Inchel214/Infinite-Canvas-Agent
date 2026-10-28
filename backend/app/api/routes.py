@@ -7,6 +7,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from typing import List, Optional
 
@@ -17,6 +18,7 @@ from pydantic import BaseModel
 
 from app import deps
 from app import experiences
+from app.agent.sessions import format_failure_note
 from app.canvas.state import CanvasNode, CanvasState
 from app.providers.schema import (
     AppSettings,
@@ -894,17 +896,87 @@ def generate_image_stream(canvas_id: str, req: StreamGenRequest):
     return StreamingResponse(sse(), media_type="text/event-stream")
 
 
+def _run_record(
+    prompt: str,
+    *,
+    status: str,
+    result: object | None = None,
+    error: str | None = None,
+) -> dict:
+    """构造一轮执行记录（落盘到会话 runs，供"重试/继续"精确重放失败任务）。
+
+    status: done / failed / stopped
+    """
+    plan = ""
+    steps: list[dict] = []
+    message = ""
+    if result is not None:
+        message = getattr(result, "message", "")
+        for step in getattr(result, "steps", []) or []:
+            if step.get("type") == "plan":
+                plan = step.get("content", "")
+            elif step.get("type") == "tool_call":
+                steps.append({
+                    "tool": step.get("tool"),
+                    "args": step.get("args") or {},
+                    "result": step.get("result"),
+                    "success": step.get("success", True),
+                })
+    return {
+        "id": uuid.uuid4().hex[:12],
+        "at": time.time(),
+        "prompt": prompt,
+        "status": status,
+        "plan": plan,
+        "steps": steps,
+        "message": message,
+        "error": error,
+    }
+
+
+def _run_status(result: object) -> str:
+    """判定一轮执行结果：stopped > failed > done。
+
+    最后一个工具步骤失败也视为失败——Agent 可能吞掉错误后正常收尾
+    （如"生成失败，账户欠费"），此时 success 为 True 但任务实际未完成。
+    """
+    if getattr(result, "stopped", False):
+        return "stopped"
+    if not getattr(result, "success", True):
+        return "failed"
+    steps = getattr(result, "steps", []) or []
+    last_tool = next((s for s in reversed(steps) if s.get("type") == "tool_call"), None)
+    if last_tool is not None and not last_tool.get("success", True):
+        return "failed"
+    return "done"
+
+
 @router.post("/agent/chat", response_model=ChatResponse, summary="发送提示词给 Agent（携带对话历史）")
 def chat(req: ChatRequest):
+    # 注入该画布的历史对话尾部，Agent 具备跨轮记忆
+    history = deps.chat_sessions.get_context(req.canvas_id)
+    # 上一轮未完成任务的摘要：让"重试/继续"能精确复用原参数
+    failure_note = format_failure_note(deps.chat_sessions.last_run(req.canvas_id))
     try:
-        # 注入该画布的历史对话尾部，Agent 具备跨轮记忆
-        history = deps.chat_sessions.get_context(req.canvas_id)
-        result = deps.agent.run(req.prompt, req.canvas_id, history=history)
+        result = deps.agent.run(
+            req.prompt, req.canvas_id, history=history, failure_note=failure_note
+        )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.exception("Agent 对话执行异常")
+        # 失败轮同样入库：否则下一轮"重试"在历史里找不到这个任务
+        msg = f"Agent 执行失败：{e}"
+        deps.chat_sessions.append_round(req.canvas_id, req.prompt, msg)
+        deps.chat_sessions.append_run(
+            _run_record(req.prompt, status="failed", error=str(e))
+        )
+        raise HTTPException(status_code=500, detail=msg)
 
     # 回写一轮对话（用户原文 + Agent 最终回复），供下轮上下文与前端历史展示
     deps.chat_sessions.append_round(req.canvas_id, req.prompt, result.message)
+    # 结构化执行记录：成功/失败/停止都留档，成功轮用于清掉旧的失败记忆
+    deps.chat_sessions.append_run(_run_record(req.prompt, status=_run_status(result), result=result))
 
     return ChatResponse(
         success=result.success,
@@ -940,6 +1012,8 @@ def chat_stream(req: ChatRequest):
         raise HTTPException(status_code=404, detail=str(e))
 
     history = deps.chat_sessions.get_context(req.canvas_id)
+    # 上一轮未完成任务的摘要：让"重试/继续"能精确复用原参数
+    failure_note = format_failure_note(deps.chat_sessions.last_run(req.canvas_id))
     q: "queue.Queue[dict | None]" = queue.Queue()
 
     def worker():
@@ -947,9 +1021,14 @@ def chat_stream(req: ChatRequest):
             result = deps.agent.run(
                 req.prompt, req.canvas_id, history=history,
                 on_event=lambda e: q.put(e),
+                failure_note=failure_note,
             )
             # 与 /agent/chat 一致：回写一轮对话供下轮上下文与历史展示
             deps.chat_sessions.append_round(req.canvas_id, req.prompt, result.message)
+            # 结构化执行记录：成功/失败/停止都留档，供下一轮"重试/继续"取用
+            deps.chat_sessions.append_run(
+                _run_record(req.prompt, status=_run_status(result), result=result)
+            )
             q.put({
                 "type": "done",
                 "success": result.success,
@@ -961,10 +1040,19 @@ def chat_stream(req: ChatRequest):
         except Exception as e:
             # worker 异常也必须发 done，否则前端会一直等
             logger.exception("Agent 流式对话执行异常")
+            msg = f"Agent 执行失败：{e}"
+            # 失败轮同样入库：否则下一轮"重试"在历史里找不到这个任务
+            try:
+                deps.chat_sessions.append_round(req.canvas_id, req.prompt, msg)
+                deps.chat_sessions.append_run(
+                    _run_record(req.prompt, status="failed", error=str(e))
+                )
+            except Exception:
+                logger.exception("失败轮对话落盘失败（忽略，不阻断事件流）")
             q.put({
                 "type": "done",
                 "success": False,
-                "message": f"Agent 执行失败：{e}",
+                "message": msg,
                 "steps": [],
             })
         finally:

@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
@@ -335,15 +336,27 @@ class OpenAICompatLLM(BaseLLM):
             "Content-Type": "application/json",
             "Accept": "text/event-stream",
         }
-        resp = session.post(self.api_url, headers=headers, json=body,
-                            timeout=self.timeout, stream=True)
-        # 非 Ark/豆包服务商可能不认 thinking 参数：400 时去掉它重试一次（对该参数静默降级）
-        if not thinking and resp.status_code == 400:
-            resp.close()
-            body.pop("thinking", None)
+        _t0 = time.monotonic()
+        logger.info(
+            "[LLM] 请求开始 model=%s messages=%d tools=%d thinking=%s",
+            self.model, len(messages), len(oai_tools or []), thinking,
+        )
+        try:
             resp = session.post(self.api_url, headers=headers, json=body,
                                 timeout=self.timeout, stream=True)
-        resp.raise_for_status()
+            # 非 Ark/豆包服务商可能不认 thinking 参数：400 时去掉它重试一次（对该参数静默降级）
+            if not thinking and resp.status_code == 400:
+                resp.close()
+                body.pop("thinking", None)
+                resp = session.post(self.api_url, headers=headers, json=body,
+                                    timeout=self.timeout, stream=True)
+            resp.raise_for_status()
+        except Exception as e:
+            logger.warning(
+                "[LLM] 请求失败 model=%s 耗时=%dms 错误=%s",
+                self.model, int((time.monotonic() - _t0) * 1000), e,
+            )
+            raise
         # iter_lines(decode_unicode) 依赖 resp.encoding，Ark 未带 charset 时强制 UTF-8
         resp.encoding = "utf-8"
 
@@ -402,7 +415,15 @@ class OpenAICompatLLM(BaseLLM):
                     args = {"prompt": acc["args"]}
                 tool_calls.append(ToolCall(name=acc["name"], args=args))
 
-        return LLMResponse(content="".join(content_parts), tool_calls=tool_calls)
+        content = "".join(content_parts)
+        logger.info(
+            "[LLM] 请求完成 model=%s 耗时=%dms 正文=%d字 tool_calls=%s",
+            self.model,
+            int((time.monotonic() - _t0) * 1000),
+            len(content),
+            [tc.name for tc in tool_calls] if tool_calls else [],
+        )
+        return LLMResponse(content=content, tool_calls=tool_calls)
 
     def _to_openai_tools(self, tools: list[dict] | None) -> list[dict] | None:
         """把内部工具描述转换为 OpenAI function calling 格式"""

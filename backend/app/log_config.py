@@ -62,12 +62,13 @@ def setup_logging() -> Path:
     root.addHandler(app_file)
 
     # uvicorn 自带 logger 有独立 handler 且不向 root 传播：手动挂同一文件 handler，
-    # 采集访问日志（uvicorn.access，propagate=False）与启动/异常日志（uvicorn）。
-    # 注意 uvicorn.error 无独立 handler、默认冒泡到 "uvicorn"，这里不能再给它挂，
-    # 否则同一条启动/异常日志写两遍。
-    for name in ("uvicorn", "uvicorn.access"):
-        lg = logging.getLogger(name)
-        lg.addHandler(app_file)
+    # 采集启动/异常日志（uvicorn）。
+    # 注意：
+    # - uvicorn.error 无独立 handler、默认冒泡到 "uvicorn"，不能再挂，否则同一条日志写两遍
+    # - uvicorn.access 不写文件（每次请求刷一行 200，把真正的错误日志淹没），
+    #   只保留控制台输出，需要排查接口访问时看终端即可
+    lg = logging.getLogger("uvicorn")
+    lg.addHandler(app_file)
 
     # 前端上报日志不单独设 handler：logger 名为 "frontend"（见 routes.py），
     # 默认冒泡到 root → 与后端日志合流写 app.log，行内 [frontend] 标记来源

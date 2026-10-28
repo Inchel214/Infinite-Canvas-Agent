@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -21,6 +22,20 @@ from app.canvas.store import BaseStore
 from app.tools.base import ToolManager, ToolResult
 
 logger = logging.getLogger(__name__)
+
+
+def _clip(text: object, n: int) -> str:
+    """日志友好化：单行 + 截断，避免大段 prompt/base64 污染日志"""
+    s = str(text or "").replace("\n", " ").strip()
+    return s if len(s) <= n else s[:n] + "…"
+
+
+def _clip_args(args: dict, n: int = 160) -> str:
+    try:
+        import json as _json
+        return _clip(_json.dumps(args, ensure_ascii=False), n)
+    except Exception:
+        return _clip(args, n)
 
 # 事件回调类型
 EventCallback = Callable[[dict], None]
@@ -111,10 +126,12 @@ class ReActAgent:
         canvas_id: str,
         history: list[dict] | None = None,
         on_event: EventCallback | None = None,
+        failure_note: str | None = None,
     ) -> AgentResult:
         """执行 Agent 循环。
 
         history 为该画布的历史对话（user/assistant），注入 LLM 上下文；
+        failure_note 为上一轮未完成任务的摘要（供"重试/继续"精确重放）；
         on_event 非空时逐步推送执行事件（SSE 流式）。
         """
         state = self.store.get_canvas(canvas_id)
@@ -131,7 +148,15 @@ class ReActAgent:
                 *(history or []),
             ]
             user_msg_index = len(messages)
-            messages.append({"role": "user", "content": self._build_user_message(prompt, state)})
+            messages.append({
+                "role": "user",
+                "content": self._build_user_message(prompt, state, failure_note),
+            })
+
+            logger.info(
+                "[Agent] 任务开始 canvas=%s prompt=%s",
+                canvas_id, _clip(prompt, 80),
+            )
 
             steps: list[dict] = []
 
@@ -154,6 +179,7 @@ class ReActAgent:
                 steps.append({"type": "plan", "content": plan})
                 # 计划注入上下文，执行阶段模型能看到自己的计划
                 messages.append({"role": "assistant", "content": f"执行计划：\n{plan}"})
+                logger.info("[Agent] 计划已生成 canvas=%s plan=%s", canvas_id, _clip(plan, 120))
 
             # ===== 执行阶段：ReAct 循环 =====
             for _step in range(self.max_steps):
@@ -174,6 +200,10 @@ class ReActAgent:
                 if not response.tool_calls:
                     steps.append({"type": "response", "content": response.content})
                     emit({"type": "response", "content": response.content})
+                    logger.info(
+                        "[Agent] 任务完成 canvas=%s 步数=%d 回复=%s",
+                        canvas_id, _step + 1, _clip(response.content, 120),
+                    )
                     return AgentResult(
                         success=True,
                         message=response.content,
@@ -189,12 +219,29 @@ class ReActAgent:
                         break
 
                     emit({"type": "tool_start", "tool": tool_call.name, "args": tool_call.args})
+                    logger.info(
+                        "[Tool] 开始 %s canvas=%s args=%s",
+                        tool_call.name, canvas_id, _clip_args(tool_call.args),
+                    )
+                    _t0 = time.monotonic()
                     result = self._execute_tool(tool_call, state)
+                    _cost_ms = int((time.monotonic() - _t0) * 1000)
+                    if result.success:
+                        logger.info(
+                            "[Tool] 完成 %s canvas=%s 耗时=%dms 结果=%s",
+                            tool_call.name, canvas_id, _cost_ms, _clip(result.message, 120),
+                        )
+                    else:
+                        logger.warning(
+                            "[Tool] 失败 %s canvas=%s 耗时=%dms 原因=%s",
+                            tool_call.name, canvas_id, _cost_ms, _clip(result.message, 160),
+                        )
                     steps.append({
                         "type": "tool_call",
                         "tool": tool_call.name,
                         "args": tool_call.args,
                         "result": result.message,
+                        "success": result.success,
                     })
 
                     # 工具结果加入消息，供 LLM 决策下一步；失败时附反思提示
@@ -232,7 +279,7 @@ class ReActAgent:
                 # 更新当前用户消息中的画布状态（历史消息保持原样）
                 messages[user_msg_index] = {
                     "role": "user",
-                    "content": self._build_user_message(prompt, state),
+                    "content": self._build_user_message(prompt, state, failure_note),
                 }
 
             # 超过最大步数：明确标记未完成（可继续对话接着执行）
@@ -416,8 +463,10 @@ class ReActAgent:
                     resolved.append(rid)
         return resolved
 
-    def _build_user_message(self, prompt: str, state: CanvasState) -> str:
-        """构建包含画布状态的用户消息"""
+    def _build_user_message(
+        self, prompt: str, state: CanvasState, failure_note: str | None = None
+    ) -> str:
+        """构建包含画布状态的用户消息；failure_note 附在末尾供失败任务重放"""
         nodes_info = []
         for n in state.list_nodes():
             label = f"图{n.index}" if n.index is not None else "图?"
@@ -431,4 +480,7 @@ class ReActAgent:
                     f"- [{label}] {n.id}: {n.type} '{n.content}' at ({n.x}, {n.y})"
                 )
         canvas_context = "\n".join(nodes_info) if nodes_info else "(空画布)"
-        return f"画布当前节点：\n{canvas_context}\n\n用户指令：{prompt}"
+        message = f"画布当前节点：\n{canvas_context}\n\n用户指令：{prompt}"
+        if failure_note:
+            message += f"\n\n{failure_note}"
+        return message
