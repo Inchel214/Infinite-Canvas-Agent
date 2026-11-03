@@ -4,10 +4,11 @@ LLM / 图片生成器由 ProviderManager 统一管理：
 配置优先级为 前端用户设置 > .env 环境变量 > Mock 降级，
 更新配置（PUT /api/settings）后热切换生效，无需重启。
 """
-from app.agent.react_loop import ReActAgent
+from app.agent.react_loop import ReActAgent, RunControl
 from app.agent.sessions import ChatSessionStore
 from app.canvas.store import FileStore
 from app.providers.manager import GeneratorProxy, LLMProxy, ProviderManager
+from app.tools.ask_user import AskUserTool
 from app.tools.base import ToolManager
 from app.tools.compose_images import ComposeImagesTool
 from app.tools.delete_node import DeleteNodeTool
@@ -27,6 +28,9 @@ chat_sessions = ChatSessionStore()
 # 服务商管理器：解析用户设置 / .env，构建当前生效的 generator 与 llm
 manager = ProviderManager()
 
+# Agent 运行控制（停止/暂停）
+control = RunControl()
+
 # 工具与 Agent 注入代理：配置热切换后自动指向新实例
 tool_manager = ToolManager()
 tool_manager.register(GenerateImageTool(GeneratorProxy(manager)))
@@ -39,10 +43,13 @@ tool_manager.register(DeleteNodeTool())
 tool_manager.register(ListNodesTool())
 # 风格库读取（Agent 按需读风格指南全文）
 tool_manager.register(ReadExperienceTool())
+# 人在回路：Agent 向用户询问信息或确认操作
+tool_manager.register(AskUserTool(control))
 
 agent = ReActAgent(
     llm=LLMProxy(manager),
     tool_manager=tool_manager,
     store=store,
     max_steps=30,
+    control=control,
 )

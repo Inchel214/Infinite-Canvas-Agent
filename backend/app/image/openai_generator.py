@@ -147,6 +147,13 @@ class OpenAIImageGenerator(BaseImageGenerator):
         raise ValueError(f"API 返回数据格式异常: {item}")
 
     def _generate(self, prompt: str, size: str) -> ImageResult:
+        import time as _time
+        _t0 = _time.monotonic()
+        normalized_size = _norm_size(size)
+        logger.debug(
+            "[OpenAI] 生图请求 model=%s size=%s prompt=%s",
+            self.model, normalized_size, prompt[:80],
+        )
         session = self._session()
         resp = session.post(
             self.generations_url,
@@ -154,7 +161,7 @@ class OpenAIImageGenerator(BaseImageGenerator):
             json={
                 "model": self.model,
                 "prompt": prompt,
-                "size": _norm_size(size),
+                "size": normalized_size,
             },
             timeout=180,
             proxies={"http": None, "https": None},
@@ -162,10 +169,20 @@ class OpenAIImageGenerator(BaseImageGenerator):
         _raise_provider_error(resp)
         url = self._parse_response(resp.json())
         w, h = _display_size(_image_size(url), (300, 300))
+        logger.debug(
+            "[OpenAI] 生图完成 model=%s 耗时=%dms 尺寸=%dx%d",
+            self.model, int((_time.monotonic() - _t0) * 1000), w, h,
+        )
         return ImageResult(image_url=url, width=w, height=h, prompt=prompt)
 
     def _edit(self, image_urls: list[str], prompt: str, size: str) -> ImageResult:
         """图生图/编辑/组合统一走 /images/edits（multipart 上传参考图）"""
+        import time as _time
+        _t0 = _time.monotonic()
+        logger.debug(
+            "[OpenAI] 编辑请求 model=%s size=%s refs=%d prompt=%s",
+            self.model, _norm_size(size), len(image_urls), prompt[:80],
+        )
         session = self._session()
         files = []
         for i, u in enumerate(image_urls):
@@ -210,6 +227,10 @@ class OpenAIImageGenerator(BaseImageGenerator):
         _raise_provider_error(resp)
         url = self._parse_response(resp.json())
         w, h = _display_size(_image_size(url), (300, 300))
+        logger.debug(
+            "[OpenAI] 编辑完成 model=%s 耗时=%dms 尺寸=%dx%d",
+            self.model, int((_time.monotonic() - _t0) * 1000), w, h,
+        )
         return ImageResult(image_url=url, width=w, height=h, prompt=prompt)
 
     # ---- 抽象接口实现 ----

@@ -337,6 +337,16 @@ class OpenAICompatLLM(BaseLLM):
             "Accept": "text/event-stream",
         }
         _t0 = time.monotonic()
+
+        # DEBUG: 请求摘要（消息角色序列 + 工具列表）
+        msg_roles = [m.get("role", "?") for m in messages]
+        logger.debug(
+            "[LLM] 请求开始 model=%s thinking=%s roles=%s tools=%d",
+            self.model, thinking, msg_roles, len(oai_tools or []),
+        )
+        if oai_tools:
+            logger.debug("[LLM] 工具列表: %s", [t["function"]["name"] for t in oai_tools])
+
         logger.info(
             "[LLM] 请求开始 model=%s messages=%d tools=%d thinking=%s",
             self.model, len(messages), len(oai_tools or []), thinking,
@@ -348,6 +358,7 @@ class OpenAICompatLLM(BaseLLM):
             if not thinking and resp.status_code == 400:
                 resp.close()
                 body.pop("thinking", None)
+                logger.debug("[LLM] thinking 参数被拒绝，去掉后重试")
                 resp = session.post(self.api_url, headers=headers, json=body,
                                     timeout=self.timeout, stream=True)
             resp.raise_for_status()
@@ -363,6 +374,9 @@ class OpenAICompatLLM(BaseLLM):
         content_parts: list[str] = []
         # tool_calls 分片聚合：{index: {"name":…, "args": 拼接中的 JSON 字符串}}
         tc_acc: dict[int, dict] = {}
+        _first_token_time: float | None = None
+        _chunk_count = 0
+        _reasoning_chunk_count = 0
         try:
             for raw in resp.iter_lines(decode_unicode=True):
                 if not raw or not raw.startswith("data:"):
@@ -378,14 +392,20 @@ class OpenAICompatLLM(BaseLLM):
                 choices = chunk.get("choices") or []
                 if not choices:
                     continue  # keep-alive / usage 统计块
+                _chunk_count += 1
                 delta = choices[0].get("delta") or {}
                 # 深度思考增量（Ark/豆包：reasoning_content）：单独回调，不进正文
                 reasoning = delta.get("reasoning_content")
                 if reasoning and on_reasoning:
+                    _reasoning_chunk_count += 1
+                    if _first_token_time is None:
+                        _first_token_time = time.monotonic()
                     on_reasoning(reasoning)
                 # 文本增量：逐段推给前端打字机渲染
                 text = delta.get("content")
                 if text:
+                    if _first_token_time is None:
+                        _first_token_time = time.monotonic()
                     content_parts.append(text)
                     if on_text:
                         on_text(text)
@@ -416,10 +436,25 @@ class OpenAICompatLLM(BaseLLM):
                 tool_calls.append(ToolCall(name=acc["name"], args=args))
 
         content = "".join(content_parts)
+        _elapsed_ms = int((time.monotonic() - _t0) * 1000)
+        _first_token_ms = (
+            int((_first_token_time - _t0) * 1000) if _first_token_time else None
+        )
+
         logger.info(
             "[LLM] 请求完成 model=%s 耗时=%dms 正文=%d字 tool_calls=%s",
             self.model,
-            int((time.monotonic() - _t0) * 1000),
+            _elapsed_ms,
+            len(content),
+            [tc.name for tc in tool_calls] if tool_calls else [],
+        )
+        logger.debug(
+            "[LLM] 流式详情 model=%s | 首token=%s | chunks=%d reasoning_chunks=%d | "
+            "content_len=%d tool_calls=%s",
+            self.model,
+            f"{_first_token_ms}ms" if _first_token_ms else "N/A",
+            _chunk_count,
+            _reasoning_chunk_count,
             len(content),
             [tc.name for tc in tool_calls] if tool_calls else [],
         )
@@ -442,13 +477,18 @@ class OpenAICompatLLM(BaseLLM):
         ]
 
     def _to_openai_messages(self, messages: list[dict]) -> list[dict]:
-        """把内部消息格式转换为 OpenAI 格式（补齐 tool_call_id）"""
+        """把内部消息格式转换为 OpenAI 格式（补齐 tool_call_id）
+        
+        支持多模态消息：content 可以是 str（纯文本）或 list（多模态，包含 text + image_url）。
+        """
         result: list[dict] = []
         pending_ids: list[str] = []
         for m in messages:
             role = m.get("role")
             if role in ("system", "user"):
-                result.append({"role": role, "content": m["content"]})
+                # content 可以是 str 或 list（多模态）
+                content = m["content"]
+                result.append({"role": role, "content": content})
             elif role == "assistant":
                 calls = m.get("tool_calls")
                 if calls:

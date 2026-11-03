@@ -108,10 +108,15 @@ class ChatSessionStore:
         return copy.deepcopy(self._sessions[canvas_id])
 
     def get_context(self, canvas_id: str) -> list[dict]:
-        """注入 LLM 的历史尾部（最近 _MAX_CONTEXT_MESSAGES 条），未超限即全量"""
+        """注入 LLM 的历史尾部（最近 _MAX_CONTEXT_MESSAGES 条），防止上下文爆炸"""
         msgs = self.get_messages(canvas_id)
-        if len(msgs) > _MAX_CONTEXT_MESSAGES:
+        total = len(msgs)
+        if total > _MAX_CONTEXT_MESSAGES:
             msgs = msgs[-_MAX_CONTEXT_MESSAGES:]
+        logger.debug(
+            "[Session] 上下文注入 canvas=%s | 总历史=%d条 | 注入=%d条",
+            canvas_id, total, len(msgs),
+        )
         return msgs
 
     def append_round(self, canvas_id: str, user_message: str, assistant_message: str) -> None:
@@ -122,6 +127,10 @@ class ChatSessionStore:
         # 超限丢弃最早的消息
         if len(msgs) > _MAX_MESSAGES:
             del msgs[: len(msgs) - _MAX_MESSAGES]
+        logger.debug(
+            "[Session] 追加对话 canvas=%s | 当前=%d条 | user=%s",
+            canvas_id, len(msgs), user_message[:60].replace("\n", " "),
+        )
         self._save(canvas_id)
 
     def append_run(self, canvas_id: str, record: dict) -> None:

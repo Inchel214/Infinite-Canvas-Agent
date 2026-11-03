@@ -68,6 +68,7 @@ def list_experiences() -> list[dict]:
         file_to_id = {v["file"]: k for k, v in reg.items()}
 
         # 扫描目录：新文件自动注册（name=文件名，description=正文摘要）
+        new_files = []
         for f in sorted(EXP_DIR.glob("*.md")):
             if f.name in file_to_id:
                 continue
@@ -82,15 +83,26 @@ def list_experiences() -> list[dict]:
                 "description": _extract_desc(content),
                 "file": f.name,
             }
+            new_files.append(f.name)
+
+        if new_files:
+            logger.debug("[Experiences] 发现新风格文件: %s", new_files)
 
         # 清理注册表里文件已不存在的条目
+        removed = [
+            k for k, v in reg.items()
+            if not (EXP_DIR / v["file"]).exists()
+        ]
         reg = {
             k: v
             for k, v in reg.items()
             if (EXP_DIR / v["file"]).exists()
         }
+        if removed:
+            logger.debug("[Experiences] 清理已删除风格: %s", removed)
 
         _save_registry(reg)
+        logger.debug("[Experiences] 目录扫描完成 | 风格数=%d", len(reg))
         return [
             {"id": k, "name": v["name"], "description": v["description"]}
             for k, v in reg.items()
@@ -103,15 +115,21 @@ def read_experience(exp_id: str) -> dict | None:
         reg = _load_registry()
         meta = reg.get(exp_id)
         if not meta:
+            logger.debug("[Experiences] 风格不存在: %s", exp_id)
             return None
         path = EXP_DIR / meta["file"]
         if not path.exists():
+            logger.debug("[Experiences] 风格文件不存在: %s", path.name)
             return None
         try:
             content = path.read_text(encoding="utf-8")
         except Exception as e:
             logger.warning("风格全文读取失败（按不存在处理）: %s: %s", path.name, e)
             return None
+        logger.debug(
+            "[Experiences] 读取风格 %s（%s）| 内容=%d字",
+            exp_id, meta["name"], len(content),
+        )
         return {
             "id": exp_id,
             "name": meta["name"],
@@ -144,6 +162,7 @@ def add_experience(name: str, description: str, content: str) -> dict:
             "file": filename,
         }
         _save_registry(reg)
+        logger.info("[Experiences] 新增风格《%s》| id=%s | 文件=%s", name.strip(), exp_id, filename)
         return {"id": exp_id, "name": name.strip(), "description": reg[exp_id]["description"]}
 
 
@@ -166,6 +185,7 @@ def update_experience(exp_id: str, name: str | None = None, description: str | N
         if description is not None:
             meta["description"] = description.strip()
         _save_registry(reg)
+        logger.info("[Experiences] 更新风格 %s | name=%s", exp_id, name)
         return {"id": exp_id, "name": meta["name"], "description": meta["description"]}
 
 
@@ -180,6 +200,7 @@ def delete_experience(exp_id: str) -> bool:
         if path.exists():
             path.unlink()
         _save_registry(reg)
+        logger.info("[Experiences] 删除风格 %s（%s）", exp_id, meta["name"])
         return True
 
 
@@ -198,21 +219,25 @@ def apply_experience(exp_id: str, prompt: str) -> str:
     style_block = f"请严格遵循以下风格指南《{exp['name']}》进行创作：\n{exp['content']}"
     if not prompt.strip():
         return style_block
+    logger.debug("[Experiences] 应用风格 %s（%s）到 prompt", exp_id, exp["name"])
     return f"{prompt.strip()}\n\n{style_block}"
 
 
 def apply_experiences(exp_ids: list[str], prompt: str) -> str:
     """多风格版：按顺序把每份风格指南全文拼接进用户 prompt（无效 ID 自动跳过）"""
     blocks: list[str] = []
+    applied_names = []
     for exp_id in exp_ids:
         exp = read_experience(exp_id)
         if exp:
             blocks.append(f"请严格遵循以下风格指南《{exp['name']}》进行创作：\n{exp['content']}")
+            applied_names.append(exp["name"])
     if not blocks:
         return prompt
     joined = "\n\n".join(blocks)
     if not prompt.strip():
         return joined
+    logger.debug("[Experiences] 应用 %d 份风格: %s", len(applied_names), applied_names)
     return f"{prompt.strip()}\n\n{joined}"
 
 

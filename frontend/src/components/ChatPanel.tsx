@@ -6,6 +6,7 @@ import {
   getChatHistory,
   clearChatHistory,
   stopAgent,
+  respondToAgent,
 } from "../api/agent";
 import type { AgentStep, CanvasNode, CanvasState } from "../types/canvas";
 
@@ -20,6 +21,13 @@ interface ChatEntry {
   stopped?: boolean; // 用户中途停止
   timestamp: number;
   error?: boolean;
+  // 人在回路：Agent 询问用户
+  askUser?: {
+    question: string;
+    options?: string[];
+    answered?: boolean; // 用户是否已回复
+    response?: string; // 用户的回复
+  };
 }
 
 interface ChatReference {
@@ -54,7 +62,126 @@ const TOOL_LABELS: Record<string, string> = {
   move_node: "移动节点",
   delete_node: "删除节点",
   list_nodes: "查看节点",
+  ask_user: "询问用户",
 };
+
+// 人在回路：Agent 询问用户卡片
+function AskUserCard({
+  question,
+  options,
+  answered,
+  response,
+  onRespond,
+}: {
+  question: string;
+  options?: string[];
+  answered?: boolean;
+  response?: string;
+  onRespond: (response: string) => void;
+}) {
+  const [inputValue, setInputValue] = useState("");
+
+  const handleSubmit = (value: string) => {
+    if (!value.trim()) return;
+    onRespond(value.trim());
+    setInputValue("");
+  };
+
+  return (
+    <div
+      style={{
+        alignSelf: "flex-start",
+        maxWidth: "92%",
+        width: "92%",
+        background: "rgba(251,191,36,0.08)",
+        border: "1px solid rgba(251,191,36,0.3)",
+        borderRadius: 8,
+        padding: "10px 12px",
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
+        <span style={{ fontSize: 14 }}>💬</span>
+        <span style={{ fontWeight: 600, fontSize: 13, color: "#fbbf24" }}>
+          Agent 需要你的回复
+        </span>
+      </div>
+      <div style={{ fontSize: 13, color: "#e8e8f0", marginBottom: 10, lineHeight: 1.5 }}>
+        {question}
+      </div>
+      {answered ? (
+        <div
+          style={{
+            fontSize: 12,
+            color: "#888",
+            padding: "6px 10px",
+            background: "rgba(255,255,255,0.05)",
+            borderRadius: 6,
+          }}
+        >
+          已回复：{response}
+        </div>
+      ) : options && options.length > 0 ? (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+          {options.map((opt, i) => (
+            <button
+              key={i}
+              onClick={() => handleSubmit(opt)}
+              style={{
+                padding: "6px 12px",
+                fontSize: 12,
+                background: "rgba(99,102,241,0.2)",
+                border: "1px solid rgba(99,102,241,0.4)",
+                borderRadius: 6,
+                color: "#c7d2fe",
+                cursor: "pointer",
+              }}
+            >
+              {opt}
+            </button>
+          ))}
+        </div>
+      ) : (
+        <div style={{ display: "flex", gap: 6 }}>
+          <input
+            type="text"
+            value={inputValue}
+            onChange={(e) => setInputValue(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                handleSubmit(inputValue);
+              }
+            }}
+            placeholder="输入你的回复..."
+            style={{
+              flex: 1,
+              padding: "6px 10px",
+              fontSize: 12,
+              background: "rgba(255,255,255,0.08)",
+              border: "1px solid rgba(255,255,255,0.15)",
+              borderRadius: 6,
+              color: "#e8e8f0",
+              outline: "none",
+            }}
+          />
+          <button
+            onClick={() => handleSubmit(inputValue)}
+            style={{
+              padding: "6px 12px",
+              fontSize: 12,
+              background: "rgba(99,102,241,0.8)",
+              border: "none",
+              borderRadius: 6,
+              color: "#fff",
+              cursor: "pointer",
+            }}
+          >
+            发送
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function formatTime(ts: number): string {
   const d = new Date(ts);
@@ -206,11 +333,17 @@ function chipMarker(dataset: DOMStringMap): string {
 }
 
 /**
- * 序列化编辑器内容为纯文本：文本原样保留，引用芯片在原位置展开为标记。
+ * 序列化编辑器内容为文本 + 引用图片列表。
+ * 文本：原样保留，引用芯片在原位置展开为标记。
+ * 引用图片列表：包含 node_id 和 image_url，供 Vision 能力使用。
  * 兼容浏览器产生的 <br> 与 <div>/<p> 块级换行。
  */
-function serializeEditor(root: HTMLElement): string {
+function serializeEditor(root: HTMLElement): {
+  text: string;
+  referencedImages: Array<{ node_id: string; image_url: string }>;
+} {
   let out = "";
+  const referencedImages: Array<{ node_id: string; image_url: string }> = [];
   const walk = (node: Node) => {
     if (node.nodeType === Node.TEXT_NODE) {
       out += node.textContent || "";
@@ -219,6 +352,13 @@ function serializeEditor(root: HTMLElement): string {
     if (!(node instanceof HTMLElement)) return;
     if (node.dataset.nodeId) {
       out += chipMarker(node.dataset);
+      // 收集引用图片信息（如果有 image_url）
+      if (node.dataset.imageUrl) {
+        referencedImages.push({
+          node_id: node.dataset.nodeId,
+          image_url: node.dataset.imageUrl,
+        });
+      }
       return;
     }
     if (node.tagName === "BR") {
@@ -231,7 +371,7 @@ function serializeEditor(root: HTMLElement): string {
     if (isBlock && !out.endsWith("\n")) out += "\n";
   };
   root.childNodes.forEach(walk);
-  return out;
+  return { text: out, referencedImages };
 }
 
 // 构建输入框内的引用芯片（DOM 直建，脱离 React 渲染，避免 contenteditable 光标问题）
@@ -243,6 +383,7 @@ function buildRefChip(node: CanvasNode): HTMLElement {
   chip.dataset.nodeId = node.id;
   chip.dataset.label = label;
   if (node.content) chip.dataset.content = node.content;
+  if (node.image_url) chip.dataset.imageUrl = node.image_url; // 存储图片 URL 供 Vision 使用
   chip.title = node.content || "引用图片";
   if (node.image_url) {
     const img = document.createElement("img");
@@ -519,10 +660,12 @@ export function ChatPanel({
   const handleSend = async () => {
     const editor = editorRef.current;
     if (!editor || !canvasId || sending) return;
-    // 序列化编辑器：文本原样保留，引用芯片在原位置展开为 [引用图片 ...] 标记。
+    // 序列化编辑器：文本原样保留，引用芯片在原位置展开为标记。
+    // 同时收集引用图片信息（node_id + image_url），供 Vision 能力使用。
     // 本地气泡与历史持久化共用这份文本，渲染时再解析回芯片
-    const message = serializeEditor(editor).trim();
-    if (!message) return;
+    const { text: message, referencedImages } = serializeEditor(editor);
+    const trimmedMessage = message.trim();
+    if (!trimmedMessage) return;
     editor.innerHTML = "";
     setHasContent(false);
     // 引用已随消息序列化，清空 App 侧收件箱避免残留
@@ -532,7 +675,7 @@ export function ChatPanel({
     // 立刻挂一条空的 assistant 条目作为"直播位"，流式事件逐步填充它
     setEntries((prev) => [
       ...prev,
-      { role: "user", content: message, timestamp: ts },
+      { role: "user", content: trimmedMessage, timestamp: ts },
       { role: "assistant", content: "", steps: [], timestamp: ts },
     ]);
 
@@ -549,7 +692,7 @@ export function ChatPanel({
     };
 
     try {
-      await chatWithAgentStream(canvasId, message, (evt) => {
+      await chatWithAgentStream(canvasId, trimmedMessage, referencedImages, (evt) => {
         if (evt.type === "plan_delta" && evt.content) {
           // 计划逐字流出（打字机），追加渲染
           updateLive((e) => ({ ...e, plan: (e.plan || "") + evt.content }));
@@ -593,6 +736,15 @@ export function ChatPanel({
             }
             return { ...e, steps };
           });
+        } else if (evt.type === "ask_user") {
+          // 人在回路：Agent 询问用户
+          updateLive((e) => ({
+            ...e,
+            askUser: {
+              question: evt.question || "",
+              options: evt.options,
+            },
+          }));
         } else if (evt.type === "done") {
           updateLive((e) => ({
             ...e,
@@ -623,6 +775,28 @@ export function ChatPanel({
       await stopAgent(canvasId);
     } catch {
       // 停止请求失败时忽略，等待流自然结束
+    }
+  };
+
+  // 人在回路：用户回复 Agent 的询问
+  const handleRespond = async (response: string) => {
+    if (!canvasId || !response.trim()) return;
+    try {
+      await respondToAgent(canvasId, response.trim());
+      // 更新 UI 标记已回复
+      setEntries((prev) => {
+        if (prev.length === 0) return prev;
+        const last = prev[prev.length - 1];
+        if (last.role !== "assistant" || !last.askUser) return prev;
+        const next = [...prev];
+        next[next.length - 1] = {
+          ...last,
+          askUser: { ...last.askUser, answered: true, response: response.trim() },
+        };
+        return next;
+      });
+    } catch {
+      // 回复失败时忽略
     }
   };
 
@@ -974,6 +1148,17 @@ export function ChatPanel({
                       </div>
                     ))}
                 </div>
+              )}
+
+              {/* 人在回路：Agent 询问用户 */}
+              {entry.askUser && (
+                <AskUserCard
+                  question={entry.askUser.question}
+                  options={entry.askUser.options}
+                  answered={entry.askUser.answered}
+                  response={entry.askUser.response}
+                  onRespond={handleRespond}
+                />
               )}
 
               {entry.timestamp > 0 && (

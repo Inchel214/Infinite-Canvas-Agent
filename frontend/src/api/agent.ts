@@ -58,7 +58,8 @@ export interface AgentStreamEvent {
     | "tool_start"
     | "tool_result"
     | "response"
-    | "done";
+    | "done"
+    | "ask_user";
   content?: string;
   tool?: string;
   args?: Record<string, unknown>;
@@ -68,18 +69,26 @@ export interface AgentStreamEvent {
   message?: string;
   canvas?: CanvasState;
   steps?: AgentStep[];
+  // ask_user 事件专用
+  question?: string;
+  options?: string[];
 }
 
 // 流式 Agent 对话：计划/思考/工具过程逐事件回调，最终 done 事件带完整结果
 export async function chatWithAgentStream(
   canvasId: string,
   prompt: string,
+  referencedImages: Array<{ node_id: string; image_url: string }>,
   onEvent: (evt: AgentStreamEvent) => void
 ): Promise<void> {
   const res = await fetch(`${API_BASE}/agent/chat/stream`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ canvas_id: canvasId, prompt }),
+    body: JSON.stringify({
+      canvas_id: canvasId,
+      prompt,
+      referenced_images: referencedImages,
+    }),
   });
   if (!res.ok || !res.body) {
     throw new Error(`${res.status}`);
@@ -117,6 +126,22 @@ export async function stopAgent(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ canvas_id: canvasId }),
+  });
+  if (!res.ok) {
+    throw new Error(`${res.status}`);
+  }
+  return res.json();
+}
+
+// 用户回复 Agent 的询问，恢复暂停的执行
+export async function respondToAgent(
+  canvasId: string,
+  response: string
+): Promise<{ success: boolean; message: string }> {
+  const res = await fetch(`${API_BASE}/agent/respond`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ canvas_id: canvasId, response }),
   });
   if (!res.ok) {
     throw new Error(`${res.status}`);

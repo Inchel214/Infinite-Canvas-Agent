@@ -6,12 +6,17 @@
 事件流（token 级打字机）：
   plan_delta（计划逐字）/ delta（思考与回复逐字）/ tool_start / tool_result /
   response（最终回复完成）/ done（收尾，带完整结果）
+
+并行执行：当 LLM 一次返回多个生图类工具调用时，自动并行执行（耗时最长，收益最大）。
+生图工具（generate/variate/edit/compose）都是"创建新节点"，天然无依赖，可安全并行。
 """
 from __future__ import annotations
 
+import copy
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -20,6 +25,9 @@ from app.agent.prompts import build_system_prompt
 from app.canvas.state import CanvasState
 from app.canvas.store import BaseStore
 from app.tools.base import ToolManager, ToolResult
+
+# 生图类工具：耗时最长（10-30秒），可并行执行
+IMAGE_TOOLS = {"generate_image", "variate_image", "edit_image", "compose_images"}
 
 logger = logging.getLogger(__name__)
 
@@ -60,17 +68,23 @@ REFLECTION_HINT = (
 
 
 class RunControl:
-    """进行中 Agent 运行的注册表：外部可按 canvas_id 请求停止（线程安全）"""
+    """进行中 Agent 运行的注册表：外部可按 canvas_id 请求停止或暂停等待用户回复（线程安全）"""
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._events: dict[str, threading.Event] = {}
+        self._events: dict[str, threading.Event] = {}  # 停止信号
+        self._pause_events: dict[str, threading.Event] = {}  # 暂停信号（用户回复后 set）
+        self._pending_questions: dict[str, dict] = {}  # 等待中的问题
+        self._user_responses: dict[str, str] = {}  # 用户回复
 
     def register(self, canvas_id: str) -> threading.Event:
         """注册一次运行，返回其停止信号"""
         evt = threading.Event()
+        pause_evt = threading.Event()
+        pause_evt.set()  # 初始为 set，不暂停
         with self._lock:
             self._events[canvas_id] = evt
+            self._pause_events[canvas_id] = pause_evt
         return evt
 
     def unregister(self, canvas_id: str, evt: threading.Event) -> None:
@@ -78,6 +92,9 @@ class RunControl:
         with self._lock:
             if self._events.get(canvas_id) is evt:
                 del self._events[canvas_id]
+                self._pause_events.pop(canvas_id, None)
+                self._pending_questions.pop(canvas_id, None)
+                self._user_responses.pop(canvas_id, None)
 
     def request_stop(self, canvas_id: str) -> bool:
         """请求停止指定画布当前运行；返回是否存在进行中的运行"""
@@ -86,7 +103,60 @@ class RunControl:
         if evt is None:
             return False
         evt.set()
+        # 同时唤醒暂停等待，让线程能退出
+        with self._lock:
+            pause_evt = self._pause_events.get(canvas_id)
+        if pause_evt:
+            pause_evt.set()
         return True
+
+    def request_pause(self, canvas_id: str, question: dict) -> bool:
+        """请求暂停并等待用户回复。返回是否成功暂停。"""
+        with self._lock:
+            pause_evt = self._pause_events.get(canvas_id)
+            stop_evt = self._events.get(canvas_id)
+            if not pause_evt or (stop_evt and stop_evt.is_set()):
+                return False
+            self._pending_questions[canvas_id] = question
+            pause_evt.clear()  # 清空，等待用户回复后 set
+        logger.debug("[RunControl] 请求暂停 canvas=%s question=%s", canvas_id, question.get("question", "")[:50])
+        return True
+
+    def wait_for_response(self, canvas_id: str, timeout: int = 300) -> str | None:
+        """阻塞等待用户回复，返回用户输入或超时返回 None"""
+        with self._lock:
+            pause_evt = self._pause_events.get(canvas_id)
+            stop_evt = self._events.get(canvas_id)
+        if not pause_evt:
+            return None
+        
+        # 阻塞等待，直到用户回复、超时、或被停止
+        if pause_evt.wait(timeout=timeout):
+            # 检查是否是被停止唤醒的
+            if stop_evt and stop_evt.is_set():
+                return None
+            with self._lock:
+                response = self._user_responses.pop(canvas_id, None)
+            logger.debug("[RunControl] 收到用户回复 canvas=%s response=%s", canvas_id, (response or "")[:50])
+            return response
+        logger.debug("[RunControl] 等待用户回复超时 canvas=%s", canvas_id)
+        return None  # 超时
+
+    def provide_response(self, canvas_id: str, response: str) -> bool:
+        """用户提供回复，恢复执行"""
+        with self._lock:
+            pause_evt = self._pause_events.get(canvas_id)
+            if pause_evt and not pause_evt.is_set():
+                self._user_responses[canvas_id] = response
+                pause_evt.set()  # 唤醒等待的线程
+                logger.debug("[RunControl] 用户回复恢复执行 canvas=%s", canvas_id)
+                return True
+        return False
+
+    def get_pending_question(self, canvas_id: str) -> dict | None:
+        """获取当前等待中的问题"""
+        with self._lock:
+            return self._pending_questions.get(canvas_id)
 
 
 @dataclass
@@ -97,6 +167,8 @@ class AgentResult:
     state: CanvasState
     steps: list[dict] = field(default_factory=list)
     stopped: bool = False  # 用户主动停止
+    waiting_for_user: bool = False  # 等待用户回复
+    pending_question: dict | None = None  # 等待中的问题
 
 
 class ReActAgent:
@@ -127,12 +199,14 @@ class ReActAgent:
         history: list[dict] | None = None,
         on_event: EventCallback | None = None,
         failure_note: str | None = None,
+        referenced_images: list[dict] | None = None,  # Vision: 用户引用的图片列表
     ) -> AgentResult:
         """执行 Agent 循环。
 
         history 为该画布的历史对话（user/assistant），注入 LLM 上下文；
         failure_note 为上一轮未完成任务的摘要（供"重试/继续"精确重放）；
-        on_event 非空时逐步推送执行事件（SSE 流式）。
+        on_event 非空时逐步推送执行事件（SSE 流式）；
+        referenced_images 为用户引用的图片列表（Vision 能力）。
         """
         state = self.store.get_canvas(canvas_id)
 
@@ -143,20 +217,29 @@ class ReActAgent:
         stop_evt = self.control.register(canvas_id)
         try:
             # system + 历史对话 + 当前用户消息（当前消息每步重建画布状态）
+            system_prompt = build_system_prompt()
             messages: list[dict] = [
-                {"role": "system", "content": build_system_prompt()},  # 热加载风格库目录
+                {"role": "system", "content": system_prompt},
                 *(history or []),
             ]
             user_msg_index = len(messages)
             messages.append({
                 "role": "user",
-                "content": self._build_user_message(prompt, state, failure_note),
+                "content": self._build_user_message(prompt, state, failure_note, referenced_images),
             })
 
             logger.info(
                 "[Agent] 任务开始 canvas=%s prompt=%s",
                 canvas_id, _clip(prompt, 80),
             )
+            logger.debug(
+                "[Agent] 上下文组装 canvas=%s | system_prompt=%d字 | history=%d条 | "
+                "failure_note=%s | referenced_images=%d",
+                canvas_id, len(system_prompt), len(history or []),
+                "有" if failure_note else "无",
+                len(referenced_images) if referenced_images else 0,
+            )
+            logger.debug("[Agent] System Prompt 全文:\n%s", system_prompt)
 
             steps: list[dict] = []
 
@@ -165,6 +248,7 @@ class ReActAgent:
             # 纯对话 → [chat] 前缀直接回答（delta 流式，单次调用收尾，不出计划卡片）
             plan, chat_answer = self._make_plan(messages, user_msg_index, emit)
             if chat_answer:
+                logger.debug("[Agent] 路由决策: 纯对话（chat），跳过 ReAct 循环")
                 steps.append({"type": "response", "content": chat_answer})
                 emit({"type": "response", "content": chat_answer})
                 return AgentResult(success=True, message=chat_answer, state=state, steps=steps)
@@ -173,9 +257,11 @@ class ReActAgent:
                 if self._is_inquiry_plan(plan):
                     # 询问性质的内容：只作为正文回复发出，不发 plan 事件
                     # plan 卡片只用于工具任务的执行路线图，询问用户本质上是纯对话
+                    logger.debug("[Agent] 路由决策: 询问用户（inquiry），跳过 ReAct 循环")
                     steps.append({"type": "response", "content": plan})
                     emit({"type": "response", "content": plan})
                     return AgentResult(success=True, message=plan, state=state, steps=steps)
+                logger.debug("[Agent] 路由决策: 工具任务（plan），进入 ReAct 循环")
                 steps.append({"type": "plan", "content": plan})
                 # 计划注入上下文，执行阶段模型能看到自己的计划
                 messages.append({"role": "assistant", "content": f"执行计划：\n{plan}"})
@@ -185,6 +271,11 @@ class ReActAgent:
             for _step in range(self.max_steps):
                 if stop_evt.is_set():
                     return self._stopped_result(state, steps)
+
+                logger.debug(
+                    "[Agent] ReAct 步骤 %d/%d canvas=%s | 消息数=%d",
+                    _step + 1, self.max_steps, canvas_id, len(messages),
+                )
 
                 # LLM 流式调用：深度思考过程实时推前端（reasoning_delta），
                 # 文本增量实时推前端（delta 打字机），tool_calls 聚合后照常执行。
@@ -211,17 +302,121 @@ class ReActAgent:
                         steps=steps,
                     )
 
-                # 执行工具调用
+                # 执行工具调用（支持并行执行生图工具）
                 aborted = False
-                for tool_call in response.tool_calls:
+                
+                # 分离生图工具和其他工具
+                image_tool_calls = [tc for tc in response.tool_calls if tc.name in IMAGE_TOOLS]
+                other_tool_calls = [tc for tc in response.tool_calls if tc.name not in IMAGE_TOOLS]
+                
+                # 并行执行生图工具（如果有多个）
+                if len(image_tool_calls) > 1:
+                    logger.info(
+                        "[Tool] 并行执行 %d 个生图工具 canvas=%s",
+                        len(image_tool_calls), canvas_id,
+                    )
+                    # 为每个工具创建独立的 state 副本
+                    state_copies = {tc: copy.deepcopy(state) for tc in image_tool_calls}
+                    
+                    def execute_image_tool(tool_call: ToolCall, tool_state: CanvasState) -> tuple[ToolCall, ToolResult, float]:
+                        """执行单个生图工具，返回 (tool_call, result, cost_ms)"""
+                        _t0 = time.monotonic()
+                        result = self._execute_tool(tool_call, tool_state)
+                        _cost_ms = int((time.monotonic() - _t0) * 1000)
+                        return tool_call, result, _cost_ms
+                    
+                    # 使用线程池并行执行
+                    with ThreadPoolExecutor(max_workers=min(len(image_tool_calls), 4)) as executor:
+                        futures = {
+                            executor.submit(execute_image_tool, tc, state_copies[tc]): tc
+                            for tc in image_tool_calls
+                        }
+                        
+                        # 收集结果（按原始顺序）
+                        results_map = {}
+                        for future in as_completed(futures):
+                            tc, result, cost_ms = future.result()
+                            results_map[tc] = (result, cost_ms)
+                    
+                    # 按原始顺序处理结果
+                    for tool_call in image_tool_calls:
+                        if stop_evt.is_set():
+                            aborted = True
+                            break
+                        
+                        result, cost_ms = results_map[tool_call]
+                        
+                        if result.success:
+                            logger.info(
+                                "[Tool] 完成 %s canvas=%s 耗时=%dms 结果=%s",
+                                tool_call.name, canvas_id, cost_ms, _clip(result.message, 120),
+                            )
+                        else:
+                            logger.warning(
+                                "[Tool] 失败 %s canvas=%s 耗时=%dms 原因=%s",
+                                tool_call.name, canvas_id, cost_ms, _clip(result.message, 160),
+                            )
+                        
+                        steps.append({
+                            "type": "tool_call",
+                            "tool": tool_call.name,
+                            "args": tool_call.args,
+                            "result": result.message,
+                            "success": result.success,
+                        })
+                        
+                        # 工具结果加入消息
+                        tool_content = result.message
+                        if not result.success:
+                            tool_content += REFLECTION_HINT
+                        messages.append({
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [tool_call],
+                        })
+                        messages.append({
+                            "role": "tool",
+                            "content": tool_content,
+                        })
+                        
+                        # 合并结果到主 state
+                        if result.success and result.state:
+                            # 将新节点从工具结果合并到主 state
+                            for node_id, node in result.state.nodes.items():
+                                if node_id not in state.nodes:
+                                    state.nodes[node_id] = node
+                            self.store.save_canvas(state)
+                        
+                        emit({
+                            "type": "tool_result",
+                            "tool": tool_call.name,
+                            "result": result.message,
+                            "success": result.success,
+                            "canvas": state.to_dict() if result.success else None,
+                        })
+                
+                # 串行执行其他工具
+                for tool_call in other_tool_calls:
                     if stop_evt.is_set():
                         aborted = True
                         break
+
+                    # ask_user 工具特殊处理：推送 ask_user 事件供前端渲染
+                    if tool_call.name == "ask_user":
+                        emit({
+                            "type": "ask_user",
+                            "question": tool_call.args.get("question", ""),
+                            "options": tool_call.args.get("options", []),
+                        })
 
                     emit({"type": "tool_start", "tool": tool_call.name, "args": tool_call.args})
                     logger.info(
                         "[Tool] 开始 %s canvas=%s args=%s",
                         tool_call.name, canvas_id, _clip_args(tool_call.args),
+                    )
+                    logger.debug(
+                        "[Tool] 完整参数 %s canvas=%s args=%s",
+                        tool_call.name, canvas_id, tool_call.args,
                     )
                     _t0 = time.monotonic()
                     result = self._execute_tool(tool_call, state)
@@ -335,10 +530,31 @@ class ReActAgent:
         未定时缓冲并匹配前缀，匹配上转 delta，不匹配转 plan_delta。
         """
         plan_messages = list(messages)
-        plan_messages[user_msg_index] = {
-            "role": "user",
-            "content": messages[user_msg_index]["content"] + PLAN_SUFFIX,
-        }
+        # 处理多模态消息：content 可能是 str 或 list
+        user_content = messages[user_msg_index]["content"]
+        if isinstance(user_content, list):
+            # 多模态格式：找到文本部分并追加 PLAN_SUFFIX
+            new_content = []
+            for part in user_content:
+                if part.get("type") == "text":
+                    # 在文本部分追加 PLAN_SUFFIX
+                    new_content.append({
+                        "type": "text",
+                        "text": part["text"] + PLAN_SUFFIX
+                    })
+                else:
+                    # 图片部分保持不变
+                    new_content.append(part)
+            plan_messages[user_msg_index] = {
+                "role": "user",
+                "content": new_content,
+            }
+        else:
+            # 纯文本格式
+            plan_messages[user_msg_index] = {
+                "role": "user",
+                "content": user_content + PLAN_SUFFIX,
+            }
 
         # pending（未定）→ chat（纯对话，文本进 delta）/ plan（计划，文本进 plan_delta）
         state = {"mode": "pending", "buf": ""}
@@ -381,6 +597,7 @@ class ReActAgent:
             logger.warning("Agent 规划阶段失败，降级为无计划执行", exc_info=True)
             return "", ""
         content = (resp.content or "").strip()
+        logger.debug("[Agent] 规划结果 content=%s", _clip(content, 200))
         if content.startswith(CHAT_PREFIX):
             # 纯对话：直接回答，跳过计划与主循环
             return "", content[len(CHAT_PREFIX):].strip()
@@ -402,7 +619,18 @@ class ReActAgent:
 
         # 处理单个 node_id 特殊值
         if "node_id" in args:
-            args["node_id"] = self._resolve_node_id(args["node_id"], state)
+            resolved = self._resolve_node_id(args["node_id"], state)
+            if resolved is None:
+                logger.debug(
+                    "[Tool] node_id 解析失败: %r → None（画布无可用节点）",
+                    tool_call.args["node_id"],
+                )
+            elif resolved != args["node_id"]:
+                logger.debug(
+                    "[Tool] node_id 解析: %r → %s",
+                    tool_call.args["node_id"], resolved,
+                )
+            args["node_id"] = resolved
             if args["node_id"] is None:
                 return ToolResult(
                     success=False,
@@ -464,9 +692,18 @@ class ReActAgent:
         return resolved
 
     def _build_user_message(
-        self, prompt: str, state: CanvasState, failure_note: str | None = None
-    ) -> str:
-        """构建包含画布状态的用户消息；failure_note 附在末尾供失败任务重放"""
+        self,
+        prompt: str,
+        state: CanvasState,
+        failure_note: str | None = None,
+        referenced_images: list[dict] | None = None,
+    ) -> str | list[dict]:
+        """构建包含画布状态的用户消息；failure_note 附在末尾供失败任务重放。
+        
+        如果有 referenced_images（Vision 能力），返回多模态格式（list of content parts）；
+        否则返回纯文本格式（str）。
+        """
+        # 构建画布上下文文本
         nodes_info = []
         for n in state.list_nodes():
             label = f"图{n.index}" if n.index is not None else "图?"
@@ -480,7 +717,60 @@ class ReActAgent:
                     f"- [{label}] {n.id}: {n.type} '{n.content}' at ({n.x}, {n.y})"
                 )
         canvas_context = "\n".join(nodes_info) if nodes_info else "(空画布)"
-        message = f"画布当前节点：\n{canvas_context}\n\n用户指令：{prompt}"
+        text_content = f"画布当前节点：\n{canvas_context}\n\n用户指令：{prompt}"
         if failure_note:
-            message += f"\n\n{failure_note}"
-        return message
+            text_content += f"\n\n{failure_note}"
+
+        # 如果没有引用图片，返回纯文本
+        if not referenced_images:
+            return text_content
+
+        # 有引用图片，构建多模态消息格式
+        content_parts = [{"type": "text", "text": text_content}]
+        
+        # 添加引用图片
+        for ref in referenced_images:
+            image_url = ref.get("image_url", "")
+            if not image_url:
+                continue
+            
+            # 本地图片 URL 转为 data URL（base64）
+            if image_url.startswith("http://127.0.0.1:8000/images/"):
+                try:
+                    from app.image.files import local_url_to_data_url
+                    data_url = local_url_to_data_url(image_url)
+                    content_parts.append({
+                        "type": "image_url",
+                        "image_url": {"url": data_url}
+                    })
+                    logger.debug(
+                        "[Vision] 添加引用图片 node_id=%s (本地URL→data URL)",
+                        ref.get("node_id"),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[Vision] 本地图片转 data URL 失败 node_id=%s url=%s error=%s",
+                        ref.get("node_id"), image_url, e,
+                    )
+            elif image_url.startswith("data:"):
+                # 已经是 data URL，直接使用
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": image_url}
+                })
+                logger.debug(
+                    "[Vision] 添加引用图片 node_id=%s (已是data URL)",
+                    ref.get("node_id"),
+                )
+            else:
+                # 远端 URL，直接使用（LLM API 会下载）
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": image_url}
+                })
+                logger.debug(
+                    "[Vision] 添加引用图片 node_id=%s (远端URL)",
+                    ref.get("node_id"),
+                )
+        
+        return content_parts

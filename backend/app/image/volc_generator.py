@@ -99,6 +99,8 @@ class VolcEngineImageGenerator(BaseImageGenerator):
         size: str = "2K",
     ) -> str:
         """调用 Ark API，返回 data URL（base64）避免浏览器 CORS 问题"""
+        import time as _time
+        _t0 = _time.monotonic()
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -113,6 +115,11 @@ class VolcEngineImageGenerator(BaseImageGenerator):
         refs = self._valid_refs(image_urls)
         if refs:
             body["image"] = refs
+
+        logger.debug(
+            "[Volc] 生图请求 model=%s size=%s refs=%d prompt=%s",
+            self.model, body["size"], len(refs), prompt[:80],
+        )
 
         # trust_env=False 绕过系统代理，proxies 禁用代理
         session = requests.Session()
@@ -143,6 +150,11 @@ class VolcEngineImageGenerator(BaseImageGenerator):
         img_resp.raise_for_status()
         mime = img_resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
         b64 = base64.b64encode(img_resp.content).decode("ascii")
+        logger.debug(
+            "[Volc] 生图完成 model=%s 耗时=%dms 图片大小=%dKB",
+            self.model, int((_time.monotonic() - _t0) * 1000),
+            len(img_resp.content) // 1024,
+        )
         return f"data:{mime};base64,{b64}"
 
     def _call_stream(
@@ -174,6 +186,13 @@ class VolcEngineImageGenerator(BaseImageGenerator):
         refs = self._valid_refs(image_urls)
         if refs:
             body["image"] = refs
+
+        import time as _time
+        _t0 = _time.monotonic()
+        logger.debug(
+            "[Volc] 流式生图请求 model=%s size=%s refs=%d prompt=%s",
+            self.stream_model, body["size"], len(refs), prompt[:80],
+        )
 
         session = requests.Session()
         session.trust_env = False
@@ -217,6 +236,11 @@ class VolcEngineImageGenerator(BaseImageGenerator):
 
         if not last_url:
             raise ValueError("流式响应中未收到图片数据")
+
+        logger.debug(
+            "[Volc] 流式生图完成 model=%s 耗时=%dms previews=%d",
+            self.stream_model, int((_time.monotonic() - _t0) * 1000), partial_count,
+        )
 
         # 最终图：下载转 base64 data URL（与节点存储格式一致）
         if last_url.startswith("data:"):

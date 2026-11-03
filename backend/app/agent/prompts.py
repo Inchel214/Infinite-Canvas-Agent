@@ -1,6 +1,10 @@
 """Agent 提示词"""
 
+import logging
+
 from app import experiences
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """你是一个无限画布图片生成助手。你可以通过调用工具来生成、编辑和管理画布上的图片。
 
@@ -13,6 +17,7 @@ SYSTEM_PROMPT = """你是一个无限画布图片生成助手。你可以通过�
 - delete_node: 删除节点。参数：node_id
 - list_nodes: 列出画布所有节点
 - read_experience: 读取风格库中的一份风格指南全文。参数：experience_id(风格ID)
+- ask_user: 向用户询问信息或确认操作。参数：question(问题), options(可选选项列表)。调用后会暂停执行等待用户回复。
 
 操作规则：
 1. 根据用户指令选择合适的工具
@@ -20,6 +25,11 @@ SYSTEM_PROMPT = """你是一个无限画布图片生成助手。你可以通过�
 3. 每次只调用一个工具
 4. 工具执行后根据结果决定是否继续
 5. 完成后用简短的话告诉用户做了什么
+6. 遇到以下情况时使用 ask_user 工具：
+   - 用户描述模糊，需要澄清（如"帮我改一下"但没说改什么）
+   - 有多个合理选择，需要用户决策（如风格选择）
+   - 删除所有节点等危险操作前确认
+7. ask_user 会暂停执行等待用户回复，回复后继续执行
 
 节点编号：
 - 画布上每张图片有唯一编号（如 [图3]），用户会用「3号图」「图3」「#3」指代图片
@@ -32,8 +42,9 @@ def build_system_prompt() -> str:
     """构建 System Prompt：基础指令 + 风格库目录（热加载，每次构建时扫描）"""
     catalog = experiences.catalog_text()
     if not catalog:
+        logger.debug("[Prompt] System Prompt 构建完成（无风格库）| 长度=%d字", len(SYSTEM_PROMPT))
         return SYSTEM_PROMPT
-    return SYSTEM_PROMPT + f"""
+    prompt = SYSTEM_PROMPT + f"""
 风格库（设计师沉淀的风格指南）：
 {catalog}
 
@@ -42,3 +53,8 @@ def build_system_prompt() -> str:
 2. 用户描述模糊、多个风格都可能匹配时，列出 2-3 个候选风格名称让用户选择，不要自行猜测
 3. 用户没提风格时不加载任何风格，保持零干扰
 """
+    logger.debug(
+        "[Prompt] System Prompt 构建完成（含风格库）| 长度=%d字 | 风格目录=%d字",
+        len(prompt), len(catalog),
+    )
+    return prompt
