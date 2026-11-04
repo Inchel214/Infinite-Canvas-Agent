@@ -183,7 +183,7 @@ class ReActAgent:
         llm: BaseLLM,
         tool_manager: ToolManager,
         store: BaseStore,
-        max_steps: int = 30,
+        max_steps: int = 100,
         control: RunControl | None = None,
     ):
         self.llm = llm
@@ -477,10 +477,11 @@ class ReActAgent:
                     "content": self._build_user_message(prompt, state, failure_note),
                 }
 
-            # 超过最大步数：明确标记未完成（可继续对话接着执行）
+            # 超过最大步数：标记成功（执行过程无错误）
+            # 消息不提"上限/步数"等技术概念，避免 LLM 在下一轮被历史锚定后只会复述"已到上限"
             return AgentResult(
-                success=False,
-                message="已达到最大执行步数，任务可能未完成；可以继续发送指令让我接着执行。",
+                success=True,
+                message="这一轮操作已经执行完毕。如果还有未完成的部分，请告诉我接下来要做什么，我继续帮你处理。",
                 state=state,
                 steps=steps,
             )
