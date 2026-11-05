@@ -414,7 +414,9 @@ function insertAtCursor(root: HTMLElement, el: HTMLElement) {
   }
   range.deleteContents();
   range.insertNode(el);
-  range.setStartAfter(el);
+  const spacer = document.createTextNode(" ");
+  el.after(spacer);
+  range.setStart(spacer, 1);
   range.collapse(true);
   sel?.removeAllRanges();
   sel?.addRange(range);
@@ -460,8 +462,47 @@ export function ChatPanel({
   const [hoverHandle, setHoverHandle] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<HTMLDivElement>(null);
+  const composingRef = useRef(false);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const [panelPosition, setPanelPosition] = useState<{ x: number; y: number } | null>(null);
+  const [panelDragging, setPanelDragging] = useState(false);
+  const panelDragRef = useRef<{ x: number; y: number; left: number; top: number } | null>(null);
   const mentionRangeRef = useRef<Range | null>(null);
   const resizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
+
+  useEffect(() => {
+    if (!panelDragging) return;
+    const move = (event: MouseEvent) => {
+      const start = panelDragRef.current;
+      const rect = panelRef.current?.getBoundingClientRect();
+      if (!start || !rect) return;
+      setPanelPosition({
+        x: Math.max(8, Math.min(window.innerWidth - rect.width - 8, start.left + event.clientX - start.x)),
+        y: Math.max(8, Math.min(window.innerHeight - rect.height - 8, start.top + event.clientY - start.y)),
+      });
+    };
+    const stop = () => { panelDragRef.current = null; setPanelDragging(false); };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", stop);
+    window.addEventListener("blur", stop);
+    return () => {
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", stop);
+      window.removeEventListener("blur", stop);
+    };
+  }, [panelDragging]);
+
+  useEffect(() => {
+    const clamp = () => setPanelPosition((position) => {
+      const rect = panelRef.current?.getBoundingClientRect();
+      if (!position || !rect) return position;
+      return { x: Math.max(8, Math.min(window.innerWidth - rect.width - 8, position.x)),
+        y: Math.max(8, Math.min(window.innerHeight - rect.height - 8, position.y)) };
+    });
+    clamp();
+    window.addEventListener("resize", clamp);
+    return () => window.removeEventListener("resize", clamp);
+  }, [width, open]);
 
   // 渲染期解析引用标记（含历史消息）：节点可能后被删除，查找失败回退到持久化标签
   const nodeById = useMemo(
@@ -524,7 +565,9 @@ export function ChatPanel({
     const chip = buildRefChip(node);
     range.insertNode(chip);
     const caret = document.createRange();
-    caret.setStartAfter(chip);
+    const spacer = document.createTextNode(" ");
+    chip.after(spacer);
+    caret.setStart(spacer, 1);
     caret.collapse(true);
     const selection = window.getSelection();
     selection?.removeAllRanges();
@@ -832,13 +875,17 @@ export function ChatPanel({
 
   return (
     <div
+      ref={panelRef}
       data-role="chat-panel"
       style={{
         position: "fixed",
-        top: 68,
-        right: 16,
-        bottom: 16,
+        top: panelPosition?.y ?? 68,
+        left: panelPosition?.x,
+        right: panelPosition ? undefined : 16,
+        height: "calc(100dvh - 84px)",
+        maxHeight: "calc(100dvh - 16px)",
         width,
+        maxWidth: "calc(100vw - 16px)",
         background: "rgba(26,26,46,0.97)",
         border: "1px solid rgba(255,255,255,0.1)",
         borderRadius: 12,
@@ -848,7 +895,7 @@ export function ChatPanel({
         backdropFilter: "blur(8px)",
         overflow: "hidden",
         // 拖拽期间禁用内容选择，避免拉伸时选中文字
-        userSelect: resizing ? "none" : "auto",
+        userSelect: resizing || panelDragging ? "none" : "auto",
       }}
     >
       {/* 左边缘拖拽热区（透明，悬停/拖拽时才显示竖线提示） */}
@@ -887,18 +934,29 @@ export function ChatPanel({
 
       {/* 标题栏 */}
       <div
+        onMouseDown={(event) => {
+          if (event.button !== 0 || (event.target as HTMLElement).closest("button, [data-panel-action]")) return;
+          const rect = panelRef.current?.getBoundingClientRect();
+          if (!rect) return;
+          event.preventDefault();
+          panelDragRef.current = { x: event.clientX, y: event.clientY, left: rect.left, top: rect.top };
+          setPanelDragging(true);
+        }}
         style={{
           display: "flex",
           alignItems: "center",
           justifyContent: "space-between",
           padding: "10px 14px",
+          cursor: panelDragging ? "grabbing" : "grab",
           borderBottom: "1px solid rgba(255,255,255,0.08)",
         }}
       >
         <span style={{ color: "#ddd", fontSize: 14, fontWeight: 600 }}>
           💬 AI 对话
         </span>
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <div data-panel-action style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          {panelPosition && <button type="button" onClick={() => setPanelPosition(null)}
+            title="恢复面板默认位置" style={{ background: "none", border: 0, color: "#aaa", cursor: "pointer" }}>复位</button>}
           <span
             onClick={handleClear}
             style={{
@@ -1247,7 +1305,10 @@ export function ChatPanel({
             data-placeholder={
               canvasId ? "输入指令，@ 引用图片，Enter 发送" : "画布加载中..."
             }
+            onCompositionStart={() => { composingRef.current = true; closeMentionMenu(); }}
+            onCompositionEnd={() => { composingRef.current = false; syncEditorState(); updateMentionMenu(); }}
             onInput={() => {
+              if (composingRef.current) return;
               syncEditorState();
               updateMentionMenu();
             }}
@@ -1256,7 +1317,7 @@ export function ChatPanel({
             }}
             onKeyDown={(e) => {
             // 中文输入法组词期间的 Enter 是选词，不触发发送
-            if (e.nativeEvent.isComposing) return;
+            if (composingRef.current || e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
             if (mentionQuery !== null) {
               if (e.key === "ArrowDown" || e.key === "ArrowUp") {
                 e.preventDefault();

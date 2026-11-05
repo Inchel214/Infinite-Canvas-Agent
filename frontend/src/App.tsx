@@ -105,9 +105,12 @@ function App() {
 
   // 状态守卫：旧画布上残留的异步回调（SSE 生成完成、粘贴完成等）带着旧画布状态 resolve
   // 时，若已切换画布则丢弃，防止旧数据覆盖新画布
-  const applyCanvasState = useCallback((next: CanvasState) => {
+  const applyCanvasState = useCallback((next: CanvasState, restoreHistory = false) => {
     if (canvasIdRef.current && next.canvas_id !== canvasIdRef.current) return;
-    setCanvasState(next);
+    setCanvasState((current) => {
+      if (!restoreHistory && current?.canvas_id === next.canvas_id && next.version < current.version) return current;
+      return next;
+    });
   }, []);
 
   // 切换到指定画布（画布管理面板调用），返回是否成功；切换 = 打开会话，清除该画布未读红点
@@ -308,21 +311,23 @@ function App() {
         canvasId={canvasId}
         busy={loading}
         onNodeMoved={async (nodeId, x, y) => {
-          if (!canvasId) return;
+          if (!canvasId) return false;
           try {
             const newCanvas = await updateNodePosition(canvasId, nodeId, x, y);
             applyCanvasState(newCanvas);
+            return true;
           } catch {
-            // 静默失败，不影响用户操作
+            return false;
           }
         }}
         onNodesMoved={async (moves) => {
-          if (!canvasId || moves.length === 0) return;
+          if (!canvasId || moves.length === 0) return false;
           try {
             const newCanvas = await moveNodes(canvasId, moves);
             applyCanvasState(newCanvas);
+            return true;
           } catch {
-            // 静默失败，不影响用户操作
+            return false;
           }
         }}
         onAction={handleAction}

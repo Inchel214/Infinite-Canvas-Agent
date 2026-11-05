@@ -1,5 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useCallback, useState, useMemo, memo } from "react";
 import { createPortal } from "react-dom";
+import { ImageCollectionCards, ImageCollectionDialog } from "./ImageCollections";
+import { useImageCollections } from "./useImageCollections";
 import type { CanvasState, CanvasNode } from "../types/canvas";
 import { generateImageStream, updateNodePosition, uploadImageNode, cloneNode, undoCanvas, redoCanvas, listExperiences, revealImageFile, type ExperienceMeta } from "../api/agent";
 
@@ -409,11 +411,11 @@ interface CanvasProps {
   canvasState: CanvasState | null;
   canvasId: string | null;
   busy?: boolean;
-  onNodeMoved?: (nodeId: string, x: number, y: number) => void;
+  onNodeMoved?: (nodeId: string, x: number, y: number) => boolean | void | Promise<boolean | void>;
   // 多选整组拖拽结束：一次性提交所有节点的新位置（后端单次保存 = 单次撤销）
-  onNodesMoved?: (moves: { nodeId: string; x: number; y: number }[]) => void;
+  onNodesMoved?: (moves: { nodeId: string; x: number; y: number }[]) => boolean | void | Promise<boolean | void>;
   onAction?: (action: CanvasAction) => boolean | void | Promise<boolean | void>;
-  onCanvasUpdate?: (state: CanvasState) => void;
+  onCanvasUpdate?: (state: CanvasState, restoreHistory?: boolean) => void;
   // 右键"添加到对话"：把选中图片引用进 ChatPanel，发送时注入 Agent 上下文
   onAddToChat?: (nodeIds: string[]) => void;
   // 右侧对话面板展开时占据的宽度（含定位边距前的面板净宽）；用于缩放指示器避让
@@ -514,6 +516,20 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
   const [hoveredNode, setHoveredNode] = useState<string | null>(null);
   // 本地位置覆盖（拖拽时即时更新，不等待 API）
+  const sizeStorageKey = `ica:display-sizes:${canvasId}`;
+  const [sizeOverrides, setSizeOverrides] = useState<Record<string, { width: number; height: number }>>(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(sizeStorageKey) ?? "{}");
+      return Object.fromEntries(Object.entries(saved).filter((entry): entry is [string, { width: number; height: number }] => {
+        const size = entry[1] as { width?: number; height?: number } | null;
+        return !!size && Number.isFinite(size.width) && Number.isFinite(size.height) && size.width! > 0 && size.height! > 0;
+      }));
+    } catch { return {}; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem(sizeStorageKey, JSON.stringify(sizeOverrides)); }
+    catch { setLocalStatusMsg("节点显示尺寸未能保存，刷新后可能恢复"); }
+  }, [sizeStorageKey, sizeOverrides]);
   const [localOverrides, setLocalOverrides] = useState<Record<string, { x: number; y: number }>>({});
   // 多选整组拖拽：按下多选集合内的图时，记录所有选中节点的原始位置 + 鼠标世界坐标起点
   const dragGroupOriginsRef = useRef<Record<string, { x: number; y: number }> | null>(null);
@@ -624,13 +640,25 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   // 配合 ImageNode memo 减少拖拽/缩放时的无效重渲染）
   const nodes = useMemo(() => rawNodes.map((n) => {
     const ov = localOverrides[n.id];
-    return ov ? { ...n, x: ov.x, y: ov.y } : n;
-  }), [rawNodes, localOverrides]);
+    return { ...n, ...ov, ...sizeOverrides[n.id] };
+  }), [rawNodes, localOverrides, sizeOverrides]);
 
-  // 画布状态变更（拖拽后端回显/自动整理/删除等）后：本地坐标覆盖让位于后端权威数据，
-  // 否则自动整理后节点仍停留在拖拽前的旧位置，需刷新页面才能看到新布局
+  const collections = useImageCollections(canvasId, nodes);
+  const [managedCollectionId, setManagedCollectionId] = useState<string | null>(null);
+  const managedCollection = collections.views.find((group) => group.id === managedCollectionId);
+  const displayBounds = useMemo(() => [...collections.visibleNodes, ...collections.views.filter((group) => group.collapsed)], [collections.visibleNodes, collections.views]);
+  const connectionBounds = (node: CanvasNode): BBox => collections.collapsedByNode.get(node.id) ?? node;
+
+  // 坐标写回确认前保留乐观位置，避免其他任务的快照把正在拖动的节点还原。
+  // 整理与撤销显式清空覆盖；普通回显只清除已确认或已删除的节点。
   useEffect(() => {
-    setLocalOverrides({});
+    setLocalOverrides((previous) => {
+      const pending = Object.fromEntries(Object.entries(previous).filter(([id, position]) => {
+        const node = canvasState?.nodes[id];
+        return node && (node.x !== position.x || node.y !== position.y);
+      }));
+      return Object.keys(pending).length === Object.keys(previous).length ? previous : pending;
+    });
     setSelectedIds((prev) => {
       const alive = new Set(nodes.map((n) => n.id));
       const next = new Set([...prev].filter((id) => alive.has(id)));
@@ -643,6 +671,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   // Ctrl+C / Cmd+C：复制选中图片到系统剪贴板（可在文件管理器粘贴为 PNG）
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
+      if (e.isComposing || e.keyCode === 229) return;
       if (e.key === "Escape") {
         // 点击过的容器：Esc 直接关闭（生成中的除外，避免误关丢进度；其它容器不受影响）
         const ac = activeContainerIdRef.current;
@@ -676,7 +705,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         undoCanvas(canvasId)
           .then((res) => {
             if (res.success) {
-              onCanvasUpdate?.(res.canvas);
+              setLocalOverrides({});
+              onCanvasUpdate?.(res.canvas, true);
               setLocalStatusMsg("已撤销");
             } else {
               setLocalStatusMsg("无可撤销操作");
@@ -693,7 +723,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         redoCanvas(canvasId)
           .then((res) => {
             if (res.success) {
-              onCanvasUpdate?.(res.canvas);
+              setLocalOverrides({});
+              onCanvasUpdate?.(res.canvas, true);
               setLocalStatusMsg("已重做");
             } else {
               setLocalStatusMsg("无可重做操作");
@@ -989,9 +1020,9 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
 
   // 适配全部节点：计算包围盒并缩放居中（自动适配与"回到全图视角"按钮共用）
   const fitAllNodes = useCallback(() => {
-    if (nodes.length === 0 || !containerRef.current) return;
+    if (displayBounds.length === 0 || !containerRef.current) return;
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    for (const n of nodes) {
+    for (const n of displayBounds) {
       minX = Math.min(minX, n.x);
       minY = Math.min(minY, n.y);
       maxX = Math.max(maxX, n.x + n.width);
@@ -1011,7 +1042,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       x: (cw - contentW * newZoom) / 2 - minX * newZoom,
       y: (ch - contentH * newZoom) / 2 - minY * newZoom,
     });
-  }, [nodes]);
+  }, [displayBounds]);
 
   // 首次进入视角：无存档时适配一次全部节点——让"自动适配"关闭的用户
   // 切画布/首次打开也能看到内容（否则视角停在原点，内容不在原点附近=一片空白）
@@ -1301,7 +1332,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         const wy1 = (sy1 - pan.y) / zoom;
         const wx2 = (sx2 - pan.x) / zoom;
         const wy2 = (sy2 - pan.y) / zoom;
-        const hits = nodes.filter(
+        const hits = collections.visibleNodes.filter(
           (n) => n.x < wx2 && n.x + n.width > wx1 && n.y < wy2 && n.y + n.height > wy1
         );
         setSelectedIds(new Set(hits.map((n) => n.id)));
@@ -1318,7 +1349,21 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         : true;
 
       if (moved) {
-        // 真正的拖拽：通知后端
+        // 保存失败时仅撤掉这次提交的坐标，后续新拖动不受旧失败响应影响。
+        const checkSave = (result: boolean | void | Promise<boolean | void>, moves: { nodeId: string; x: number; y: number }[]) => {
+          const rollback = () => {
+            setLocalOverrides((previous) => {
+              const next = { ...previous };
+              for (const move of moves) {
+                if (next[move.nodeId]?.x === move.x && next[move.nodeId]?.y === move.y) delete next[move.nodeId];
+              }
+              return next;
+            });
+            setLocalStatusMsg("位置保存失败，已恢复；请重新拖动");
+            window.setTimeout(() => setLocalStatusMsg(null), 3000);
+          };
+          Promise.resolve(result).then((ok) => { if (ok === false) rollback(); }).catch(rollback);
+        };
         const groupOrigins = dragGroupOriginsRef.current;
         if (groupOrigins) {
           // 多选整组拖拽：一次性批量提交（后端单次保存 = 单次撤销）
@@ -1327,11 +1372,11 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
             const pos = localOverrides[id];
             if (pos) moves.push({ nodeId: id, x: pos.x, y: pos.y });
           }
-          if (moves.length > 0) onNodesMoved?.(moves);
+          if (moves.length > 0) checkSave(onNodesMoved?.(moves), moves);
         } else {
           const pos = localOverrides[draggingNode];
           if (pos && onNodeMoved) {
-            onNodeMoved(draggingNode, pos.x, pos.y);
+            checkSave(onNodeMoved(draggingNode, pos.x, pos.y), [{ nodeId: draggingNode, ...pos }]);
           }
         }
         dragGroupOriginsRef.current = null;
@@ -1369,7 +1414,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       backgroundDownRef.current = null;
       setIsPanning(false);
     }
-  }, [marquee, draggingNode, localOverrides, onNodeMoved, onNodesMoved, isPanning, pan, zoom, nodes, connecting, containers, generatingIds, updateContainer, screenToWorld, draggingContainer, createContainer, menu, getContainerPlacement, editPanel, editPanelRect]);
+  }, [collections.visibleNodes, marquee, draggingNode, localOverrides, onNodeMoved, onNodesMoved, isPanning, pan, zoom, connecting, containers, generatingIds, updateContainer, screenToWorld, draggingContainer, createContainer, menu, getContainerPlacement, editPanel, editPanelRect]);
 
   // 图片节点拖拽开始（记录起点用于 click/drag 判定）
   const handleNodeMouseDown = useCallback((e: React.MouseEvent, node: CanvasNode) => {
@@ -1612,7 +1657,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     showMsg("正在复制图片...");
     try {
       // 先把 Promise 交给 ClipboardItem，再立即调用 write，保留菜单点击带来的用户激活。
-      const pngPromise = fetchImageBlob(copies[0].image_url).then(convertImageBlobToPng);
+      const pngPromise = fetchImageBlob(copies[0].image_url!).then(convertImageBlobToPng);
       await navigator.clipboard.write([
         new ClipboardItem({ "image/png": pngPromise }),
       ]);
@@ -1879,6 +1924,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   );
 
   const selectedCount = selectedIds.size;
+  const selectedImageCount = nodes.filter((node) => selectedIds.has(node.id) && node.type === "image" && !!node.image_url).length;
 
   return (
     <div
@@ -2044,7 +2090,9 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
               (target.source_ids || []).map((sid) => {
                 const src = nodes.find((n) => n.id === sid);
                 if (!src) return null;
-                const ep = getConnectionEndpoints(src, target);
+                const sourceGroup = collections.collapsedByNode.get(src.id);
+                if (sourceGroup && sourceGroup.id === collections.collapsedByNode.get(target.id)?.id) return null;
+                const ep = getConnectionEndpoints(connectionBounds(src), connectionBounds(target));
                 const path = `M ${ep.x1} ${ep.y1} C ${ep.cx1} ${ep.cy1}, ${ep.cx2} ${ep.cy2}, ${ep.x2} ${ep.y2}`;
                 return (
                   <g key={`${sid}-${target.id}`}>
@@ -2075,7 +2123,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
             return c.refIds.map((rid) => {
               const src = nodes.find((n) => n.id === rid);
               if (!src) return null;
-              const ep = getConnectionEndpoints(src, tgtRect);
+              const ep = getConnectionEndpoints(connectionBounds(src), tgtRect);
               const path = `M ${ep.x1} ${ep.y1} C ${ep.cx1} ${ep.cy1}, ${ep.cx2} ${ep.cy2}, ${ep.x2} ${ep.y2}`;
               return (
                 <g key={`${rid}-${c.id}`}>
@@ -2144,10 +2192,11 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
             })()}
         </svg>
 
-        {nodes.map((node) => (
+        {collections.visibleNodes.map((node) => (
           <ImageNode
             key={node.id}
             node={node}
+            zoom={zoom}
             isDragging={draggingNode === node.id}
             isHovered={hoveredNode === node.id}
             isLinked={!!(node.source_ids && node.source_ids.length >= 2)}
@@ -2158,9 +2207,50 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
             onMouseEnter={() => setHoveredNode(node.id)}
             onMouseLeave={() => setHoveredNode(null)}
             onContextMenu={(e) => handleNodeContextMenu(e, node)}
+            onResizeStart={(event) => {
+              if (event.button !== 0) return;
+              event.stopPropagation();
+              event.preventDefault();
+              const element = event.currentTarget;
+              element.setPointerCapture(event.pointerId);
+              const startX = event.clientX;
+              const startY = event.clientY;
+              let dimensions = { width: node.width, height: node.height };
+              const move = (next: PointerEvent) => {
+                const delta = ((next.clientX - startX) * node.width + (next.clientY - startY) * node.height)
+                  / (zoom * (node.width * node.width + node.height * node.height));
+                const scale = Math.max(64 / Math.min(node.width, node.height), Math.min(4096 / Math.max(node.width, node.height), 1 + delta));
+                dimensions = { width: node.width * scale, height: node.height * scale };
+                setSizeOverrides((previous) => ({ ...previous, [node.id]: dimensions }));
+              };
+              const finish = () => {
+                element.removeEventListener("pointermove", move);
+                element.removeEventListener("pointerup", finish);
+                element.removeEventListener("pointercancel", cancel);
+                if (element.hasPointerCapture(event.pointerId)) element.releasePointerCapture(event.pointerId);
+              };
+              const cancel = () => {
+                element.removeEventListener("pointermove", move);
+                element.removeEventListener("pointerup", finish);
+                element.removeEventListener("pointercancel", cancel);
+                setSizeOverrides((previous) => { const next = { ...previous }; delete next[node.id]; return next; });
+              };
+              element.addEventListener("pointermove", move);
+              element.addEventListener("pointerup", finish);
+              element.addEventListener("pointercancel", cancel);
+            }}
             onUpdateNode={handleUpdateNodeContent}
           />
         ))}
+
+        <ImageCollectionCards zoom={zoom} groups={collections.views} update={(id, patch) => {
+          collections.update(id, patch);
+          if (patch.collapsed) {
+            const members = new Set(collections.views.find((group) => group.id === id)?.memberIds);
+            setSelectedIds((previous) => new Set([...previous].filter((nodeId) => !members.has(nodeId))));
+            setMenu(null);
+          }
+        }} onManage={setManagedCollectionId} />
 
         {/* 待生成图片容器：编辑时保持屏幕可读；生成后落入世界层并随画布视角一起缩放。 */}
         {containers.map((c) => {
@@ -2298,6 +2388,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
           y={menu.y}
           mode={menu.mode}
           selectedCount={selectedCount}
+          selectedImageCount={selectedImageCount}
           selectedNodeContent={
             selectedCount === 1
               ? nodes.find((n) => n.id === [...selectedIds][0])?.content ?? ""
@@ -2320,10 +2411,47 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
           onRevealImage={handleRevealImage}
           onCreateContainer={handleCreateContainer}
           onAddToChat={handleAddToChat}
+          onCollect={() => {
+            const group = collections.create([...selectedIds]);
+            if (!group) {
+              setLocalStatusMsg("请至少选择两张已生成的图片，文字节点不能收纳");
+              window.setTimeout(() => setLocalStatusMsg(null), 3200);
+              return;
+            }
+            setSelectedIds(new Set());
+            setMenu(null);
+            const rect = containerRef.current?.getBoundingClientRect();
+            if (rect) {
+              const availableWidth = Math.max(280, rect.width - chatDockWidth);
+              const nextZoom = Math.min(Math.max(zoom, 0.8), availableWidth / 340, rect.height / 346);
+              setZoom(nextZoom);
+              setPan({ x: availableWidth / 2 - (group.x + 140) * nextZoom,
+                y: rect.height / 2 - (group.y + 143) * nextZoom });
+            }
+            setLocalStatusMsg(`已收纳 ${group.memberIds.length} 张图片，可展开或管理`);
+            window.setTimeout(() => setLocalStatusMsg(null), 3200);
+          }}
           onClose={() => setMenu(null)}
         />,
         document.body,
       )}
+
+      {collections.saveError && <div role="alert" style={{ position: "fixed", bottom: 64, left: 16, zIndex: 1100,
+        padding: "10px 14px", background: "#713c45", borderRadius: 8, color: "white" }}>图片分组未能保存，刷新后可能丢失。请检查浏览器存储空间。</div>}
+      {managedCollection && <ImageCollectionDialog key={managedCollection.id} group={managedCollection}
+        onClose={() => setManagedCollectionId(null)}
+        onRename={(name) => collections.update(managedCollection.id, { name })}
+        onCover={(coverId) => collections.update(managedCollection.id, { coverId })}
+        onRemove={(id) => collections.remove(managedCollection.id, id)}
+        onDissolve={() => { collections.dissolve(managedCollection.id); setManagedCollectionId(null); }}
+        onReveal={(node) => {
+          collections.update(managedCollection.id, { collapsed: false });
+          setManagedCollectionId(null);
+          setSelectedIds(new Set([node.id]));
+          const rect = containerRef.current?.getBoundingClientRect();
+          if (rect) setPan({ x: (rect.width - chatDockWidth) / 2 - (node.x + node.width / 2) * zoom,
+            y: rect.height / 2 - (node.y + node.height / 2) * zoom });
+        }} />}
 
       {/* 编辑图片框（独立于右键菜单，可与普通菜单并存；连线在画布 SVG 层渲染）
           portal 到 body，避免被画布 scale(zoom) 缩放（坐标本就是屏幕视口坐标） */}
@@ -2534,6 +2662,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         onClick={async (e) => {
           e.stopPropagation();
           if (!onAction) return;
+          setLocalOverrides({});
           const ok = await onAction({ type: "arrange" });
           // 置位待执行标志：等新画布状态渲染出最新节点坐标后再 fit（见 pendingFitRef effect）
           if (ok !== false) pendingFitRef.current = true;
@@ -2867,7 +2996,8 @@ function AspectRatioButtons({
               pattern="\d*"
               value={customW}
               onChange={(e) => setCustomW(e.target.value.replace(/\D/g, ""))}
-              onKeyDown={(e) => { if (e.key === "Enter") confirmCustom(); if (e.key === "Escape") setCustomMode(false); }}
+              onKeyDown={(e) => {
+              if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return; if (e.key === "Enter") confirmCustom(); if (e.key === "Escape") setCustomMode(false); }}
               style={inputStyle}
               autoFocus
               placeholder="W"
@@ -2879,7 +3009,8 @@ function AspectRatioButtons({
               pattern="\d*"
               value={customH}
               onChange={(e) => setCustomH(e.target.value.replace(/\D/g, ""))}
-              onKeyDown={(e) => { if (e.key === "Enter") confirmCustom(); if (e.key === "Escape") setCustomMode(false); }}
+              onKeyDown={(e) => {
+              if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return; if (e.key === "Enter") confirmCustom(); if (e.key === "Escape") setCustomMode(false); }}
               style={inputStyle}
               placeholder="H"
             />
@@ -2920,6 +3051,7 @@ const ContextMenu = ({
   y,
   mode,
   selectedCount,
+  selectedImageCount,
   selectedNodeContent,
   promptInput,
   onPromptChange,
@@ -2938,6 +3070,7 @@ const ContextMenu = ({
   onRevealImage,
   onCreateContainer,
   onAddToChat,
+  onCollect,
   onClose,
 }: {
   ref: React.RefObject<HTMLDivElement | null>;
@@ -2945,6 +3078,7 @@ const ContextMenu = ({
   y: number;
   mode: "menu" | "compose" | "variate" | "background";
   selectedCount: number;
+  selectedImageCount: number;
   selectedNodeContent: string;
   promptInput: string;
   onPromptChange: (v: string) => void;
@@ -2963,6 +3097,7 @@ const ContextMenu = ({
   onRevealImage: () => void;
   onCreateContainer: () => void;
   onAddToChat: () => void;
+  onCollect: () => void;
   onClose: () => void;
 }) => {
   // 输入模式（组合/变体/编辑）加宽，操作菜单保持紧凑
@@ -3056,7 +3191,7 @@ const ContextMenu = ({
         }}
       >
         {mode === "menu"
-          ? `已选中 ${selectedCount} 张图片`
+          ? `已选 ${selectedCount} 个节点 · ${selectedImageCount} 张图片`
           : mode === "background"
             ? "画布空白处"
             : "描述（可选）"}
@@ -3151,6 +3286,12 @@ const ContextMenu = ({
         </div>
       ) : mode === "menu" ? (
         <>
+          {selectedCount >= 2 && <button type="button" disabled={selectedImageCount < 2} onClick={onCollect}
+            title={selectedImageCount < 2 ? "请至少选择两张已生成的图片，文字节点不能收纳" : "将选中的图片收纳为一组"}
+            style={{ ...itemStyle, width: "100%", border: 0, background: "transparent", textAlign: "left", opacity: selectedImageCount < 2 ? .5 : 1, cursor: selectedImageCount < 2 ? "not-allowed" : "pointer" }} onMouseEnter={hoverBg} onMouseLeave={hoverOut}>
+            <span>收纳为一组</span><span style={{ fontSize: 11, color: "#aaa5bf" }}>{selectedImageCount} 张图片</span>
+          </button>}
+          {selectedCount >= 2 && selectedImageCount < 2 && <div style={{ padding: "4px 14px 8px", fontSize: 11, color: "#aaa5bf" }}>需至少选中 2 张图片，文字不计入</div>}
           {selectedCount >= 2 && (
             <div style={itemStyle} onMouseEnter={hoverBg} onMouseLeave={hoverOut} onClick={() => onMenuAction("compose")}>
               <span>✨ 组合生成</span>
@@ -3203,6 +3344,7 @@ const ContextMenu = ({
             value={promptInput}
             onChange={(e) => onPromptChange(e.target.value)}
             onKeyDown={(e) => {
+              if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
               if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();
                 onExecute();
@@ -4019,6 +4161,7 @@ const EditPanel = ({
  */
 const ImageNode = memo(function ImageNode({
   node,
+  zoom,
   isDragging,
   isHovered,
   isLinked,
@@ -4030,8 +4173,10 @@ const ImageNode = memo(function ImageNode({
   onMouseLeave,
   onContextMenu,
   onUpdateNode,
+  onResizeStart,
 }: {
   node: CanvasNode;
+  zoom: number;
   isDragging: boolean;
   isHovered: boolean;
   isLinked: boolean;
@@ -4042,6 +4187,7 @@ const ImageNode = memo(function ImageNode({
   onMouseEnter: () => void;
   onMouseLeave: () => void;
   onContextMenu: (e: React.MouseEvent) => void;
+  onResizeStart?: (event: React.PointerEvent<HTMLDivElement>) => void;
   onUpdateNode?: (nodeId: string, content: string) => void;
 }) {
   const [hoveredPortIdx, setHoveredPortIdx] = useState<number | null>(null);
@@ -4109,11 +4255,19 @@ const ImageNode = memo(function ImageNode({
             transition: isDragging ? "none" : "box-shadow 0.2s, outline 0.2s",
           }}
         />
+        {isSelected && <div title="拖动等比缩放图片" role="button" aria-label="缩放图片节点"
+          onMouseDown={(event) => event.stopPropagation()} onPointerDown={onResizeStart}
+          style={{ position: "absolute", right: -6, bottom: -6, width: 14, height: 14,
+            background: "#a78bfa", border: "2px solid #fff", borderRadius: 3,
+            cursor: "nwse-resize", touchAction: "none", zIndex: 20 }} />}
         {/* 编号放在图片外侧，避免遮挡内容；用户与 Agent 均用 #N 指代图片。 */}
         {node.index != null && (
           <div
             title={`#${node.index}`}
+            data-node-number={node.index}
             style={{
+              transform: `scale(${Math.max(1, 1 / Math.max(zoom, 0.05))})`,
+              transformOrigin: "left bottom",
               position: "absolute",
               left: 0,
               bottom: "calc(100% + 4px)",
@@ -4122,7 +4276,7 @@ const ImageNode = memo(function ImageNode({
               borderRadius: 6,
               background: "rgba(55,55,65,0.94)",
               color: "rgba(255,255,255,0.92)",
-              fontSize: 11,
+              fontSize: 12,
               fontWeight: 600,
               lineHeight: "19px",
               textAlign: "center",
@@ -4204,6 +4358,7 @@ const ImageNode = memo(function ImageNode({
               }
             }}
             onKeyDown={(e) => {
+              if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
               if (e.key === "Escape") {
                 setEditContent(node.content || "");
                 setIsEditing(false);
@@ -4271,7 +4426,7 @@ const ImageNode = memo(function ImageNode({
           userSelect: "none",
           wordBreak: "break-word",
           whiteSpace: "pre-wrap",
-          overflow: "hidden",
+          overflow: "visible",
           transition: isDragging ? "none" : "box-shadow 0.2s, outline 0.2s",
         }}
         onMouseDown={onMouseDown}
@@ -4284,12 +4439,15 @@ const ImageNode = memo(function ImageNode({
           setIsEditing(true);
         }}
       >
-        {node.content}
+        <span style={{ display: "block", width: "100%", maxHeight: "100%", overflow: "hidden" }}>{node.content}</span>
         {/* 编号标签：与图片节点一致，放在卡片上方 */}
         {node.index != null && (
           <div
             title={`#${node.index}`}
+            data-node-number={node.index}
             style={{
+              transform: `scale(${Math.max(1, 1 / Math.max(zoom, 0.05))})`,
+              transformOrigin: "left bottom",
               position: "absolute",
               left: 0,
               bottom: "calc(100% + 4px)",
@@ -4298,7 +4456,7 @@ const ImageNode = memo(function ImageNode({
               borderRadius: 6,
               background: "rgba(55,55,65,0.94)",
               color: "rgba(255,255,255,0.92)",
-              fontSize: 11,
+              fontSize: 12,
               fontWeight: 600,
               lineHeight: "19px",
               textAlign: "center",
@@ -4383,6 +4541,7 @@ function ImageMentionPrompt({
   initialHeight?: number;
 }) {
   const editorRef = useRef<HTMLDivElement>(null);
+  const composingRef = useRef(false);
   const renderedValueRef = useRef("");
   const renderedRefsRef = useRef("");
   const [mentionRange, setMentionRange] = useState<Range | null>(null);
@@ -4461,7 +4620,7 @@ function ImageMentionPrompt({
     const editor = editorRef.current;
     const refSignature = refNodes.map((node) => node.id).join("|");
     if (
-      !editor ||
+      !editor || composingRef.current ||
       (renderedValueRef.current === value && renderedRefsRef.current === refSignature)
     ) {
       return;
@@ -4527,7 +4686,7 @@ function ImageMentionPrompt({
     range.insertNode(spacer);
     range.insertNode(mention);
     const selection = window.getSelection();
-    range.setStartAfter(spacer);
+    range.setStart(spacer, spacer.length);
     range.collapse(true);
     selection?.removeAllRanges();
     selection?.addRange(range);
@@ -4578,7 +4737,14 @@ function ImageMentionPrompt({
         role="textbox"
         aria-multiline="true"
         data-placeholder={placeholder}
+        onCompositionStart={() => { composingRef.current = true; setMentionRange(null); }}
+        onCompositionEnd={() => {
+          composingRef.current = false;
+          emitChange();
+          detectTypedMention();
+        }}
         onInput={() => {
+          if (composingRef.current) return;
           emitChange();
           detectTypedMention();
         }}
@@ -4587,6 +4753,7 @@ function ImageMentionPrompt({
           insertPlainText(e.clipboardData.getData("text/plain"));
         }}
         onKeyDown={(e) => {
+          if (composingRef.current || e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
           if (mentionRange && refNodes.length > 0) {
             if (e.key === "ArrowDown" || e.key === "ArrowUp") {
               e.preventDefault();
