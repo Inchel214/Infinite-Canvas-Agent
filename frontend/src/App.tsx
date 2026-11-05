@@ -5,6 +5,7 @@ import { SettingsPanel } from "./components/SettingsPanel";
 import { CanvasPickerPanel } from "./components/CanvasPickerPanel";
 import {
   createCanvas,
+  createTextNode,
   getCanvas,
   updateNodePosition,
   updateNodes,
@@ -245,7 +246,11 @@ function App() {
     setLoading(true);
 
     try {
-      if (action.type === "compose") {
+      if (action.type === "text") {
+        applyCanvasState(await createTextNode(canvasId, action.content, action.x, action.y));
+        setStatusMsg("已添加文字，双击可编辑");
+        return true;
+      } else if (action.type === "compose") {
         // 进行中状态显示在被操作图片的边界框上（Canvas processing），顶部不再提示
         const res = await composeImages(canvasId, action.nodeIds, action.prompt, action.size, action.x, action.y, action.experienceIds);
         applyCanvasState(res.canvas);

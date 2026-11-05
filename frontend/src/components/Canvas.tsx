@@ -7,6 +7,7 @@ import { generateImageStream, updateNodePosition, uploadImageNode, cloneNode, un
 
 // 右键菜单可触发的操作类型（experienceIds：风格库多选的风格，直连生图时后端确定性拼接）
 export type CanvasAction =
+  | { type: "text"; content: string; x: number; y: number }
   | { type: "compose"; nodeIds: string[]; prompt: string; size: string; x?: number; y?: number; experienceIds?: string[] }
   | { type: "variate"; nodeId: string; prompt: string; size: string; x?: number; y?: number; experienceIds?: string[] }
   | { type: "edit"; nodeId: string; prompt: string; size: string; x?: number; y?: number; experienceIds?: string[] }
@@ -24,6 +25,7 @@ export type PendingContainer = {
   h: number;            // 编辑态屏幕像素高；生成后作为画布世界尺寸随视角缩放
   aspect: string;
   resolution: string;
+  count?: number;
   prompt: string;
   refIds: string[];     // 连线进来的参考图节点 ID
   experienceIds?: string[]; // 风格库多选的风格
@@ -517,6 +519,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   const [hoveredNode, setHoveredNode] = useState<string | null>(null);
   // 本地位置覆盖（拖拽时即时更新，不等待 API）
   const sizeStorageKey = `ica:display-sizes:${canvasId}`;
+  const [localStatusMsg, setLocalStatusMsg] = useState<string | null>(null);
   const [sizeOverrides, setSizeOverrides] = useState<Record<string, { width: number; height: number }>>(() => {
     try {
       const saved = JSON.parse(localStorage.getItem(sizeStorageKey) ?? "{}");
@@ -543,6 +546,10 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   const [marquee, setMarquee] = useState<{ x1: number; y1: number; x2: number; y2: number } | null>(null);
   const [menu, setMenu] = useState<MenuState | null>(null);
   const [promptInput, setPromptInput] = useState("");
+  const [variantCount, setVariantCount] = useState(1);
+  const [textDraft, setTextDraft] = useState<{ x: number; y: number; content: string } | null>(null);
+  const [textSaving, setTextSaving] = useState(false);
+  const [textError, setTextError] = useState("");
   // 尺寸选择（宽高比 + 分辨率档位）
   const [aspect, setAspect] = useState<string>("1:1");
   const [resolution, setResolution] = useState<string>("2K");
@@ -619,7 +626,6 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   useEffect(() => {
     generatingIdsRef.current = generatingIds;
   }, [generatingIds]);
-  const [localStatusMsg, setLocalStatusMsg] = useState<string | null>(null);
   const containerSeqRef = useRef(0);
   // 画布内复制/粘贴的剪贴板（存节点副本，Ctrl+V 粘贴到画布）
   const clipboardRef = useRef<CanvasNode[] | null>(null);
@@ -1582,12 +1588,27 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       setMenu(null);
       setPromptInput("");
       const sname = styleNamesByIds(menuStyleIds);
-      const boxId = addProcessingBox(box, sname ? `正在按《${sname}》生成变体...` : "正在生成变体...");
-      Promise.resolve(
-        onAction({ type: "variate", nodeId: ids[0], prompt, size, x: box.x, y: box.y, experienceIds: menuStyleIds.length ? menuStyleIds : undefined })
-      ).finally(() => removeProcessingBox(boxId));
+      const jobs = Array.from({ length: variantCount }, (_, i) => {
+        const position = { ...box, x: box.x + i * (box.w + 40) };
+        return { position, boxId: addProcessingBox(position, `${sname ? `《${sname}》` : ""}变体 ${i + 1}/${variantCount} · 等待生成`) };
+      });
+      // 逐张提交，每张独立落图；其中一张失败不会阻止后续任务。
+      void (async () => {
+        let succeeded = 0;
+        for (const job of jobs) {
+          setProcessingBoxes((prev) => prev.map((item) => item.id === job.boxId
+            ? { ...item, label: item.label.replace("等待生成", "正在生成…") } : item));
+          try {
+            const ok = await onAction({ type: "variate", nodeId: ids[0], prompt, size,
+              x: job.position.x, y: job.position.y, experienceIds: menuStyleIds.length ? menuStyleIds : undefined });
+            if (ok) succeeded++;
+          } catch { /* 单张失败后继续后续任务，最终汇总结果。 */ }
+          finally { removeProcessingBox(job.boxId); }
+        }
+        setLocalStatusMsg(`变体生成完成：${succeeded}/${variantCount} 张${succeeded < variantCount ? "，失败项可重新生成" : ""}`);
+      })();
     }
-  }, [onAction, menu, selectedIds, nodes, promptInput, aspect, resolution, buildProcessingBox, menuStyleIds, styleNamesByIds, addProcessingBox, removeProcessingBox]);
+  }, [onAction, menu, selectedIds, nodes, promptInput, aspect, resolution, variantCount, buildProcessingBox, menuStyleIds, styleNamesByIds, addProcessingBox, removeProcessingBox]);
 
   // 编辑框执行：图1始终是编辑底图；追加参考图时按当前顺序走多图组合能力。
   // 点生成 → 面板关闭 → 在新图位置（原图右侧）画占位框显示"正在编辑图片..."
@@ -1802,7 +1823,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
 
   // 容器生成：0 参考图文生图 / 1 参考图变体 / 多参考图组合（SSE 流式 + 真实预览图）
   const handleContainerGenerate = useCallback(
-    async (c: PendingContainer) => {
+    async function generateContainer(c: PendingContainer) {
       if (!canvasId) return;
       // 防重入：仅拦截本容器（textarea Enter 直触）；其它容器不受影响，可并发生成
       if (generatingIdsRef.current.has(c.id)) return;
@@ -1814,6 +1835,18 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         return;
       }
 
+      const count = Math.min(4, Math.max(1, Math.floor(c.count ?? 1)));
+      if (count > 1) {
+        const batch = Array.from({ length: count }, (_, i): PendingContainer => ({
+          ...c, id: i === 0 ? c.id : `pending-${crypto.randomUUID()}`,
+          x: c.x + i * (Math.max(400, c.w / zoom) + 60), count: 1, error: undefined,
+          previewUrl: undefined, exiting: false,
+        }));
+        setContainers((prev) => [...prev.map((item) => item.id === c.id ? batch[0] : item), ...batch.slice(1)]);
+        await Promise.all(batch.map((item) => generateContainer(item)));
+        return;
+      }
+      generatingIdsRef.current.add(c.id);
       const op =
         c.refIds.length === 0 ? "generate" : c.refIds.length === 1 ? "variate" : "compose";
 
@@ -1912,6 +1945,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       } finally {
         window.clearInterval(timer);
         delete generatingPositionsRef.current[c.id];
+        generatingIdsRef.current.delete(c.id);
         // 只解除本容器的生成态（其它容器的进度不受影响）
         setGeneratingIds((prev) => {
           const next = new Set(prev);
@@ -1920,7 +1954,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         });
       }
     },
-    [canvasId, updateContainer, removeContainer, onCanvasUpdate]
+    [canvasId, updateContainer, removeContainer, onCanvasUpdate, zoom]
   );
 
   const selectedCount = selectedIds.size;
@@ -2381,6 +2415,33 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       {/* 右键菜单（普通菜单 / compose / variate 输入框）
           portal 到 body：画布层有 transform: scale(zoom)，否则 position:fixed
           会以变换层为包含块被整体缩放，字号/滚动条放大、边框错位 */}
+      {textDraft && createPortal(
+        <div role="dialog" aria-modal="true" aria-label="新建文字节点"
+          onMouseDown={(e) => e.stopPropagation()} onKeyDown={(e) => { e.stopPropagation(); if (e.key === "Escape" && !textSaving) setTextDraft(null); }}
+          style={{ position: "fixed", inset: 0, zIndex: 2100, background: "#0007", display: "grid", placeItems: "center" }}>
+          <form onSubmit={async (e) => {
+            e.preventDefault();
+            if (!textDraft.content.trim() || textSaving || !onAction) return;
+            setTextSaving(true); setTextError("");
+            try {
+              const ok = await onAction({ type: "text", ...textDraft, content: textDraft.content.trim() });
+              if (ok) setTextDraft(null); else setTextError("保存失败，内容已保留，请重试");
+            } catch { setTextError("保存失败，内容已保留，请重试"); }
+            finally { setTextSaving(false); }
+          }} style={{ width: 380, maxWidth: "90vw", padding: 20, borderRadius: 12, background: "#25253d", color: "#eee" }}>
+            <div style={{ marginBottom: 12 }}>新建文字节点</div>
+            <textarea autoFocus aria-label="文字内容" placeholder="写下提示词或备注，双击文字节点可继续编辑"
+              value={textDraft.content} disabled={textSaving}
+              onChange={(e) => setTextDraft({ ...textDraft, content: e.target.value })}
+              style={{ width: "100%", boxSizing: "border-box", minHeight: 180, resize: "vertical", padding: 10, color: "#eee", background: "#19192d", border: "1px solid #656078", borderRadius: 6 }} />
+            {textError && <div role="alert" style={{ color: "#f87171", fontSize: 12 }}>{textError}</div>}
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 12 }}>
+              <button type="button" disabled={textSaving} onClick={() => setTextDraft(null)}>取消</button>
+              <button type="submit" disabled={textSaving || !textDraft.content.trim()}>{textSaving ? "保存中…" : "添加文字"}</button>
+            </div>
+          </form>
+        </div>, document.body
+      )}
       {menu && createPortal(
         <ContextMenu
           ref={menuRef}
@@ -2409,6 +2470,13 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
           onCopyImage={handleCopyImage}
           onSaveImage={handleSaveImage}
           onRevealImage={handleRevealImage}
+          variantCount={variantCount}
+          onVariantCountChange={setVariantCount}
+          onCreateText={() => {
+            if (!menu) return;
+            const position = screenToWorld(menu.x, menu.y);
+            setTextDraft({ ...position, content: "" }); setTextError(""); setMenu(null);
+          }}
           onCreateContainer={handleCreateContainer}
           onAddToChat={handleAddToChat}
           onCollect={() => {
@@ -3069,6 +3137,9 @@ const ContextMenu = ({
   onSaveImage,
   onRevealImage,
   onCreateContainer,
+  onCreateText,
+  variantCount,
+  onVariantCountChange,
   onAddToChat,
   onCollect,
   onClose,
@@ -3096,6 +3167,9 @@ const ContextMenu = ({
   onSaveImage: () => void;
   onRevealImage: () => void;
   onCreateContainer: () => void;
+  onCreateText: () => void;
+  variantCount: number;
+  onVariantCountChange: (count: number) => void;
   onAddToChat: () => void;
   onCollect: () => void;
   onClose: () => void;
@@ -3280,10 +3354,15 @@ const ContextMenu = ({
       )}
 
       {mode === "background" ? (
+        <>
+        <div style={itemStyle} onMouseEnter={hoverBg} onMouseLeave={hoverOut} onClick={onCreateText}>
+          <span>✎ 新建文字节点</span><span style={{ fontSize: 11, color: "#aaa" }}>提示词 / 备注</span>
+        </div>
         <div style={itemStyle} onMouseEnter={hoverBg} onMouseLeave={hoverOut} onClick={onCreateContainer}>
           <span>📦 新建图片容器</span>
           <span style={{ fontSize: 11, color: "rgba(255,255,255,0.35)" }}>拖线生成</span>
         </div>
+        </>
       ) : mode === "menu" ? (
         <>
           {selectedCount >= 2 && <button type="button" disabled={selectedImageCount < 2} onClick={onCollect}
@@ -3403,6 +3482,7 @@ const ContextMenu = ({
             </div>
           </div>
 
+          {mode === "variate" && <QuantitySelect value={variantCount} onChange={onVariantCountChange} />}
           {/* 风格选择（风格库为空时隐藏） */}
           <StyleSelect experiences={experiences} value={styleIds} onChange={onStyleChange} />
 
@@ -3420,7 +3500,7 @@ const ContextMenu = ({
                 cursor: "pointer",
               }}
             >
-              执行
+              {mode === "variate" ? `生成 ${variantCount} 张` : "执行"}
             </button>
             <button
               onClick={onClose}
@@ -5411,6 +5491,7 @@ function PendingContainerNode({
         </div>
       </div>
 
+      <QuantitySelect value={container.count ?? 1} onChange={(count) => onChange({ count })} />
       {/* 风格选择（风格库为空时隐藏） */}
       <StyleSelect experiences={experiences} value={container.experienceIds ?? []} onChange={(v) => onChange({ experienceIds: v.length ? v : undefined })} />
 
@@ -5453,7 +5534,7 @@ function PendingContainerNode({
           cursor: isGenerating ? "not-allowed" : "pointer",
         }}
       >
-        {isGenerating ? `生成中 ${Math.round(progress)}%` : "⚡ 生成"}
+        {isGenerating ? `生成中 ${Math.round(progress)}%` : `⚡ 生成 ${container.count ?? 1} 张`}
       </button>
 
       {/* 左右上下 + 四角拉伸柄：隐形热区（仅光标反馈），拖动整体等比缩放面板 */}
@@ -5559,4 +5640,17 @@ function PendingContainerNode({
       </div>
     </div>
   );
+}
+
+function QuantitySelect({ value, onChange }: { value: number; onChange: (count: number) => void }) {
+  return <div style={{ marginTop: 8 }}>
+    <div style={{ fontSize: 11, color: "#aaa5bf", marginBottom: 5 }}>生成数量</div>
+    <div style={{ display: "flex", gap: 4 }}>
+      {[1, 2, 3, 4].map((count) => <button type="button" key={count} aria-pressed={value === count}
+        onClick={() => onChange(count)} style={{ flex: 1, padding: "5px 0", border: 0, borderRadius: 5,
+          background: value === count ? "#6366f1" : "rgba(255,255,255,.08)", color: "#eee", fontSize: 11, cursor: "pointer" }}>
+        {count} 张
+      </button>)}
+    </div>
+  </div>;
 }

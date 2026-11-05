@@ -256,14 +256,14 @@ export async function updateNodes(
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ updates }),
+      body: JSON.stringify({ updates: updates.map(({ nodeId, ...fields }) => ({ node_id: nodeId, ...fields })) }),
     }
   );
   if (!res.ok) {
     throw new Error(`${res.status}`);
   }
   const data = await res.json();
-  return data.canvas;
+  return data.canvas ?? getCanvas(canvasId);
 }
 
 // ===== 直接执行类操作（右键菜单/容器触发，不走 Agent）=====
@@ -745,4 +745,15 @@ export async function deleteExperience(id: string): Promise<void> {
   if (!res.ok) {
     throw new Error(`${res.status}`);
   }
+}
+
+// 文字节点使用现有持久化接口，保存后读取完整画布。
+export async function createTextNode(canvasId: string, content: string, x: number, y: number): Promise<CanvasState> {
+  const res = await fetch(`${API_BASE}/canvas/${canvasId}/nodes/text`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ nodes: [{ content, x, y, width: 280, height: 180 }] }),
+  });
+  if (!res.ok) throw new Error("文字保存失败，请重试");
+  return getCanvas(canvasId);
 }

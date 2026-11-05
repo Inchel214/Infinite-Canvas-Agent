@@ -40,6 +40,25 @@ export function CanvasPickerPanel({
   onStatus,
 }: CanvasPickerPanelProps) {
   const [canvases, setCanvases] = useState<CanvasSummary[]>([]);
+  const archiveKey = "ica:hidden-canvases";
+  const [archivedIds, setArchivedIds] = useState<string[]>(() => {
+    try {
+      const saved: unknown = JSON.parse(localStorage.getItem(archiveKey) ?? "[]");
+      return Array.isArray(saved) ? saved.filter((id): id is string => typeof id === "string") : [];
+    } catch { return []; }
+  });
+  const [showArchived, setShowArchived] = useState(false);
+  const visibleCanvases = canvases.filter((c) => archivedIds.includes(c.canvas_id) === showArchived);
+  const toggleArchive = (id: string) => {
+    if (busy) return;
+    const wasArchived = archivedIds.includes(id);
+    const next = wasArchived ? archivedIds.filter((item) => item !== id) : [...archivedIds, id];
+    try {
+      localStorage.setItem(archiveKey, JSON.stringify(next));
+      setArchivedIds(next);
+      onStatus(wasArchived ? "已恢复画布" : "已归档，可在「已归档」中恢复");
+    } catch { onStatus("归档保存失败，请重试"); }
+  };
   const [loading, setLoading] = useState(true);
   // 首次加载失败（后端重启/瞬时不可用）：与"真的没有画布"区分开，
   // 提供重试入口而不是误导性的"还没有画布"
@@ -244,9 +263,17 @@ export function CanvasPickerPanel({
           </span>
         </div>
         <div style={{ color: "#777", fontSize: 12, marginBottom: 12 }}>
-          点击画布切换；✏️ 重命名、🗑 删除
+          归档后从列表隐藏，可恢复；仅保存在当前浏览器
         </div>
 
+        <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+          {[false, true].map((archived) => <button key={String(archived)} type="button"
+            onClick={() => { setShowArchived(archived); setRenamingId(null); setConfirmDeleteId(null); }}
+            style={{ flex: 1, padding: "7px 10px", border: 0, borderRadius: 6, cursor: "pointer", color: "#ddd",
+              background: showArchived === archived ? "#5254a8" : "rgba(255,255,255,.06)" }}>
+            {archived ? `已归档 (${canvases.filter((c) => archivedIds.includes(c.canvas_id)).length})` : "使用中"}
+          </button>)}
+        </div>
         {/* 列表 */}
         <div
           style={{
@@ -267,10 +294,10 @@ export function CanvasPickerPanel({
               画布列表加载失败（服务可能重启中）· 点击重试
             </div>
           )}
-          {!loading && !loadFailed && canvases.length === 0 && (
-            <div style={{ color: "#888", fontSize: 13 }}>还没有画布</div>
+          {!loading && !loadFailed && visibleCanvases.length === 0 && (
+            <div style={{ color: "#888", fontSize: 13 }}>{showArchived ? "暂无归档画布" : "暂无使用中的画布"}</div>
           )}
-          {canvases.map((c) => {
+          {visibleCanvases.map((c) => {
             const isCurrent = c.canvas_id === currentCanvasId;
             const isRenaming = renamingId === c.canvas_id;
             const isConfirming = confirmDeleteId === c.canvas_id;
@@ -394,6 +421,10 @@ export function CanvasPickerPanel({
                   </span>
                 ) : (
                   <>
+                    <button type="button" disabled={busy} onClick={(e) => { e.stopPropagation(); toggleArchive(c.canvas_id); }}
+                      style={{ border: 0, background: "transparent", color: "#b7b5d3", fontSize: 12, padding: "3px 0", cursor: "pointer", flexShrink: 0 }}>
+                      {showArchived ? "恢复" : "归档"}
+                    </button>
                     <span
                       onClick={(e) => {
                         e.stopPropagation();

@@ -55,7 +55,7 @@ function ImageCollectionCard({ group, zoom, update, onManage }: {
     return () => element.removeEventListener("wheel", wheel);
   }, [step, group.collapsed]);
   const arrowStyle: CSSProperties = { ...buttonStyle, position: "absolute", top: "45%", zIndex: 5,
-    width: 30, height: 30, padding: 0, borderRadius: "50%", background: "rgba(22,22,37,.86)", fontSize: 23,
+    display: "grid", placeItems: "center", lineHeight: 1, boxSizing: "border-box", width: 30, height: 30, padding: 0, borderRadius: "50%", background: "rgba(22,22,37,.86)", fontSize: 23,
     boxShadow: "0 2px 8px #0005" };
   return <section data-collection-id={group.id} aria-label={`${group.name}，${group.members.length} 张图片`}
     onMouseDown={(event) => event.stopPropagation()}
@@ -122,8 +122,8 @@ function ImageCollectionCard({ group, zoom, update, onManage }: {
         })}
       </div>
       {group.members.length > 1 && <>
-        <button type="button" aria-label="上一张图片" style={{ ...arrowStyle, left: -4 }} onClick={() => step(-1)}>‹</button>
-        <button type="button" aria-label="下一张图片" style={{ ...arrowStyle, right: -4 }} onClick={() => step(1)}>›</button>
+        <button type="button" aria-label="上一张图片" style={{ ...arrowStyle, left: -4 }} onClick={() => step(-1)}><svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="15 18 9 12 15 6" /></svg></button>
+        <button type="button" aria-label="下一张图片" style={{ ...arrowStyle, right: -4 }} onClick={() => step(1)}><svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="9 18 15 12 9 6" /></svg></button>
       </>}
       <span role="status" aria-live="polite" style={{ position: "absolute", bottom: 8, left: "50%", transform: `translateX(-50%) scale(${labelScale})`, transformOrigin: "center bottom", zIndex: 4,
         borderRadius: 12, padding: "3px 8px", background: "#111b", color: "white", fontSize: 12, pointerEvents: "none", whiteSpace: "nowrap" }}>
