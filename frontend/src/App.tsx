@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import { Canvas, type CanvasAction } from "./components/Canvas";
-import { ChatPanel } from "./components/ChatPanel";
+import { ChatPanel, type ChatPanelRef } from "./components/ChatPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { CanvasPickerPanel } from "./components/CanvasPickerPanel";
 import {
@@ -78,6 +78,8 @@ function App() {
   // 外部写入感知（MCP/Codex）：轮询对比 version，变化才拉全量刷新画布
   const canvasVersionRef = useRef<number>(-1);
   const loadingRef = useRef(false);
+  // ChatPanel ref：切换画布前保存草稿
+  const chatPanelRef = useRef<ChatPanelRef>(null);
 
   useEffect(() => {
     loadingRef.current = loading;
@@ -89,6 +91,8 @@ function App() {
 
   // 应用画布身份：同步 state / ref / localStorage / URL（多标签直达 + 刷新恢复）
   const applyCanvasId = useCallback((id: string, state?: CanvasState) => {
+    // 切换画布前保存当前画布的草稿
+    chatPanelRef.current?.saveDraft();
     canvasIdRef.current = id;
     setCanvasId(id);
     // 画布切换：对话引用跟着换画布会指错图，直接清空
@@ -140,12 +144,30 @@ function App() {
   }, [applyCanvasId]);
 
   // 初始化画布：URL ?canvas=xx 直达 > 上次打开的画布 > 新建
+  // 带重试机制，防止后端未就绪时首次加载失败
   useEffect(() => {
     (async () => {
+      const loadCanvasWithRetry = async (id: string, retries = 2) => {
+        for (let i = 0; i <= retries; i++) {
+          try {
+            const state = await getCanvas(id);
+            return state;
+          } catch (err) {
+            if (i < retries) {
+              console.warn(`[App] 画布加载失败，${i + 1}s 后重试 (${i + 1}/${retries}):`, err);
+              await new Promise(r => setTimeout(r, 1000));
+            } else {
+              console.warn('[App] 画布加载最终失败:', err);
+              throw err;
+            }
+          }
+        }
+      };
+
       const urlId = new URLSearchParams(window.location.search).get("canvas");
       if (urlId) {
         try {
-          const state = await getCanvas(urlId);
+          const state = await loadCanvasWithRetry(urlId);
           applyCanvasId(urlId, state);
           return;
         } catch {
@@ -155,7 +177,7 @@ function App() {
       const savedId = localStorage.getItem(LAST_CANVAS_KEY);
       if (savedId) {
         try {
-          const state = await getCanvas(savedId);
+          const state = await loadCanvasWithRetry(savedId);
           applyCanvasId(savedId, state);
           return;
         } catch {
@@ -164,7 +186,7 @@ function App() {
         }
       }
       const id = await createCanvas();
-      const state = await getCanvas(id);
+      const state = await loadCanvasWithRetry(id);
       applyCanvasId(id, state);
     })();
   }, [applyCanvasId]);
@@ -262,7 +284,7 @@ function App() {
         setStatusMsg(res.message);
         return res.success;
       } else if (action.type === "edit") {
-        const res = await editImage(canvasId, action.nodeId, action.prompt, action.size, action.x, action.y, action.experienceIds);
+        const res = await editImage(canvasId, action.nodeId, action.prompt, action.size, action.x, action.y, action.experienceIds, action.mask);
         applyCanvasState(res.canvas);
         setStatusMsg(res.message);
         return res.success;
@@ -479,6 +501,7 @@ function App() {
 
       {/* AI 对话面板（按画布 key 重挂载，切换画布自动换对应历史） */}
       <ChatPanel
+        ref={chatPanelRef}
         key={`chat-${canvasId ?? "none"}`}
         canvasId={canvasId}
         open={chatOpen}

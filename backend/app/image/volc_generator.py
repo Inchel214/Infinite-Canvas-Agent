@@ -306,9 +306,91 @@ class VolcEngineImageGenerator(BaseImageGenerator):
         height: int = 300,
         size: str = "2K",
     ) -> ImageResult:
-        url = self._call(prompt, image_urls=[source_image_url], size=size)
+        """局部编辑（inpainting）：传入蒙版，只修改蒙版区域。
+
+        mask: base64 data URL（PNG 格式，白色区域为要修改的部分）
+        如果 mask 为空，退化为 img2img（全图重绘）。
+        """
+        if mask:
+            # 有蒙版：调用 inpainting API
+            url = self._call_inpaint(source_image_url, mask, prompt, size)
+        else:
+            # 无蒙版：退化为 img2img
+            url = self._call(prompt, image_urls=[source_image_url], size=size)
         w, h = _display_size(_image_size(url), (width, height))
         return ImageResult(image_url=url, width=w, height=h, prompt=prompt)
+
+    def _call_inpaint(
+        self,
+        image_url: str,
+        mask: str,
+        prompt: str,
+        size: str = "2K",
+    ) -> str:
+        """调用 Ark inpainting API（局部编辑）。
+
+        mask 为 base64 data URL，白色区域为要修改的部分。
+        """
+        import time as _time
+        _t0 = _time.monotonic()
+
+        # 把原图和蒙版都转为可发送格式
+        image_ref = to_sendable_ref(image_url) if image_url.startswith("http") else image_url
+        mask_ref = mask  # mask 已经是 data URL
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        body: dict = {
+            "model": self.model,
+            "prompt": prompt,
+            "size": _clamp_size(size, self.model),
+            "response_format": "url",
+            "watermark": False,
+            "image": image_ref,
+            "mask": mask_ref,  # inpainting 专用参数
+        }
+
+        logger.debug(
+            "[Volc] Inpainting 请求 model=%s size=%s prompt=%s",
+            self.model, body["size"], prompt[:80],
+        )
+
+        session = requests.Session()
+        session.trust_env = False
+        resp = session.post(
+            self.api_url,
+            headers=headers,
+            json=body,
+            timeout=120,
+            proxies={"http": None, "https": None},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        items = data.get("data", [])
+        if not items:
+            raise ValueError(f"API 返回无图片数据: {data}")
+        url = items[0].get("url") or items[0].get("b64_json", "")
+        if not url:
+            raise ValueError(f"API 返回数据格式异常: {items[0]}")
+
+        # 如果已经是 base64，直接拼 data URL
+        if not url.startswith("http") and not url.startswith("data:"):
+            return f"data:image/jpeg;base64,{url}"
+
+        # 如果是 HTTP URL，后端下载后转 base64 data URL
+        img_resp = session.get(url, timeout=60, proxies={"http": None, "https": None})
+        img_resp.raise_for_status()
+        mime = img_resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
+        b64 = base64.b64encode(img_resp.content).decode("ascii")
+        logger.debug(
+            "[Volc] Inpainting 完成 model=%s 耗时=%dms 图片大小=%dKB",
+            self.model, int((_time.monotonic() - _t0) * 1000),
+            len(img_resp.content) // 1024,
+        )
+        return f"data:{mime};base64,{b64}"
 
     def compose(
         self,

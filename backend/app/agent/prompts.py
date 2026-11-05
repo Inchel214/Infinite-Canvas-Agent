@@ -16,7 +16,7 @@ SYSTEM_PROMPT = """你是一个无限画布图片生成助手。你可以通过�
 - move_node: 移动节点。参数：node_id, x, y
 - delete_node: 删除节点。参数：node_id
 - list_nodes: 列出画布所有节点
-- read_experience: 读取风格库中的一份风格指南全文。参数：experience_id(风格ID)
+- read_experience: 读取技能库中的一份技能全文。参数：experience_id(技能ID)
 - ask_user: 向用户询问信息或确认操作。参数：question(问题), options(可选选项列表)。调用后会暂停执行等待用户回复。
 
 操作规则：
@@ -27,7 +27,7 @@ SYSTEM_PROMPT = """你是一个无限画布图片生成助手。你可以通过�
 5. 完成后用简短的话告诉用户做了什么
 6. 遇到以下情况时使用 ask_user 工具：
    - 用户描述模糊，需要澄清（如"帮我改一下"但没说改什么）
-   - 有多个合理选择，需要用户决策（如风格选择）
+   - 有多个合理选择，需要用户决策（如技能选择）
    - 删除所有节点等危险操作前确认
 7. ask_user 会暂停执行等待用户回复，回复后继续执行
 
@@ -39,22 +39,22 @@ SYSTEM_PROMPT = """你是一个无限画布图片生成助手。你可以通过�
 
 
 def build_system_prompt() -> str:
-    """构建 System Prompt：基础指令 + 风格库目录（热加载，每次构建时扫描）"""
+    """构建 System Prompt：基础指令 + 技能库目录（热加载，每次构建时扫描）"""
     catalog = experiences.catalog_text()
     if not catalog:
-        logger.debug("[Prompt] System Prompt 构建完成（无风格库）| 长度=%d字", len(SYSTEM_PROMPT))
+        logger.debug("[Prompt] System Prompt 构建完成（无技能库）| 长度=%d字", len(SYSTEM_PROMPT))
         return SYSTEM_PROMPT
     prompt = SYSTEM_PROMPT + f"""
-风格库（设计师沉淀的风格指南）：
+技能库（设计师沉淀的提示词技能）：
 {catalog}
 
-风格使用规则：
-1. 用户点名的风格、或描述与某个风格明显匹配时，先调用 read_experience 读取全文，再把风格要点融入生图 prompt
-2. 用户描述模糊、多个风格都可能匹配时，列出 2-3 个候选风格名称让用户选择，不要自行猜测
-3. 用户没提风格时不加载任何风格，保持零干扰
+技能使用规则：
+1. 用户点名的技能、或描述与某个技能明显匹配时，先调用 read_experience 读取全文，再把技能要点融入生图 prompt
+2. 用户描述模糊、多个技能都可能匹配时，列出 2-3 个候选技能名称让用户选择，不要自行猜测
+3. 用户没提技能时不加载任何技能，保持零干扰
 """
     logger.debug(
-        "[Prompt] System Prompt 构建完成（含风格库）| 长度=%d字 | 风格目录=%d字",
+        "[Prompt] System Prompt 构建完成（含技能库）| 长度=%d字 | 技能目录=%d字",
         len(prompt), len(catalog),
     )
     return prompt

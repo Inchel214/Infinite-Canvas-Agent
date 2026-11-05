@@ -242,7 +242,89 @@ class OpenAIImageGenerator(BaseImageGenerator):
         return self._edit([source_image_url], prompt, size)
 
     def edit(self, source_image_url, prompt, mask=None, width=300, height=300, size="2K") -> ImageResult:
-        return self._edit([source_image_url], prompt, size)
+        """局部编辑（inpainting）：传入蒙版，只修改蒙版区域。
+
+        mask: base64 data URL（PNG 格式，白色区域为要修改的部分）
+        如果 mask 为空，退化为 img2img（全图重绘）。
+        """
+        if mask:
+            # 有蒙版：调用 inpainting API
+            return self._inpaint(source_image_url, mask, prompt, size)
+        else:
+            # 无蒙版：退化为 img2img
+            return self._edit([source_image_url], prompt, size)
+
+    def _inpaint(self, image_url: str, mask: str, prompt: str, size: str) -> ImageResult:
+        """调用 OpenAI inpainting API（局部编辑）。
+
+        使用 /images/edits 端点，传入 image + mask + prompt。
+        mask 为 base64 data URL，白色区域为要修改的部分。
+        """
+        import time as _time
+        _t0 = _time.monotonic()
+        logger.debug(
+            "[OpenAI] Inpainting 请求 model=%s size=%s prompt=%s",
+            self.model, _norm_size(size), prompt[:80],
+        )
+
+        session = self._session()
+
+        # 获取原图
+        image_content, image_mime = _fetch_image(image_url)
+        image_ext = _mime_to_ext(image_mime)
+
+        # 获取蒙版（必须是 PNG）
+        mask_content, mask_mime = _fetch_image(mask)
+        if mask_mime != "image/png":
+            # 蒙版必须是 PNG，如果不是，需要转换
+            logger.warning("[OpenAI] 蒙版格式 %s 非 PNG，尝试直接使用", mask_mime)
+
+        files = [
+            ("image", (f"image.{image_ext}", image_content, image_mime)),
+            ("mask", ("mask.png", mask_content, "image/png")),
+        ]
+
+        requested_size = _norm_size(size)
+
+        def post_inpaint(request_size: str) -> requests.Response:
+            request_files = [
+                ("image", (f"image.{image_ext}", image_content, image_mime)),
+                ("mask", ("mask.png", mask_content, "image/png")),
+            ]
+            return session.post(
+                self.edits_url,
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                data={"model": self.model, "prompt": prompt, "size": request_size},
+                files=request_files,
+                timeout=180,
+                proxies={"http": None, "https": None},
+            )
+
+        resp = post_inpaint(requested_size)
+        fallback_size = _fallback_edit_size(requested_size)
+        if resp.status_code == 400 and fallback_size:
+            first_error = _response_error_detail(resp)
+            logger.warning(
+                "Inpainting 接口拒绝自定义尺寸 %s，降级为 %s 重试：%s",
+                requested_size,
+                fallback_size,
+                first_error,
+            )
+            resp = post_inpaint(fallback_size)
+            if not resp.ok:
+                detail = _response_error_detail(resp)
+                raise ValueError(
+                    f"图片服务请求失败（HTTP {resp.status_code}）：{detail}"
+                    f"（原尺寸 {requested_size} 被拒绝，已用兼容尺寸 {fallback_size} 重试）"
+                )
+        _raise_provider_error(resp)
+        url = self._parse_response(resp.json())
+        w, h = _display_size(_image_size(url), (300, 300))
+        logger.debug(
+            "[OpenAI] Inpainting 完成 model=%s 耗时=%dms 尺寸=%dx%d",
+            self.model, int((_time.monotonic() - _t0) * 1000), w, h,
+        )
+        return ImageResult(image_url=url, width=w, height=h, prompt=prompt)
 
     def compose(self, image_urls, prompt="", width=300, height=300, size="2K") -> ImageResult:
         return self._edit(image_urls, prompt, size)

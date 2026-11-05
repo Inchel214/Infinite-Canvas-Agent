@@ -5,7 +5,7 @@
 - messages：用户原文与 Agent 最终回复（user/assistant 文本对），保持轻量、可直接回注 LLM 上下文
 - runs：每轮执行的结构化记录（状态/计划/工具参数），供"重试/继续"精确重放失败任务
 
-工具调用的完整过程只进 runs（不注入上下文），避免上下文爆炸。
+工具调用的完整过程实时持久化（每个工具步骤完成后立即写入），重启后可审计/恢复 Agent 决策过程。
 """
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import copy
 import json
 import logging
 import os
+import uuid
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,9 @@ _MAX_RUNS = 50
 def format_failure_note(run: dict | None) -> str | None:
     """把最近一条未完成的执行记录压缩成上下文提示，供 Agent 精确重放。
 
+    包含完整的执行历史（成功+失败步骤），让 LLM 知道哪些步骤已完成、
+    哪些失败，从而能从失败点精确重试，避免重复执行已成功的步骤。
+
     仅在最近一轮确实失败/停止时返回；成功轮返回 None，
     避免"上次任务已完成"的记录误导后续无关指令。
     """
@@ -40,27 +44,27 @@ def format_failure_note(run: dict | None) -> str | None:
         s = str(text or "").replace("\n", " ").strip()
         return s if len(s) <= n else s[:n] + "…"
 
-    # 取最后一个失败的工具步骤（成功的步骤无需重放）
-    failed_step = next(
-        (s for s in reversed(run.get("steps") or []) if not s.get("success", True)),
-        None,
-    )
-
     status = "已停止" if run.get("status") == "stopped" else "失败"
     lines = [f"[系统记录] 本画布最近一次未完成的任务（{status}）："]
     lines.append(f"- 指令：{clip(run.get('prompt'), 120)}")
     if run.get("plan"):
         lines.append(f"- 计划：{clip(run['plan'], 120)}")
-    if failed_step:
-        args = json.dumps(failed_step.get("args") or {}, ensure_ascii=False)
-        lines.append(
-            f"- 未完成步骤：{failed_step.get('tool')}({clip(args, 160)})"
-            f" → {clip(failed_step.get('result'), 100)}"
-        )
+
+    # 包含所有步骤（成功+失败），让 LLM 知道完整执行历史
+    steps = run.get("steps", [])
+    if steps:
+        lines.append("- 执行历史：")
+        for i, step in enumerate(steps, 1):
+            tool_status = "✓" if step.get("success", True) else "✗"
+            args = json.dumps(step.get("args") or {}, ensure_ascii=False)
+            lines.append(f"  {i}. [{tool_status}] {step.get('tool')}({clip(args, 100)})")
+            if not step.get("success", True):
+                lines.append(f"     失败原因：{clip(step.get('result'), 80)}")
+
     if run.get("error"):
         lines.append(f"- 错误：{clip(run['error'], 120)}")
     lines.append(
-        "如本轮用户要求「重试/继续/接着做」，请直接复用上述参数重放该步骤，不要重新询问。"
+        "\n请从失败的步骤继续重试，已完成的步骤无需重复执行。不要重新询问用户参数。"
     )
     return "\n".join(lines)
 
@@ -119,6 +123,32 @@ class ChatSessionStore:
         )
         return msgs
 
+    def append_user_message(self, canvas_id: str, user_message: str) -> None:
+        """立即保存用户消息（发送时调用，确保切换画布后历史不丢失）"""
+        msgs = self._messages_internal(canvas_id)
+        msgs.append({"role": "user", "content": user_message})
+        # 超限丢弃最早的消息
+        if len(msgs) > _MAX_MESSAGES:
+            del msgs[: len(msgs) - _MAX_MESSAGES]
+        logger.debug(
+            "[Session] 保存用户消息 canvas=%s | 当前=%d条 | user=%s",
+            canvas_id, len(msgs), user_message[:60].replace("\n", " "),
+        )
+        self._save(canvas_id)
+
+    def append_assistant_message(self, canvas_id: str, assistant_message: str) -> None:
+        """保存助手回复（worker 完成后调用）"""
+        msgs = self._messages_internal(canvas_id)
+        msgs.append({"role": "assistant", "content": assistant_message})
+        # 超限丢弃最早的消息
+        if len(msgs) > _MAX_MESSAGES:
+            del msgs[: len(msgs) - _MAX_MESSAGES]
+        logger.debug(
+            "[Session] 保存助手回复 canvas=%s | 当前=%d条",
+            canvas_id, len(msgs),
+        )
+        self._save(canvas_id)
+
     def append_round(self, canvas_id: str, user_message: str, assistant_message: str) -> None:
         """追加一轮完整对话（用户原文 + Agent 最终回复）并落盘"""
         msgs = self._messages_internal(canvas_id)
@@ -144,6 +174,69 @@ class ChatSessionStore:
         if len(runs) > _MAX_RUNS:
             del runs[: len(runs) - _MAX_RUNS]
         self._save(canvas_id)
+
+    def begin_run(self, canvas_id: str, prompt: str) -> str:
+        """开始一轮执行，创建 in_progress 状态的 run 记录并落盘。
+
+        返回 run_id，后续通过 update_run_steps 增量更新步骤。
+        """
+        self._ensure_loaded(canvas_id)
+        runs = self._runs.setdefault(canvas_id, [])
+        run_id = uuid.uuid4().hex[:12]
+        record = {
+            "id": run_id,
+            "at": __import__("time").time(),
+            "prompt": prompt,
+            "status": "in_progress",
+            "plan": "",
+            "steps": [],
+            "message": "",
+            "error": None,
+        }
+        runs.append(record)
+        if len(runs) > _MAX_RUNS:
+            del runs[: len(runs) - _MAX_RUNS]
+        self._save(canvas_id)
+        logger.debug("[Session] 开始执行 canvas=%s run_id=%s", canvas_id, run_id)
+        return run_id
+
+    def update_run_plan(self, canvas_id: str, run_id: str, plan: str) -> None:
+        """更新 run 记录的计划（规划阶段完成后调用）"""
+        self._ensure_loaded(canvas_id)
+        runs = self._runs.get(canvas_id) or []
+        for run in runs:
+            if run.get("id") == run_id:
+                run["plan"] = plan
+                break
+        self._save(canvas_id)
+
+    def append_step(self, canvas_id: str, run_id: str, step: dict) -> None:
+        """追加一个工具步骤到 run 记录并立即落盘（实时持久化）"""
+        self._ensure_loaded(canvas_id)
+        runs = self._runs.get(canvas_id) or []
+        for run in runs:
+            if run.get("id") == run_id:
+                run.setdefault("steps", []).append(step)
+                break
+        self._save(canvas_id)
+        logger.debug(
+            "[Session] 追加步骤 canvas=%s run_id=%s tool=%s",
+            canvas_id, run_id, step.get("tool"),
+        )
+
+    def finish_run(self, canvas_id: str, run_id: str, status: str, message: str = "", error: str | None = None) -> None:
+        """完成 run 记录，更新状态为 done/failed/stopped"""
+        self._ensure_loaded(canvas_id)
+        runs = self._runs.get(canvas_id) or []
+        for run in runs:
+            if run.get("id") == run_id:
+                run["status"] = status
+                run["message"] = message
+                if error:
+                    run["error"] = error
+                break
+        self._save(canvas_id)
+        logger.debug("[Session] 完成执行 canvas=%s run_id=%s status=%s", canvas_id, run_id, status)
 
     def last_run(self, canvas_id: str) -> dict | None:
         """最近一条执行记录（判断"重试/继续"指向哪个任务），无记录返回 None"""
@@ -178,9 +271,15 @@ class ChatSessionStore:
             "messages": self._sessions.get(canvas_id, []),
             "runs": self._runs.get(canvas_id, []),
         }
+        tmp = path.with_suffix(".json.tmp")
         try:
-            with path.open("w", encoding="utf-8") as f:
+            with tmp.open("w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False)
+            os.replace(tmp, path)
         except OSError as e:
             # 磁盘写入失败不影响内存中的会话
             logger.warning("对话历史落盘失败（仅保留内存版）: %s: %s", path.name, e)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass

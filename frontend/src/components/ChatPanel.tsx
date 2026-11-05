@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, forwardRef, useImperativeHandle, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -7,6 +7,9 @@ import {
   clearChatHistory,
   stopAgent,
   respondToAgent,
+  waitForRunCompletion,
+  beginRound,
+  undoRound,
 } from "../api/agent";
 import type { AgentStep, CanvasNode, CanvasState } from "../types/canvas";
 
@@ -21,10 +24,14 @@ interface ChatEntry {
   stopped?: boolean; // 用户中途停止
   timestamp: number;
   error?: boolean;
+  roundId?: string; // 轮次标记 ID（用于整轮撤回）
   // 人在回路：Agent 询问用户
   askUser?: {
     question: string;
     options?: string[];
+    timeout?: number; // 超时时间（秒）
+    default_action?: string; // 超时后的默认行为
+    startTime?: number; // 开始等待的时间戳
     answered?: boolean; // 用户是否已回复
     response?: string; // 用户的回复
   };
@@ -69,23 +76,57 @@ const TOOL_LABELS: Record<string, string> = {
 function AskUserCard({
   question,
   options,
+  timeout,
+  default_action,
+  startTime,
   answered,
   response,
   onRespond,
 }: {
   question: string;
   options?: string[];
+  timeout?: number;
+  default_action?: string;
+  startTime?: number;
   answered?: boolean;
   response?: string;
   onRespond: (response: string) => void;
 }) {
   const [inputValue, setInputValue] = useState("");
+  const [remaining, setRemaining] = useState(timeout || 120);
+
+  // 倒计时效果
+  useEffect(() => {
+    if (answered || !startTime) return;
+    
+    const interval = setInterval(() => {
+      const elapsed = Math.floor((Date.now() - startTime) / 1000);
+      const left = Math.max(0, (timeout || 120) - elapsed);
+      setRemaining(left);
+      
+      if (left === 0) {
+        clearInterval(interval);
+      }
+    }, 1000);
+    
+    return () => clearInterval(interval);
+  }, [answered, startTime, timeout]);
 
   const handleSubmit = (value: string) => {
     if (!value.trim()) return;
     onRespond(value.trim());
     setInputValue("");
   };
+
+  // 格式化倒计时显示
+  const formatCountdown = (seconds: number) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins}:${String(secs).padStart(2, "0")}`;
+  };
+
+  // 倒计时颜色：最后 30 秒变红
+  const countdownColor = remaining <= 30 ? "#ef4444" : remaining <= 60 ? "#f59e0b" : "#888";
 
   return (
     <div
@@ -99,11 +140,18 @@ function AskUserCard({
         padding: "10px 12px",
       }}
     >
-      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
-        <span style={{ fontSize: 14 }}>💬</span>
-        <span style={{ fontWeight: 600, fontSize: 13, color: "#fbbf24" }}>
-          Agent 需要你的回复
-        </span>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <span style={{ fontSize: 14 }}>💬</span>
+          <span style={{ fontWeight: 600, fontSize: 13, color: "#fbbf24" }}>
+            Agent 需要你的回复
+          </span>
+        </div>
+        {!answered && startTime && (
+          <span style={{ fontSize: 11, color: countdownColor, fontFamily: "monospace" }}>
+            {formatCountdown(remaining)}
+          </span>
+        )}
       </div>
       <div style={{ fontSize: 13, color: "#e8e8f0", marginBottom: 10, lineHeight: 1.5 }}>
         {question}
@@ -120,63 +168,76 @@ function AskUserCard({
         >
           已回复：{response}
         </div>
-      ) : options && options.length > 0 ? (
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-          {options.map((opt, i) => (
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {/* 选项按钮（如果有） */}
+          {options && options.length > 0 && (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+              {options.map((opt, i) => (
+                <button
+                  key={i}
+                  onClick={() => handleSubmit(opt)}
+                  style={{
+                    padding: "6px 12px",
+                    fontSize: 12,
+                    background: "rgba(99,102,241,0.2)",
+                    border: "1px solid rgba(99,102,241,0.4)",
+                    borderRadius: 6,
+                    color: "#c7d2fe",
+                    cursor: "pointer",
+                  }}
+                >
+                  {opt}
+                </button>
+              ))}
+            </div>
+          )}
+          {/* 自由输入框（始终显示） */}
+          <div style={{ display: "flex", gap: 6 }}>
+            <input
+              type="text"
+              value={inputValue}
+              onChange={(e) => setInputValue(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  handleSubmit(inputValue);
+                }
+              }}
+              placeholder={options && options.length > 0 ? "或输入自定义回复..." : "输入你的回复..."}
+              style={{
+                flex: 1,
+                padding: "6px 10px",
+                fontSize: 12,
+                background: "rgba(255,255,255,0.08)",
+                border: "1px solid rgba(255,255,255,0.15)",
+                borderRadius: 6,
+                color: "#e8e8f0",
+                outline: "none",
+              }}
+            />
             <button
-              key={i}
-              onClick={() => handleSubmit(opt)}
+              onClick={() => handleSubmit(inputValue)}
               style={{
                 padding: "6px 12px",
                 fontSize: 12,
-                background: "rgba(99,102,241,0.2)",
-                border: "1px solid rgba(99,102,241,0.4)",
+                background: "rgba(99,102,241,0.8)",
+                border: "none",
                 borderRadius: 6,
-                color: "#c7d2fe",
+                color: "#fff",
                 cursor: "pointer",
               }}
             >
-              {opt}
+              发送
             </button>
-          ))}
-        </div>
-      ) : (
-        <div style={{ display: "flex", gap: 6 }}>
-          <input
-            type="text"
-            value={inputValue}
-            onChange={(e) => setInputValue(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") {
-                handleSubmit(inputValue);
-              }
-            }}
-            placeholder="输入你的回复..."
-            style={{
-              flex: 1,
-              padding: "6px 10px",
-              fontSize: 12,
-              background: "rgba(255,255,255,0.08)",
-              border: "1px solid rgba(255,255,255,0.15)",
-              borderRadius: 6,
-              color: "#e8e8f0",
-              outline: "none",
-            }}
-          />
-          <button
-            onClick={() => handleSubmit(inputValue)}
-            style={{
-              padding: "6px 12px",
-              fontSize: 12,
-              background: "rgba(99,102,241,0.8)",
-              border: "none",
-              borderRadius: 6,
-              color: "#fff",
-              cursor: "pointer",
-            }}
-          >
-            发送
-          </button>
+          </div>
+          {/* 超时提示 */}
+          {timeout && (
+            <div style={{ fontSize: 11, color: "#666", fontStyle: "italic" }}>
+              {default_action 
+                ? `⏱ ${Math.floor(timeout / 60)} 分钟未回复将自动：${default_action}`
+                : `⏱ ${Math.floor(timeout / 60)} 分钟未回复将由 Agent 自行决策`}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -439,7 +500,11 @@ function insertTextAtCursor(root: HTMLElement, text: string) {
   }
 }
 
-export function ChatPanel({
+export interface ChatPanelRef {
+  saveDraft: () => void;
+}
+
+export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatPanel({
   canvasId,
   open,
   onOpenChange,
@@ -449,7 +514,7 @@ export function ChatPanel({
   canvasNodes,
   onClearRefs,
   onCanvasUpdate,
-}: ChatPanelProps) {
+}: ChatPanelProps, ref) {
   const [entries, setEntries] = useState<ChatEntry[]>([]);
   // 输入区是否有内容（文本或引用芯片）：驱动发送按钮禁用态
   const [hasContent, setHasContent] = useState(false);
@@ -460,6 +525,7 @@ export function ChatPanel({
   const [confirmClear, setConfirmClear] = useState(false);
   const [resizing, setResizing] = useState(false);
   const [hoverHandle, setHoverHandle] = useState(false);
+  const [draftContent, setDraftContent] = useState<string>("");
   const listRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<HTMLDivElement>(null);
   const composingRef = useRef(false);
@@ -469,6 +535,13 @@ export function ChatPanel({
   const panelDragRef = useRef<{ x: number; y: number; left: number; top: number } | null>(null);
   const mentionRangeRef = useRef<Range | null>(null);
   const resizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
+
+  // 暴露 saveDraft 方法给父组件（保留接口兼容性，实际草稿已实时保存）
+  useImperativeHandle(ref, () => ({
+    saveDraft: () => {
+      // 草稿已通过 syncEditorState 实时保存，无需额外操作
+    },
+  }), []);
 
   useEffect(() => {
     if (!panelDragging) return;
@@ -577,14 +650,26 @@ export function ChatPanel({
   };
 
   // 输入事件后同步空态/有内容状态；浏览器会在清空的 contenteditable 里留 <br>，归一化为空让 :empty 占位符生效
+  // 同时实时保存草稿到 localStorage，确保切换画布时不丢失
   const syncEditorState = () => {
     const editor = editorRef.current;
     if (!editor) return;
     if (!editor.textContent?.trim() && !editor.querySelector("[data-node-id]")) {
       editor.innerHTML = "";
       setHasContent(false);
+      setDraftContent("");
+      // 实时清除草稿
+      if (canvasId) {
+        localStorage.removeItem(`chat_draft_${canvasId}`);
+      }
     } else {
+      const content = editor.innerHTML;
       setHasContent(true);
+      setDraftContent(content);
+      // 实时保存草稿
+      if (canvasId && content && content !== '<br>') {
+        localStorage.setItem(`chat_draft_${canvasId}`, content);
+      }
     }
   };
 
@@ -603,10 +688,15 @@ export function ChatPanel({
   useEffect(() => {
     const editor = editorRef.current;
     if (!editor || canvasNodes.length === 0) return;
+    let removed = false;
     editor.querySelectorAll("[data-node-id]").forEach((el) => {
-      if (!nodeById.has((el as HTMLElement).dataset.nodeId || "")) el.remove();
+      if (!nodeById.has((el as HTMLElement).dataset.nodeId || "")) {
+        el.remove();
+        removed = true;
+      }
     });
-    syncEditorState();
+    // 只在有芯片被移除时才同步状态，避免组件挂载时误清除草稿
+    if (removed) syncEditorState();
   }, [nodeById]);
 
   // 左边缘拖拽拉伸：往左拖变宽，往右拖变窄，clamp 到 [MIN, MAX]
@@ -639,21 +729,70 @@ export function ChatPanel({
 
   // 挂载时加载该画布的持久化对话历史（组件按 canvasId 重挂载，天然隔离）。
   // 历史里的行内引用标记在渲染气泡时还原成芯片（见 renderUserContent）
+  // 如果有正在执行的 run（用户切换画布时生成任务仍在后端运行），先轮询等待完成再加载历史
   useEffect(() => {
     if (!canvasId) return;
-    getChatHistory(canvasId)
-      .then((messages) => {
-        setEntries(
-          messages.map((m) => ({
-            role: m.role,
-            content: m.content,
-            timestamp: 0, // 历史不展示时间戳
-          }))
-        );
-      })
-      .catch(() => {
-        // 后端未就绪时静默，面板仍可输入
+    console.log('[ChatPanel] 加载画布历史:', canvasId);
+
+    let cancelled = false;
+
+    // 恢复该画布的未发送草稿（延迟确保 editorRef 已绑定）
+    const draftKey = `chat_draft_${canvasId}`;
+    const draft = localStorage.getItem(draftKey);
+    if (draft) {
+      requestAnimationFrame(() => {
+        if (cancelled) return;
+        const editor = editorRef.current;
+        if (editor) {
+          editor.innerHTML = draft;
+          setHasContent(true);
+        }
       });
+    }
+
+    (async () => {
+      // 检查是否有正在执行的生成任务
+      try {
+        await waitForRunCompletion(canvasId, 30000, 1000);
+      } catch (err) {
+        console.warn('[ChatPanel] 等待 run 完成失败:', err);
+      }
+
+      if (cancelled) return;
+
+      // 加载历史（带重试，防止后端未就绪时首次加载失败）
+      const loadHistory = async (retries = 2) => {
+        for (let i = 0; i <= retries; i++) {
+          try {
+            const messages = await getChatHistory(canvasId);
+            if (cancelled) return;
+            console.log('[ChatPanel] 历史加载成功:', messages.length, '条');
+            setEntries(
+              messages.map((m) => ({
+                role: m.role,
+                content: m.content,
+                timestamp: 0, // 历史不展示时间戳
+              }))
+            );
+            return; // 成功则返回
+          } catch (err) {
+            if (cancelled) return;
+            if (i < retries) {
+              console.warn(`[ChatPanel] 历史加载失败，${i + 1}s 后重试 (${i + 1}/${retries}):`, err);
+              await new Promise(r => setTimeout(r, 1000));
+            } else {
+              console.warn('[ChatPanel] 历史加载最终失败:', err);
+              // 后端未就绪时静默，面板仍可输入
+            }
+          }
+        }
+      };
+      loadHistory();
+    })();
+
+    return () => {
+      cancelled = true;
+    };
   }, [canvasId]);
 
   // 新消息时滚动到底部
@@ -684,6 +823,8 @@ export function ChatPanel({
     const editor = editorRef.current;
     if (editor) editor.innerHTML = "";
     setHasContent(false);
+    // 清空历史时也清除草稿
+    localStorage.removeItem(`chat_draft_${canvasId}`);
     setConfirmClear(false);
   };
 
@@ -711,14 +852,20 @@ export function ChatPanel({
     if (!trimmedMessage) return;
     editor.innerHTML = "";
     setHasContent(false);
+    // 发送成功后清除该画布的草稿
+    localStorage.removeItem(`chat_draft_${canvasId}`);
     // 引用已随消息序列化，清空 App 侧收件箱避免残留
     onClearRefs();
     setSending(true);
     const ts = Date.now();
+    
+    // 标记本轮对话开始（用于整轮撤回）
+    const roundId = await beginRound(canvasId);
+    
     // 立刻挂一条空的 assistant 条目作为"直播位"，流式事件逐步填充它
     setEntries((prev) => [
       ...prev,
-      { role: "user", content: trimmedMessage, timestamp: ts },
+      { role: "user", content: trimmedMessage, timestamp: ts, roundId: roundId || undefined },
       { role: "assistant", content: "", steps: [], timestamp: ts },
     ]);
 
@@ -754,8 +901,11 @@ export function ChatPanel({
             reasoningOpen: e.reasoning ? false : e.reasoningOpen,
           }));
         } else if (evt.type === "tool_start") {
+          // ReAct 多轮循环：LLM 要调工具时，之前流的 delta 是中间思考说明，
+          // 不是最终回复。清空 content 防止下一轮 delta 累加导致重复输出。
           updateLive((e) => ({
             ...e,
+            content: "",
             steps: [
               ...(e.steps || []),
               { type: "tool_call", tool: evt.tool, args: evt.args, result: "", pending: true },
@@ -786,6 +936,9 @@ export function ChatPanel({
             askUser: {
               question: evt.question || "",
               options: evt.options,
+              timeout: evt.timeout,
+              default_action: evt.default_action,
+              startTime: Date.now(), // 记录开始等待的时间
             },
           }));
         } else if (evt.type === "done") {
@@ -1024,21 +1177,57 @@ export function ChatPanel({
             <div
               key={i}
               style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 5 }}
+              className="chat-user-message"
             >
-              <div
-                style={{
-                  maxWidth: "86%",
-                  background: "rgba(99,102,241,0.85)",
-                  color: "#fff",
-                  padding: "8px 12px",
-                  borderRadius: "12px 12px 2px 12px",
-                  fontSize: 14,
-                  lineHeight: 1.6,
-                  whiteSpace: "pre-wrap",
-                  wordBreak: "break-word",
-                }}
-              >
-                {renderUserContent(entry.content)}
+              <div style={{ display: "flex", alignItems: "flex-end", gap: 6 }}>
+                {/* 撤回按钮：悬停时显示，仅当有 roundId 且不是正在发送时可用 */}
+                {entry.roundId && !sending && (
+                  <button
+                    type="button"
+                    title="撤回本轮 AI 的所有修改"
+                    onClick={async () => {
+                      if (!canvasId || !entry.roundId) return;
+                      const res = await undoRound(canvasId, entry.roundId);
+                      if (res.success) {
+                        onCanvasUpdate(res.canvas);
+                        // 显示提示
+                        const msg = res.message || "已撤回";
+                        setEntries((prev) => [
+                          ...prev,
+                          { role: "assistant", content: `↩️ ${msg}`, timestamp: Date.now() },
+                        ]);
+                      }
+                    }}
+                    style={{
+                      background: "none",
+                      border: "none",
+                      color: "rgba(255,255,255,0.4)",
+                      cursor: "pointer",
+                      padding: "4px",
+                      fontSize: 14,
+                      opacity: 0,
+                      transition: "opacity 0.15s",
+                    }}
+                    className="chat-undo-btn"
+                  >
+                    ↩
+                  </button>
+                )}
+                <div
+                  style={{
+                    maxWidth: "86%",
+                    background: "rgba(99,102,241,0.85)",
+                    color: "#fff",
+                    padding: "8px 12px",
+                    borderRadius: "12px 12px 2px 12px",
+                    fontSize: 14,
+                    lineHeight: 1.6,
+                    whiteSpace: "pre-wrap",
+                    wordBreak: "break-word",
+                  }}
+                >
+                  {renderUserContent(entry.content)}
+                </div>
               </div>
             </div>
           ) : (
@@ -1213,6 +1402,9 @@ export function ChatPanel({
                 <AskUserCard
                   question={entry.askUser.question}
                   options={entry.askUser.options}
+                  timeout={entry.askUser.timeout}
+                  default_action={entry.askUser.default_action}
+                  startTime={entry.askUser.startTime}
                   answered={entry.askUser.answered}
                   response={entry.askUser.response}
                   onRespond={handleRespond}
@@ -1539,6 +1731,13 @@ export function ChatPanel({
           color: #777;
           pointer-events: none;
         }
+        /* 用户消息悬停时显示撤回按钮 */
+        .chat-user-message:hover .chat-undo-btn {
+          opacity: 1 !important;
+        }
+        .chat-undo-btn:hover {
+          color: rgba(255,255,255,0.8) !important;
+        }
         /* 输入框内的引用芯片：高 20px ≤ 行高 22px，垂直居中，保证各行高度一致 */
         .ref-chip {
           display: inline-flex;
@@ -1602,4 +1801,4 @@ export function ChatPanel({
       `}</style>
     </div>
   );
-}
+});

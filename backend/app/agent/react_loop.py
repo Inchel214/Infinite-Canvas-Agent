@@ -185,12 +185,14 @@ class ReActAgent:
         store: BaseStore,
         max_steps: int = 100,
         control: RunControl | None = None,
+        chat_sessions: "ChatSessionStore | None" = None,  # 工具步骤实时持久化
     ):
         self.llm = llm
         self.tool_manager = tool_manager
         self.store = store
         self.max_steps = max_steps
         self.control = control or RunControl()
+        self.chat_sessions = chat_sessions
 
     def run(
         self,
@@ -215,6 +217,10 @@ class ReActAgent:
                 on_event(evt)
 
         stop_evt = self.control.register(canvas_id)
+        # 工具步骤实时持久化：创建 run 记录
+        run_id = None
+        if self.chat_sessions:
+            run_id = self.chat_sessions.begin_run(canvas_id, prompt)
         try:
             # system + 历史对话 + 当前用户消息（当前消息每步重建画布状态）
             system_prompt = build_system_prompt()
@@ -251,6 +257,9 @@ class ReActAgent:
                 logger.debug("[Agent] 路由决策: 纯对话（chat），跳过 ReAct 循环")
                 steps.append({"type": "response", "content": chat_answer})
                 emit({"type": "response", "content": chat_answer})
+                # 完成 run 记录
+                if self.chat_sessions and run_id:
+                    self.chat_sessions.finish_run(canvas_id, run_id, "done", chat_answer)
                 return AgentResult(success=True, message=chat_answer, state=state, steps=steps)
             if plan:
                 # 检查计划是否是询问用户（包含问号或询问句式，且没有明确的工具调用步骤）
@@ -260,9 +269,15 @@ class ReActAgent:
                     logger.debug("[Agent] 路由决策: 询问用户（inquiry），跳过 ReAct 循环")
                     steps.append({"type": "response", "content": plan})
                     emit({"type": "response", "content": plan})
+                    # 完成 run 记录
+                    if self.chat_sessions and run_id:
+                        self.chat_sessions.finish_run(canvas_id, run_id, "done", plan)
                     return AgentResult(success=True, message=plan, state=state, steps=steps)
                 logger.debug("[Agent] 路由决策: 工具任务（plan），进入 ReAct 循环")
                 steps.append({"type": "plan", "content": plan})
+                # 持久化计划
+                if self.chat_sessions and run_id:
+                    self.chat_sessions.update_run_plan(canvas_id, run_id, plan)
                 # 计划注入上下文，执行阶段模型能看到自己的计划
                 messages.append({"role": "assistant", "content": f"执行计划：\n{plan}"})
                 logger.info("[Agent] 计划已生成 canvas=%s plan=%s", canvas_id, _clip(plan, 120))
@@ -270,6 +285,9 @@ class ReActAgent:
             # ===== 执行阶段：ReAct 循环 =====
             for _step in range(self.max_steps):
                 if stop_evt.is_set():
+                    # 完成 run 记录
+                    if self.chat_sessions and run_id:
+                        self.chat_sessions.finish_run(canvas_id, run_id, "stopped", "")
                     return self._stopped_result(state, steps)
 
                 logger.debug(
@@ -280,10 +298,15 @@ class ReActAgent:
                 # LLM 流式调用：深度思考过程实时推前端（reasoning_delta），
                 # 文本增量实时推前端（delta 打字机），tool_calls 聚合后照常执行。
                 # 执行阶段保留深度思考，复杂工具链的规划质量靠它。
+                _text_buffer = []
+                def _on_text(s: str) -> None:
+                    _text_buffer.append(s)
+                    emit({"type": "delta", "content": s})
+
                 response = self.llm.chat_stream(
                     messages,
                     tools=self.tool_manager.list_schemas(),
-                    on_text=lambda s: emit({"type": "delta", "content": s}),
+                    on_text=_on_text,
                     on_reasoning=lambda s: emit({"type": "reasoning_delta", "content": s}),
                 )
 
@@ -295,6 +318,9 @@ class ReActAgent:
                         "[Agent] 任务完成 canvas=%s 步数=%d 回复=%s",
                         canvas_id, _step + 1, _clip(response.content, 120),
                     )
+                    # 完成 run 记录
+                    if self.chat_sessions and run_id:
+                        self.chat_sessions.finish_run(canvas_id, run_id, "done", response.content)
                     return AgentResult(
                         success=True,
                         message=response.content,
@@ -315,37 +341,37 @@ class ReActAgent:
                         "[Tool] 并行执行 %d 个生图工具 canvas=%s",
                         len(image_tool_calls), canvas_id,
                     )
-                    # 为每个工具创建独立的 state 副本
-                    state_copies = {tc: copy.deepcopy(state) for tc in image_tool_calls}
-                    
-                    def execute_image_tool(tool_call: ToolCall, tool_state: CanvasState) -> tuple[ToolCall, ToolResult, float]:
-                        """执行单个生图工具，返回 (tool_call, result, cost_ms)"""
+                    # 为每个工具创建独立的 state 副本（用索引作 key，ToolCall 含 dict 字段不可哈希）
+                    state_copies = {i: copy.deepcopy(state) for i, tc in enumerate(image_tool_calls)}
+
+                    def execute_image_tool(idx: int, tool_call: ToolCall, tool_state: CanvasState) -> tuple[int, ToolResult, float]:
+                        """执行单个生图工具，返回 (index, result, cost_ms)"""
                         _t0 = time.monotonic()
                         result = self._execute_tool(tool_call, tool_state)
                         _cost_ms = int((time.monotonic() - _t0) * 1000)
-                        return tool_call, result, _cost_ms
-                    
+                        return idx, result, _cost_ms
+
                     # 使用线程池并行执行
                     with ThreadPoolExecutor(max_workers=min(len(image_tool_calls), 4)) as executor:
                         futures = {
-                            executor.submit(execute_image_tool, tc, state_copies[tc]): tc
-                            for tc in image_tool_calls
+                            executor.submit(execute_image_tool, i, tc, state_copies[i]): i
+                            for i, tc in enumerate(image_tool_calls)
                         }
-                        
+
                         # 收集结果（按原始顺序）
-                        results_map = {}
+                        results_map: dict[int, tuple[ToolResult, float]] = {}
                         for future in as_completed(futures):
-                            tc, result, cost_ms = future.result()
-                            results_map[tc] = (result, cost_ms)
-                    
+                            idx, result, cost_ms = future.result()
+                            results_map[idx] = (result, cost_ms)
+
                     # 按原始顺序处理结果
-                    for tool_call in image_tool_calls:
+                    for i, tool_call in enumerate(image_tool_calls):
                         if stop_evt.is_set():
                             aborted = True
                             break
-                        
-                        result, cost_ms = results_map[tool_call]
-                        
+
+                        result, cost_ms = results_map[i]
+
                         if result.success:
                             logger.info(
                                 "[Tool] 完成 %s canvas=%s 耗时=%dms 结果=%s",
@@ -356,7 +382,7 @@ class ReActAgent:
                                 "[Tool] 失败 %s canvas=%s 耗时=%dms 原因=%s",
                                 tool_call.name, canvas_id, cost_ms, _clip(result.message, 160),
                             )
-                        
+
                         steps.append({
                             "type": "tool_call",
                             "tool": tool_call.name,
@@ -364,7 +390,15 @@ class ReActAgent:
                             "result": result.message,
                             "success": result.success,
                         })
-                        
+                        # 实时持久化工具步骤
+                        if self.chat_sessions and run_id:
+                            self.chat_sessions.append_step(canvas_id, run_id, {
+                                "tool": tool_call.name,
+                                "args": tool_call.args,
+                                "result": result.message,
+                                "success": result.success,
+                            })
+
                         # 工具结果加入消息
                         tool_content = result.message
                         if not result.success:
@@ -378,7 +412,7 @@ class ReActAgent:
                             "role": "tool",
                             "content": tool_content,
                         })
-                        
+
                         # 合并结果到主 state
                         if result.success and result.state:
                             # 将新节点从工具结果合并到主 state
@@ -407,6 +441,8 @@ class ReActAgent:
                             "type": "ask_user",
                             "question": tool_call.args.get("question", ""),
                             "options": tool_call.args.get("options", []),
+                            "default_action": tool_call.args.get("default_action", ""),
+                            "timeout": tool_call.args.get("timeout", 120),
                         })
 
                     emit({"type": "tool_start", "tool": tool_call.name, "args": tool_call.args})
@@ -438,6 +474,14 @@ class ReActAgent:
                         "result": result.message,
                         "success": result.success,
                     })
+                    # 实时持久化工具步骤
+                    if self.chat_sessions and run_id:
+                        self.chat_sessions.append_step(canvas_id, run_id, {
+                            "tool": tool_call.name,
+                            "args": tool_call.args,
+                            "result": result.message,
+                            "success": result.success,
+                        })
 
                     # 工具结果加入消息，供 LLM 决策下一步；失败时附反思提示
                     tool_content = result.message
@@ -469,6 +513,9 @@ class ReActAgent:
                     })
 
                 if aborted:
+                    # 完成 run 记录
+                    if self.chat_sessions and run_id:
+                        self.chat_sessions.finish_run(canvas_id, run_id, "stopped", "")
                     return self._stopped_result(state, steps)
 
                 # 更新当前用户消息中的画布状态（历史消息保持原样）
@@ -479,9 +526,13 @@ class ReActAgent:
 
             # 超过最大步数：标记成功（执行过程无错误）
             # 消息不提"上限/步数"等技术概念，避免 LLM 在下一轮被历史锚定后只会复述"已到上限"
+            max_steps_msg = "这一轮操作已经执行完毕。如果还有未完成的部分，请告诉我接下来要做什么，我继续帮你处理。"
+            # 完成 run 记录
+            if self.chat_sessions and run_id:
+                self.chat_sessions.finish_run(canvas_id, run_id, "done", max_steps_msg)
             return AgentResult(
                 success=True,
-                message="这一轮操作已经执行完毕。如果还有未完成的部分，请告诉我接下来要做什么，我继续帮你处理。",
+                message=max_steps_msg,
                 state=state,
                 steps=steps,
             )

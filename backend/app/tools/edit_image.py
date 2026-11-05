@@ -12,13 +12,23 @@ from app.tools.tasks import tracks_generation
 
 class EditImageTool(BaseTool):
     name = "edit_image"
-    description = "局部编辑：对画布上的图片进行重绘 / 局部修改 / 扩展"
+    description = (
+        "局部编辑（Inpainting）：对画布上的图片进行蒙版区域修改。"
+        "用户需要提供蒙版图片（base64 data URL，白色区域为要修改的部分）。"
+        "如果没有提供蒙版，则退化为全图重绘（img2img）。"
+    )
     args_schema = {
         "type": "object",
         "properties": {
             "node_id": {"type": "string", "description": "要编辑的图片节点 ID"},
             "prompt": {"type": "string", "description": "编辑描述提示词"},
-            "mask": {"type": "string", "description": "蒙版描述（可选，如 左上角、背景 等）"},
+            "mask": {
+                "type": "string",
+                "description": (
+                    "蒙版图片（base64 data URL，PNG 格式，白色区域为要修改的部分）。"
+                    "如果不提供，则退化为全图重绘。"
+                ),
+            },
             "x": {"type": "number", "description": "新图放置位置 x（默认在原图右侧）"},
             "y": {"type": "number", "description": "新图放置位置 y"},
             "size": {
@@ -36,7 +46,7 @@ class EditImageTool(BaseTool):
     def run(self, state: CanvasState, **kwargs) -> ToolResult:
         node_id = kwargs.get("node_id", "")
         prompt = kwargs.get("prompt", "")
-        mask = kwargs.get("mask")
+        mask = kwargs.get("mask")  # base64 data URL 或 None
         size = str(kwargs.get("size", "2K"))
 
         source = state.get_node(node_id)
@@ -68,7 +78,7 @@ class EditImageTool(BaseTool):
         result = self.image_generator.edit(
             source_image_url=source.image_url,
             prompt=prompt,
-            mask=mask,
+            mask=mask,  # 传入蒙版（可以是 None）
             width=source.width,
             height=source.height,
             size=size,
@@ -86,9 +96,11 @@ class EditImageTool(BaseTool):
             source_ids=[node_id],
         )
         state.add_node(node)
+
+        edit_type = "局部编辑" if mask else "全图重绘"
         return ToolResult(
             success=True,
-            message=f"已编辑图片: {prompt}",
+            message=f"已{edit_type}图片: {prompt}",
             state=state,
             data={"node_id": node.id, "image_url": result.image_url},
         )

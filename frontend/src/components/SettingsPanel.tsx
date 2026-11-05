@@ -216,7 +216,7 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
   const [errorMsg, setErrorMsg] = useState("");
   const [notice, setNotice] = useState("");
 
-  // ===== 风格库（经验文档）=====
+  // ===== 技能库（提示词技能）=====
   const [experiences, setExperiences] = useState<ExperienceMeta[]>([]);
   const [expNotice, setExpNotice] = useState("");
   const [importDraft, setImportDraft] = useState<{
@@ -228,7 +228,7 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
   const [importing, setImporting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // 加载风格列表 + 服务商预设
+  // 加载技能列表 + 服务商预设
   useEffect(() => {
     (async () => {
       try {
@@ -283,7 +283,7 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
       setExpNotice(
         draftSource === "manual"
           ? `已保存《${importDraft.name}》为 MD，生成图片时可直接选择`
-          : `已导入《${importDraft.name}》，生成图片时可在面板风格中选择`
+          : `已导入《${importDraft.name}》，生成图片时可在面板技能中选择`
       );
       setTimeout(() => setExpNotice(""), 2600);
     } catch (e) {
@@ -293,7 +293,7 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
     }
   };
 
-  // 删除风格
+  // 删除技能
   const handleDeleteExp = async (id: string, name: string) => {
     if (editDraft?.id === id) setEditDraft(null); // 正在编辑的项被删除，关闭表单
     try {
@@ -306,7 +306,7 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
     }
   };
 
-  // ===== 编辑风格名称/描述 =====
+  // ===== 编辑技能名称/描述 =====
   const [editDraft, setEditDraft] = useState<{
     id: string;
     name: string;
@@ -625,16 +625,16 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
           </div>
         )}
 
-        {/* ===== 风格库（经验文档） ===== */}
-        <div style={sectionTitleStyle}>🎨 风格库（风格指南）</div>
+        {/* ===== 技能库（提示词技能） ===== */}
+        <div style={sectionTitleStyle}>🛠️ 技能库（提示词技能）</div>
         <div style={{ color: "#777", fontSize: 12, margin: "4px 0 8px" }}>
-          手动沉淀或导入风格 MD，生成图片时可在面板中选择；Agent 对话也会按需引用
+          手动沉淀或导入技能 MD，生成图片时可在面板中选择；Agent 对话也会按需引用
         </div>
 
-        {/* 风格列表 */}
+        {/* 技能列表 */}
         {experiences.length === 0 && !importDraft && (
           <div style={{ color: "#666", fontSize: 12, padding: "6px 0" }}>
-            暂无风格，可手动新建或导入第一个 MD
+            暂无技能，可手动新建或导入第一个 MD
           </div>
         )}
         {experiences.map((exp) =>
@@ -650,7 +650,7 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
                 border: "1px solid rgba(167,139,250,0.25)",
               }}
             >
-              <label style={labelStyle}>风格名称</label>
+              <label style={labelStyle}>技能名称</label>
               <input
                 style={inputStyle}
                 value={editDraft.name}
@@ -765,9 +765,9 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
             }}
           >
             <div style={{ color: "#ddd", fontSize: 13, fontWeight: 650, marginBottom: 8 }}>
-              {draftSource === "manual" ? "手动新建风格" : "确认导入风格"}
+              {draftSource === "manual" ? "手动新建技能" : "确认导入技能"}
             </div>
-            <label style={labelStyle}>风格名称</label>
+            <label style={labelStyle}>技能名称</label>
             <input
               style={inputStyle}
               value={importDraft.name}

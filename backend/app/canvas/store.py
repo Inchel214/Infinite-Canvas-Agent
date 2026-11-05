@@ -69,6 +69,9 @@ class InMemoryStore(BaseStore):
         self._history: dict[str, list[CanvasState]] = {}
         # redo 栈：undo 时把当前状态压入，redo 时弹出
         self._redo: dict[str, list[CanvasState]] = {}
+        # 轮次标记：{canvas_id: {round_id: history_length}}
+        # 用于"撤回整轮 AI 操作"：记录对话开始时的 undo 栈深度
+        self._round_markers: dict[str, dict[str, int]] = {}
 
     def create_canvas(self, name: str = "") -> CanvasState:
         state = create_canvas(name)
@@ -123,6 +126,43 @@ class InMemoryStore(BaseStore):
         self._canvases[canvas_id] = nxt
         return nxt
 
+    def begin_round(self, canvas_id: str) -> str:
+        """标记一轮对话的开始，记录当前 undo 栈深度。返回 round_id。"""
+        import uuid
+        round_id = str(uuid.uuid4())[:8]
+        markers = self._round_markers.setdefault(canvas_id, {})
+        markers[round_id] = len(self._history.get(canvas_id) or [])
+        return round_id
+
+    def undo_to_round(self, canvas_id: str, round_id: str) -> CanvasState | None:
+        """撤销到指定轮次标记之前的状态。返回撤销后的状态，标记不存在返回 None。"""
+        markers = self._round_markers.get(canvas_id) or {}
+        if round_id not in markers:
+            return None
+        target_depth = markers[round_id]
+        # 删除该轮及之后的标记
+        to_remove = [rid for rid, depth in markers.items() if depth >= target_depth]
+        for rid in to_remove:
+            del markers[rid]
+        # 逐步撤销到目标深度
+        hist = self._history.get(canvas_id) or []
+        current = self._canvases.get(canvas_id)
+        if current is None:
+            return None
+        undone = 0
+        while len(hist) > target_depth:
+            prev = hist.pop()
+            redo_stack = self._redo.setdefault(canvas_id, [])
+            redo_stack.append(copy.deepcopy(current))
+            if len(redo_stack) > _MAX_HISTORY:
+                redo_stack.pop(0)
+            current = prev
+            undone += 1
+        self._canvases[canvas_id] = current
+        if undone == 0:
+            return None
+        return current
+
     def list_canvases(self) -> list[dict]:
         summaries = [
             {
@@ -142,6 +182,7 @@ class InMemoryStore(BaseStore):
         del self._canvases[canvas_id]
         self._history.pop(canvas_id, None)
         self._redo.pop(canvas_id, None)
+        self._round_markers.pop(canvas_id, None)
 
 
 class FileStore(InMemoryStore):
@@ -330,6 +371,7 @@ class FileStore(InMemoryStore):
         self._canvases.pop(canvas_id, None)
         self._history.pop(canvas_id, None)
         self._redo.pop(canvas_id, None)
+        self._round_markers.pop(canvas_id, None)
         # 删磁盘文件
         if exists:
             try:

@@ -1,16 +1,22 @@
 import { useEffect, useLayoutEffect, useRef, useCallback, useState, useMemo, memo } from "react";
+import { MaskEditor } from "./MaskEditor";
 import { createPortal } from "react-dom";
 import { ImageCollectionCards, ImageCollectionDialog } from "./ImageCollections";
 import { useImageCollections } from "./useImageCollections";
 import type { CanvasState, CanvasNode } from "../types/canvas";
 import { generateImageStream, updateNodePosition, uploadImageNode, cloneNode, undoCanvas, redoCanvas, listExperiences, revealImageFile, type ExperienceMeta } from "../api/agent";
+// 重构后的快捷键模块
+import { ShortcutHelpPanel } from "./canvas/components/ShortcutHelpPanel";
+import { useCanvasShortcuts } from "./canvas/hooks/useCanvasShortcuts";
+import { DEFAULT_SHORTCUTS } from "./canvas/constants";
+import { matchesShortcut } from "./canvas/state/canvasShortcuts";
 
 // 右键菜单可触发的操作类型（experienceIds：风格库多选的风格，直连生图时后端确定性拼接）
 export type CanvasAction =
   | { type: "text"; content: string; x: number; y: number }
   | { type: "compose"; nodeIds: string[]; prompt: string; size: string; x?: number; y?: number; experienceIds?: string[] }
   | { type: "variate"; nodeId: string; prompt: string; size: string; x?: number; y?: number; experienceIds?: string[] }
-  | { type: "edit"; nodeId: string; prompt: string; size: string; x?: number; y?: number; experienceIds?: string[] }
+  | { type: "edit"; nodeId: string; prompt: string; size: string; x?: number; y?: number; experienceIds?: string[]; mask?: string }
   | { type: "generate"; prompt: string; size: string; x: number; y: number; experienceIds?: string[] }
   | { type: "delete"; nodeIds: string[] }
   | { type: "arrange" }
@@ -492,6 +498,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   const [isPanning, setIsPanning] = useState(false);
   const panStart = useRef({ x: 0, y: 0, panX: 0, panY: 0 });
   const prevNodeCount = useRef(0);
+  // 用户是否手动平移/缩放过画布：一旦手动操作过，后续节点增减不再自动 fitView
+  const userPannedRef = useRef(false);
 
   // 自动适配相机视角开关：节点增减时是否自动缩放/居中（默认开启，偏好持久化）
   const [autoFit, setAutoFit] = useState<boolean>(() => {
@@ -509,6 +517,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       } catch {
         // 隐私模式等写入异常时忽略，仅本次会话生效
       }
+      // 重新开启 autoFit 时清除手动操作标记，让下次节点变化触发适配
+      if (next) userPannedRef.current = false;
       return next;
     });
   }, []);
@@ -520,6 +530,14 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   // 本地位置覆盖（拖拽时即时更新，不等待 API）
   const sizeStorageKey = `ica:display-sizes:${canvasId}`;
   const [localStatusMsg, setLocalStatusMsg] = useState<string | null>(null);
+  const [showHelp, setShowHelp] = useState(false);
+  
+  // 快捷键 Hook：提供快捷键配置和帮助面板支持
+  // 注意：实际快捷键逻辑仍保留在原有 useEffect 中（与画布状态紧密耦合）
+  // 这里只使用 hook 的配置管理和帮助面板功能
+  const shortcuts = useCanvasShortcuts({
+    enabled: false, // 禁用自动监听，使用原有逻辑
+  });
   const [sizeOverrides, setSizeOverrides] = useState<Record<string, { width: number; height: number }>>(() => {
     try {
       const saved = JSON.parse(localStorage.getItem(sizeStorageKey) ?? "{}");
@@ -588,6 +606,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   // ===== 编辑图片框（独立于右键菜单，可与普通菜单并存） =====
   const [editPanel, setEditPanel] = useState<EditPanelState | null>(null);
   const editPanelRef = useRef<HTMLDivElement>(null);
+  // 蒙版编辑器（局部编辑 Inpainting）
+  const [maskEditor, setMaskEditor] = useState<{ nodeId: string; imageUrl: string; width: number; height: number } | null>(null);
   // 生成中占位框：编辑/变体/组合执行时，在新图将要出现的位置预先画出矩形框，
   // 框内显示"正在编辑图片..."等状态；完成后新图淡入该位置。
   // 数组形式支持多张图同时编辑：每个操作绑定自己的占位框，完成时只移除自己的
@@ -675,10 +695,13 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   // Esc：关闭激活容器 / 关闭菜单 / 清空选择 / 取消连线
   // Delete/Backspace：删除选中节点
   // Ctrl+C / Cmd+C：复制选中图片到系统剪贴板（可在文件管理器粘贴为 PNG）
+  // 使用 shortcuts.bindings 支持自定义快捷键
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (e.isComposing || e.keyCode === 229) return;
-      if (e.key === "Escape") {
+      
+      // Esc：关闭激活容器 / 关闭菜单 / 清空选择 / 取消连线
+      if (matchesShortcut(e, shortcuts.bindings.escape)) {
         // 点击过的容器：Esc 直接关闭（生成中的除外，避免误关丢进度；其它容器不受影响）
         const ac = activeContainerIdRef.current;
         if (ac && !generatingIdsRef.current.has(ac)) {
@@ -696,7 +719,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
 
       // 空格键：切换平移模式
-      if (e.code === "Space") {
+      if (matchesShortcut(e, shortcuts.bindings.togglePan)) {
         if (!isSpacePressedRef.current) {
           isSpacePressedRef.current = true;
           setSpacePressed(true);
@@ -705,8 +728,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         return;
       }
 
-      // Ctrl/Cmd+Z → 撤销（Shift+Z 不拦截，交给 Ctrl+Shift+Z 重做）
-      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && (e.key === "z" || e.key === "Z") && canvasId) {
+      // 撤销（使用自定义配置）
+      if (matchesShortcut(e, shortcuts.bindings.undo) && canvasId) {
         e.preventDefault();
         undoCanvas(canvasId)
           .then((res) => {
@@ -723,8 +746,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         return;
       }
 
-      // Ctrl/Cmd+Y 或 Ctrl/Cmd+Shift+Z → 重做（恢复撤销）
-      if ((e.ctrlKey || e.metaKey) && ((e.key === "y" || e.key === "Y") || (e.shiftKey && (e.key === "z" || e.key === "Z"))) && canvasId) {
+      // 重做（使用自定义配置，支持备选快捷键如 Ctrl+Shift+Z）
+      if (matchesShortcut(e, shortcuts.bindings.redo) && canvasId) {
         e.preventDefault();
         redoCanvas(canvasId)
           .then((res) => {
@@ -741,15 +764,16 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         return;
       }
 
-      // Delete / Backspace → 删除选中
-      if ((e.key === "Delete" || e.key === "Backspace") && selectedIds.size > 0) {
+      // 删除选中（使用自定义配置）
+      if (matchesShortcut(e, shortcuts.bindings.delete) && selectedIds.size > 0) {
         e.preventDefault();
         onAction?.({ type: "delete", nodeIds: [...selectedIds] });
         setMenu(null);
         return;
       }
-      // Ctrl+C / Cmd+C → 画布内复制选中图片（存入剪贴板状态）
-      if ((e.ctrlKey || e.metaKey) && (e.key === "c" || e.key === "C") && selectedIds.size >= 1) {
+      
+      // 复制（使用自定义配置）
+      if (matchesShortcut(e, shortcuts.bindings.copy) && selectedIds.size >= 1) {
         const ids = [...selectedIds];
         const copies = ids
           .map((id) => nodes.find((n) => n.id === id))
@@ -761,8 +785,9 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
           setTimeout(() => setLocalStatusMsg(null), 2200);
         }
       }
-      // Ctrl+V / Cmd+V → 在当前视图中心粘贴复制的图片到画布
-      if ((e.ctrlKey || e.metaKey) && (e.key === "v" || e.key === "V") && clipboardRef.current) {
+      
+      // 粘贴（使用自定义配置）
+      if (matchesShortcut(e, shortcuts.bindings.paste) && clipboardRef.current) {
         const target = e.target as HTMLElement;
         if (target.tagName === "INPUT" || target.tagName === "TEXTAREA") return;
         e.preventDefault();
@@ -812,12 +837,12 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [selectedIds, nodes, onAction, canvasId, onCanvasUpdate, setLocalStatusMsg]);
+  }, [selectedIds, nodes, onAction, canvasId, onCanvasUpdate, setLocalStatusMsg, shortcuts.bindings]);
 
-  // 空格键抬起：清除平移模式
+  // 空格键抬起：清除平移模式（使用自定义配置）
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (e.code === "Space") {
+      if (matchesShortcut(e, shortcuts.bindings.togglePan)) {
         if (isSpacePressedRef.current) {
           isSpacePressedRef.current = false;
           setSpacePressed(false);
@@ -826,7 +851,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     };
     window.addEventListener("keyup", handler);
     return () => window.removeEventListener("keyup", handler);
-  }, []);
+  }, [shortcuts.bindings.togglePan]);
 
   // 屏幕坐标（相对画布容器）→ 世界坐标
   const screenToWorld = useCallback(
@@ -1060,6 +1085,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   }, [nodes.length, fitAllNodes]);
 
   // 自动适配：节点数量变化时缩放到合适大小（受 autoFit 开关控制）
+  // 用户手动平移/缩放后（userPannedRef），跳过自动适配以保留用户视角
   useEffect(() => {
     if (nodes.length === 0) return;
     if (!autoFit) {
@@ -1072,6 +1098,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     prevNodeCount.current = nodes.length;
     // 挂载时已还原存档视角：首次计数变化不再自动适配，尊重用户上次停留的视角
     if (firstRun && savedCam.current) return;
+    // 用户手动操作过画布视角后不再自动 fit，保留用户当前的平移/缩放
+    if (userPannedRef.current) return;
     fitAllNodes();
   }, [canvasState, autoFit, fitAllNodes, nodes.length]);
 
@@ -1143,6 +1171,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         const factor = Math.exp(delta);
         const newZoom = Math.min(Math.max(z * factor, 0.05), 5);
         markZoomGesture();
+        userPannedRef.current = true;
         const worldX = (mx - p.x) / z;
         const worldY = (my - p.y) / z;
         setPan({ x: mx - worldX * newZoom, y: my - worldY * newZoom });
@@ -1152,6 +1181,82 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     container.addEventListener("wheel", onWheel, { passive: false });
     return () => {
       container.removeEventListener("wheel", onWheel);
+      if (raf !== null) cancelAnimationFrame(raf);
+    };
+  }, []);
+
+  // 触屏手势：双指缩放 + 双指平移（单指保持原生行为，不拦截）
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    let touchDist = 0;
+    let touchMid = { x: 0, y: 0 };
+    let touchPan = { x: 0, y: 0 };
+    let touchZoom = 1;
+    let raf: number | null = null;
+    let pendingDelta = { scale: 1, dx: 0, dy: 0, mx: 0, my: 0 };
+
+    const onTouchStart = (e: TouchEvent) => {
+      if (e.touches.length !== 2) return;
+      e.preventDefault();
+      const [a, b] = [e.touches[0], e.touches[1]];
+      const dx = b.clientX - a.clientX;
+      const dy = b.clientY - a.clientY;
+      touchDist = Math.hypot(dx, dy);
+      const rect = container.getBoundingClientRect();
+      touchMid = { x: (a.clientX + b.clientX) / 2 - rect.left, y: (a.clientY + b.clientY) / 2 - rect.top };
+      touchPan = { x: panRef.current.x, y: panRef.current.y };
+      touchZoom = zoomRef.current;
+      pendingDelta = { scale: 1, dx: 0, dy: 0, mx: 0, my: 0 };
+    };
+
+    const onTouchMove = (e: TouchEvent) => {
+      if (e.touches.length !== 2) return;
+      e.preventDefault();
+      userPannedRef.current = true;
+      const [a, b] = [e.touches[0], e.touches[1]];
+      const dx = b.clientX - a.clientX;
+      const dy = b.clientY - a.clientY;
+      const dist = Math.hypot(dx, dy);
+      const rect = container.getBoundingClientRect();
+      const mid = { x: (a.clientX + b.clientX) / 2 - rect.left, y: (a.clientY + b.clientY) / 2 - rect.top };
+
+      const scale = touchDist > 0 ? dist / touchDist : 1;
+      const panDx = mid.x - touchMid.x;
+      const panDy = mid.y - touchMid.y;
+
+      pendingDelta = { scale, dx: panDx, dy: panDy, mx: mid.x, my: mid.y };
+      if (raf !== null) return;
+      raf = requestAnimationFrame(() => {
+        raf = null;
+        const { scale: s, dx: pdx, dy: pdy, mx, my: mmy } = pendingDelta;
+        const z = touchZoom;
+        const newZoom = Math.min(Math.max(z * s, 0.05), 5);
+        markZoomGesture();
+        // 以双指中心为锚点缩放 + 叠加平移偏移
+        const worldX = (mx - touchPan.x) / z;
+        const worldY = (my - touchPan.y) / z;
+        setPan({ x: mx - worldX * newZoom + pdx, y: mmy - worldY * newZoom + pdy });
+        setZoom(newZoom);
+      });
+    };
+
+    const onTouchEnd = (e: TouchEvent) => {
+      if (e.touches.length < 2) {
+        touchDist = 0;
+        if (raf !== null) { cancelAnimationFrame(raf); raf = null; }
+      }
+    };
+
+    container.addEventListener("touchstart", onTouchStart, { passive: false });
+    container.addEventListener("touchmove", onTouchMove, { passive: false });
+    container.addEventListener("touchend", onTouchEnd);
+    container.addEventListener("touchcancel", onTouchEnd);
+    return () => {
+      container.removeEventListener("touchstart", onTouchStart);
+      container.removeEventListener("touchmove", onTouchMove);
+      container.removeEventListener("touchend", onTouchEnd);
+      container.removeEventListener("touchcancel", onTouchEnd);
       if (raf !== null) cancelAnimationFrame(raf);
     };
   }, []);
@@ -1262,6 +1367,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         });
       }
     } else if (isPanning) {
+      userPannedRef.current = true;
       // rAF 合帧：一帧内多次 mousemove 合并为一次 setPan，避免高频重渲染
       panRafData.current.dx = e.clientX - panStart.current.x;
       panRafData.current.dy = e.clientY - panStart.current.y;
@@ -1639,6 +1745,36 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       : { type: "edit", nodeId: refNodes[0].id, prompt, size, x: box.x, y: box.y, experienceIds: expIds?.length ? expIds : undefined };
     Promise.resolve(onAction(action)).finally(() => removeProcessingBox(boxId));
   }, [onAction, editPanel, nodes, buildProcessingBox, styleNamesByIds, addProcessingBox, removeProcessingBox]);
+
+  // 蒙版编辑器确认：执行局部编辑（Inpainting）
+  const handleMaskEditorConfirm = useCallback((mask: string) => {
+    if (!onAction || !maskEditor) return;
+    const node = nodes.find((n) => n.id === maskEditor.nodeId);
+    if (!node) return;
+    // 计算落点位置（原图右侧）
+    const box = buildProcessingBox(
+      closestAspectKey(node.width, node.height),
+      [node]
+    );
+    const boxId = addProcessingBox(box, "正在局部编辑图片...");
+    setMaskEditor(null);
+    // 弹出提示让用户输入描述
+    const prompt = window.prompt("请输入要修改的内容描述（如：红色西装、蓝色背景等）");
+    if (!prompt) {
+      removeProcessingBox(boxId);
+      return;
+    }
+    const action: CanvasAction = {
+      type: "edit",
+      nodeId: node.id,
+      prompt,
+      size: "2K",
+      x: box.x,
+      y: box.y,
+      mask,
+    };
+    Promise.resolve(onAction(action)).finally(() => removeProcessingBox(boxId));
+  }, [onAction, maskEditor, nodes, buildProcessingBox, addProcessingBox, removeProcessingBox]);
 
   const handleDelete = useCallback(() => {
     if (!onAction || selectedIds.size === 0) return;
@@ -2465,6 +2601,19 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
           styleIds={menuStyleIds}
           onStyleChange={setMenuStyleIds}
           onMenuAction={handleMenuAction}
+          onInpaint={() => {
+            const nodeId = [...selectedIds][0];
+            const node = nodes.find((n) => n.id === nodeId);
+            if (node && node.image_url) {
+              setMaskEditor({
+                nodeId: node.id,
+                imageUrl: node.image_url,
+                width: node.width,
+                height: node.height,
+              });
+              setMenu(null);
+            }
+          }}
           onExecute={handleExecute}
           onDelete={handleDelete}
           onCopyImage={handleCopyImage}
@@ -2592,6 +2741,18 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
             document.body,
           );
         })()}
+
+      {/* 蒙版编辑器（局部编辑 Inpainting）：全屏覆盖层 */}
+      {maskEditor && createPortal(
+        <MaskEditor
+          imageUrl={maskEditor.imageUrl}
+          width={maskEditor.width}
+          height={maskEditor.height}
+          onConfirm={handleMaskEditorConfirm}
+          onCancel={() => setMaskEditor(null)}
+        />,
+        document.body,
+      )}
 
       {/* 选中数量提示（localStatusMsg 显示时隐藏，避免重叠） */}
       {selectedCount > 0 && !menu && !connecting && !busy && !localStatusMsg && (
@@ -2753,6 +2914,35 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         </svg>
       </button>
 
+      {/* 快捷键帮助按钮 */}
+      <button
+        type="button"
+        className="ica-fitview-btn"
+        title="快捷键帮助"
+        style={{ position: "absolute", bottom: 16, left: 136 }}
+        onMouseDown={(e) => e.stopPropagation()}
+        onClick={(e) => {
+          e.stopPropagation();
+          setShowHelp((prev) => !prev);
+        }}
+      >
+        <span style={{ fontSize: 16, fontWeight: 700, lineHeight: 1 }}>?</span>
+      </button>
+
+      {/* 快捷键帮助面板（增强版，支持自定义） */}
+      {showHelp && (
+        <ShortcutHelpPanel
+          bindings={shortcuts.bindings}
+          conflicts={shortcuts.conflicts}
+          isRecording={shortcuts.isRecording}
+          recordingAction={shortcuts.recordingAction}
+          onStartRecording={shortcuts.startRecording}
+          onStopRecording={shortcuts.stopRecording}
+          onReset={shortcuts.resetShortcuts}
+          onClose={() => setShowHelp(false)}
+        />
+      )}
+
       {/* 缩放指示器：钉在视口右下角（对话圆按钮已上移避让）；对话面板展开时只做水平避让（贴面板左外缘），纵向永不移动 */}
       <div
         style={{
@@ -2859,16 +3049,16 @@ function StyleSelect({
       ? "无（自由发挥）"
       : names.length === 1
         ? names[0]
-        : `已选 ${names.length} 个风格`;
+        : `已选 ${names.length} 个技能`;
 
   return (
     <div ref={rootRef} style={{ marginTop: 8 }}>
-      <div style={{ fontSize: 11, color: "rgba(255,255,255,0.62)", marginBottom: 5 }}>风格（可多选）</div>
+      <div style={{ fontSize: 11, color: "rgba(255,255,255,0.62)", marginBottom: 5 }}>技能（可多选）</div>
       <button
         ref={btnRef}
         type="button"
         onClick={() => setOpen((o) => !o)}
-        title="选中后，每份风格指南全文会依次拼接进生成提示词"
+        title="选中后，每份技能全文会依次拼接进生成提示词"
         style={{
           width: "100%",
           boxSizing: "border-box",
@@ -3131,6 +3321,7 @@ const ContextMenu = ({
   styleIds,
   onStyleChange,
   onMenuAction,
+  onInpaint,
   onExecute,
   onDelete,
   onCopyImage,
@@ -3161,6 +3352,7 @@ const ContextMenu = ({
   styleIds: string[];
   onStyleChange: (v: string[]) => void;
   onMenuAction: (mode: "compose" | "variate" | "edit") => void;
+  onInpaint: () => void;
   onExecute: () => void;
   onDelete: () => void;
   onCopyImage: () => void;
@@ -3391,11 +3583,20 @@ const ContextMenu = ({
               </div>
               <div style={itemStyle} onMouseEnter={hoverBg} onMouseLeave={hoverOut} onClick={() => onMenuAction("edit")}>
                 <span>✏️ 编辑图片</span>
-                <span style={{ fontSize: 11, color: "rgba(255,255,255,0.35)" }}>局部修改</span>
+                <span style={{ fontSize: 11, color: "rgba(255,255,255,0.35)" }}>全图重绘</span>
+              </div>
+              <div
+                style={itemStyle}
+                onMouseEnter={hoverBg}
+                onMouseLeave={hoverOut}
+                onClick={onInpaint}
+              >
+                <span>🖌️ 局部编辑</span>
+                <span style={{ fontSize: 11, color: "rgba(255,255,255,0.35)" }}>蒙版修改</span>
               </div>
               <div style={itemStyle} onMouseEnter={hoverBg} onMouseLeave={hoverOut} onClick={onCopyImage}>
                 <span>📋 复制图片</span>
-                <span style={{ fontSize: 11, color: "rgba(255,255,255,0.35)" }}>粘贴到电脑</span>
+                <span style={{ fontSize: 11, color: "rgba(255,255,255,0.35)" }}>可粘贴到其他应用</span>
               </div>
               <div style={itemStyle} onMouseEnter={hoverBg} onMouseLeave={hoverOut} onClick={onSaveImage}>
                 <span>💾 另存为...</span>

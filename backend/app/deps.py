@@ -8,6 +8,7 @@ from app.agent.react_loop import ReActAgent, RunControl
 from app.agent.sessions import ChatSessionStore
 from app.canvas.store import FileStore
 from app.providers.manager import GeneratorProxy, LLMProxy, ProviderManager
+from app.tools.add_text_node import AddTextNodeTool
 from app.tools.ask_user import AskUserTool
 from app.tools.base import ToolManager
 from app.tools.compose_images import ComposeImagesTool
@@ -41,6 +42,7 @@ tool_manager.register(ComposeImagesTool(GeneratorProxy(manager)))
 tool_manager.register(MoveNodeTool())
 tool_manager.register(DeleteNodeTool())
 tool_manager.register(ListNodesTool())
+tool_manager.register(AddTextNodeTool())
 # 风格库读取（Agent 按需读风格指南全文）
 tool_manager.register(ReadExperienceTool())
 # 人在回路：Agent 向用户询问信息或确认操作
@@ -50,6 +52,7 @@ agent = ReActAgent(
     llm=LLMProxy(manager),
     tool_manager=tool_manager,
     store=store,
-    max_steps=30,
+    max_steps=100,
     control=control,
+    chat_sessions=chat_sessions,  # 工具步骤实时持久化
 )

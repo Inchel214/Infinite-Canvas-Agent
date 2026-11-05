@@ -8,7 +8,8 @@ import type {
   ChatResponse,
 } from "../types/canvas";
 
-const API_BASE = "http://127.0.0.1:8000/api";
+// 后端 API 地址：优先读 Vite 环境变量，开发时回退到本地默认
+const API_BASE = (import.meta.env.VITE_API_BASE as string) || "http://127.0.0.1:8000/api";
 
 // 直接执行类操作（不走 Agent）的响应
 export interface DirectResponse {
@@ -72,6 +73,8 @@ export interface AgentStreamEvent {
   // ask_user 事件专用
   question?: string;
   options?: string[];
+  timeout?: number; // 超时时间（秒）
+  default_action?: string; // 超时后的默认行为
 }
 
 // 流式 Agent 对话：计划/思考/工具过程逐事件回调，最终 done 事件带完整结果
@@ -157,6 +160,33 @@ export async function getChatHistory(canvasId: string): Promise<ChatMessage[]> {
   if (!res.ok) throw new Error(`${res.status}`);
   const data = await res.json();
   return data.messages ?? [];
+}
+
+// 获取画布最近一次执行状态
+export async function getLastRunStatus(canvasId: string): Promise<{ run: { id: string; status: string } | null }> {
+  const res = await fetch(
+    `${API_BASE}/agent/run-status?canvas_id=${encodeURIComponent(canvasId)}`
+  );
+  if (!res.ok) throw new Error(`${res.status}`);
+  return res.json();
+}
+
+// 轮询等待 in_progress 的 run 完成（切换画布后恢复用）
+export async function waitForRunCompletion(
+  canvasId: string,
+  maxWaitMs: number = 30000,
+  pollIntervalMs: number = 1000
+): Promise<void> {
+  const startTime = Date.now();
+  while (Date.now() - startTime < maxWaitMs) {
+    const { run } = await getLastRunStatus(canvasId);
+    if (!run || run.status !== "in_progress") {
+      return; // 没有运行中的任务或已完成
+    }
+    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+  }
+  // 超时后不再等待，直接返回（历史可能不完整）
+  console.warn("[Agent] 等待 run 完成超时 canvas=%s", canvasId);
 }
 
 // 清空画布对话历史
@@ -348,7 +378,8 @@ export async function editImage(
   size = "2K",
   x?: number,
   y?: number,
-  experienceIds?: string[]
+  experienceIds?: string[],
+  mask?: string  // 蒙版 base64 data URL（局部编辑 Inpainting）
 ): Promise<DirectResponse> {
   const res = await fetch(`${API_BASE}/canvas/${canvasId}/edit`, {
     method: "POST",
@@ -360,6 +391,7 @@ export async function editImage(
       x,
       y,
       experience_ids: experienceIds?.length ? experienceIds : undefined,
+      mask,  // 蒙版（可选）
     }),
   });
   if (!res.ok) {
@@ -402,20 +434,6 @@ export async function cloneNode(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!res.ok) {
-    throw new Error(`${res.status}`);
-  }
-  return res.json();
-}
-
-export async function deleteNode(
-  canvasId: string,
-  nodeId: string
-): Promise<DirectResponse> {
-  const res = await fetch(
-    `${API_BASE}/canvas/${canvasId}/node/${nodeId}`,
-    { method: "DELETE" }
-  );
   if (!res.ok) {
     throw new Error(`${res.status}`);
   }
@@ -471,6 +489,31 @@ export async function undoCanvas(canvasId: string): Promise<DirectResponse> {
 // 重做最近一次撤销，无可重做时后端返回 success:false
 export async function redoCanvas(canvasId: string): Promise<DirectResponse> {
   const res = await fetch(`${API_BASE}/canvas/${canvasId}/redo`, {
+    method: "POST",
+  });
+  if (!res.ok) {
+    throw new Error(`${res.status}`);
+  }
+  return res.json();
+}
+
+// 标记一轮对话的开始（Agent 执行前调用），返回 round_id
+export async function beginRound(canvasId: string): Promise<string | null> {
+  try {
+    const res = await fetch(`${API_BASE}/canvas/${canvasId}/begin-round`, {
+      method: "POST",
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.round_id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// 撤回整轮 AI 操作（撤销到该轮开始前的状态）
+export async function undoRound(canvasId: string, roundId: string): Promise<DirectResponse> {
+  const res = await fetch(`${API_BASE}/canvas/${canvasId}/undo-round?round_id=${encodeURIComponent(roundId)}`, {
     method: "POST",
   });
   if (!res.ok) {
