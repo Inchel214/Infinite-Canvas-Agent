@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import struct
+import time
 from typing import Iterator
 
 import requests
@@ -29,6 +30,45 @@ _STREAM_DEFAULT_MODEL = "doubao-seedream-4-0-20260415"
 _MIN_PIXELS = 3686400
 # 其余模型（Seedream 4.0 / 5.0 Pro，实测 400 报错信息）总像素下限 921600（≈960x960）
 _BASE_MIN_PIXELS = 921600
+
+# 网络重试：偶发超时/5xx/ConnectionError 时有限重试 + 指数退避
+_MAX_RETRIES = 3
+_RETRY_BASE_DELAY = 1.0  # 秒，第一次重试等 1s，第二次 2s，第三次 4s
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """判断异常是否值得重试：网络错误、超时、5xx"""
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        return True
+    if isinstance(exc, requests.HTTPError):
+        resp = exc.response
+        if resp is not None and 500 <= resp.status_code < 600:
+            return True
+    return False
+
+
+def _retry_request(session: requests.Session, method: str, url: str, **kwargs) -> requests.Response:
+    """带有限重试 + 指数退避的请求封装。仅对 transient 错误重试。"""
+    last_exc: Exception | None = None
+    for attempt in range(_MAX_RETRIES):
+        try:
+            if method == "POST":
+                resp = session.post(url, **kwargs)
+            else:
+                resp = session.get(url, **kwargs)
+            resp.raise_for_status()
+            return resp
+        except Exception as exc:
+            last_exc = exc
+            if not _is_retryable(exc) or attempt == _MAX_RETRIES - 1:
+                raise
+            delay = _RETRY_BASE_DELAY * (2 ** attempt)
+            logger.warning(
+                "[Volc] 请求失败（第 %d/%d 次），%ss 后重试: %s",
+                attempt + 1, _MAX_RETRIES, delay, exc,
+            )
+            time.sleep(delay)
+    raise last_exc  # 不会到达
 
 
 def _clamp_size(size: str, model: str = "") -> str:
@@ -124,14 +164,13 @@ class VolcEngineImageGenerator(BaseImageGenerator):
         # trust_env=False 绕过系统代理，proxies 禁用代理
         session = requests.Session()
         session.trust_env = False
-        resp = session.post(
-            self.api_url,
+        resp = _retry_request(
+            session, "POST", self.api_url,
             headers=headers,
             json=body,
             timeout=120,
             proxies={"http": None, "https": None},
         )
-        resp.raise_for_status()
         data = resp.json()
 
         items = data.get("data", [])
@@ -146,8 +185,10 @@ class VolcEngineImageGenerator(BaseImageGenerator):
             return f"data:image/jpeg;base64,{url}"
 
         # 如果是 HTTP URL，后端下载后转 base64 data URL（避免浏览器 CORS）
-        img_resp = session.get(url, timeout=60, proxies={"http": None, "https": None})
-        img_resp.raise_for_status()
+        img_resp = _retry_request(
+            session, "GET", url,
+            timeout=60, proxies={"http": None, "https": None},
+        )
         mime = img_resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
         b64 = base64.b64encode(img_resp.content).decode("ascii")
         logger.debug(
@@ -246,8 +287,10 @@ class VolcEngineImageGenerator(BaseImageGenerator):
         if last_url.startswith("data:"):
             final_url = last_url
         else:
-            img_resp = session.get(last_url, timeout=60, proxies={"http": None, "https": None})
-            img_resp.raise_for_status()
+            img_resp = _retry_request(
+                session, "GET", last_url,
+                timeout=60, proxies={"http": None, "https": None},
+            )
             mime = img_resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
             b64 = base64.b64encode(img_resp.content).decode("ascii")
             final_url = f"data:{mime};base64,{b64}"
@@ -359,14 +402,13 @@ class VolcEngineImageGenerator(BaseImageGenerator):
 
         session = requests.Session()
         session.trust_env = False
-        resp = session.post(
-            self.api_url,
+        resp = _retry_request(
+            session, "POST", self.api_url,
             headers=headers,
             json=body,
             timeout=120,
             proxies={"http": None, "https": None},
         )
-        resp.raise_for_status()
         data = resp.json()
 
         items = data.get("data", [])
@@ -381,8 +423,10 @@ class VolcEngineImageGenerator(BaseImageGenerator):
             return f"data:image/jpeg;base64,{url}"
 
         # 如果是 HTTP URL，后端下载后转 base64 data URL
-        img_resp = session.get(url, timeout=60, proxies={"http": None, "https": None})
-        img_resp.raise_for_status()
+        img_resp = _retry_request(
+            session, "GET", url,
+            timeout=60, proxies={"http": None, "https": None},
+        )
         mime = img_resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
         b64 = base64.b64encode(img_resp.content).decode("ascii")
         logger.debug(

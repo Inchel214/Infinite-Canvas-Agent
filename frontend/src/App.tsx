@@ -144,8 +144,12 @@ function App() {
   }, [applyCanvasId]);
 
   // 初始化画布：URL ?canvas=xx 直达 > 上次打开的画布 > 新建
-  // 带重试机制，防止后端未就绪时首次加载失败
+  // 使用 ref 确保只执行一次，防止 StrictMode 或依赖变化导致重复执行
+  const initDoneRef = useRef(false);
   useEffect(() => {
+    if (initDoneRef.current) return;
+    initDoneRef.current = true;
+
     (async () => {
       const loadCanvasWithRetry = async (id: string, retries = 2) => {
         for (let i = 0; i <= retries; i++) {
@@ -164,6 +168,7 @@ function App() {
         }
       };
 
+      // 1. 优先使用 URL 参数
       const urlId = new URLSearchParams(window.location.search).get("canvas");
       if (urlId) {
         try {
@@ -171,9 +176,16 @@ function App() {
           applyCanvasId(urlId, state);
           return;
         } catch {
-          // 后端已删该画布，回退到 localStorage
+          // URL 中的画布不存在，清除 URL 参数
+          try {
+            const url = new URL(window.location.href);
+            url.searchParams.delete("canvas");
+            window.history.replaceState(null, "", url);
+          } catch { /* ignore */ }
         }
       }
+
+      // 2. 使用 localStorage 保存的上次画布
       const savedId = localStorage.getItem(LAST_CANVAS_KEY);
       if (savedId) {
         try {
@@ -181,10 +193,25 @@ function App() {
           applyCanvasId(savedId, state);
           return;
         } catch {
-          // 画布不存在（后端数据被清理），忽略并新建
+          // 画布不存在，清除 localStorage
           localStorage.removeItem(LAST_CANVAS_KEY);
         }
       }
+
+      // 3. 尝试加载第一个可用画布
+      try {
+        const list = await listCanvases();
+        if (list.length > 0) {
+          const first = list[0];
+          const state = await loadCanvasWithRetry(first.canvas_id);
+          applyCanvasId(first.canvas_id, state);
+          return;
+        }
+      } catch {
+        // 列表加载失败，继续往下走新建
+      }
+
+      // 4. 都没有，才新建画布
       const id = await createCanvas();
       const state = await loadCanvasWithRetry(id);
       applyCanvasId(id, state);

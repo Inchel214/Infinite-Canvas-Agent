@@ -23,11 +23,13 @@ from app.image.files import IMAGES_DIR
 
 app = FastAPI(title="Infinite Canvas Agent", version="0.1.0")
 
-# CORS 配置（开发用，后续收紧）
+# CORS 配置：allow_origins=["*"] 与 allow_credentials=True 同时使用是 CORS 规范
+# 禁止的组合（任意源可携带凭据访问）。本项目无 cookie/浏览器凭据认证，不需要
+# allow_credentials（Starlette CORSMiddleware 默认 True，必须显式设为 False）。
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )

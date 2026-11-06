@@ -1747,34 +1747,32 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   }, [onAction, editPanel, nodes, buildProcessingBox, styleNamesByIds, addProcessingBox, removeProcessingBox]);
 
   // 蒙版编辑器确认：执行局部编辑（Inpainting）
-  const handleMaskEditorConfirm = useCallback((mask: string) => {
-    if (!onAction || !maskEditor) return;
-    const node = nodes.find((n) => n.id === maskEditor.nodeId);
-    if (!node) return;
-    // 计算落点位置（原图右侧）
-    const box = buildProcessingBox(
-      closestAspectKey(node.width, node.height),
-      [node]
-    );
-    const boxId = addProcessingBox(box, "正在局部编辑图片...");
-    setMaskEditor(null);
-    // 弹出提示让用户输入描述
-    const prompt = window.prompt("请输入要修改的内容描述（如：红色西装、蓝色背景等）");
-    if (!prompt) {
-      removeProcessingBox(boxId);
-      return;
-    }
-    const action: CanvasAction = {
-      type: "edit",
-      nodeId: node.id,
-      prompt,
-      size: "2K",
-      x: box.x,
-      y: box.y,
-      mask,
-    };
-    Promise.resolve(onAction(action)).finally(() => removeProcessingBox(boxId));
-  }, [onAction, maskEditor, nodes, buildProcessingBox, addProcessingBox, removeProcessingBox]);
+  const handleMaskEditorConfirm = useCallback(
+    (mask: string, prompt: string, size: string, experienceIds?: string[]) => {
+      if (!onAction || !maskEditor) return;
+      if (!prompt.trim()) return;
+      const node = nodes.find((n) => n.id === maskEditor.nodeId);
+      if (!node) return;
+      const box = buildProcessingBox(
+        closestAspectKey(node.width, node.height),
+        [node]
+      );
+      const boxId = addProcessingBox(box, "正在局部编辑图片...");
+      setMaskEditor(null);
+      const action: CanvasAction = {
+        type: "edit",
+        nodeId: node.id,
+        prompt: prompt.trim(),
+        size,
+        x: box.x,
+        y: box.y,
+        mask,
+        experienceIds: experienceIds?.length ? experienceIds : undefined,
+      };
+      Promise.resolve(onAction(action)).finally(() => removeProcessingBox(boxId));
+    },
+    [onAction, maskEditor, nodes, buildProcessingBox, addProcessingBox, removeProcessingBox]
+  );
 
   const handleDelete = useCallback(() => {
     if (!onAction || selectedIds.size === 0) return;
@@ -2748,6 +2746,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
           imageUrl={maskEditor.imageUrl}
           width={maskEditor.width}
           height={maskEditor.height}
+          experiences={experiences}
           onConfirm={handleMaskEditorConfirm}
           onCancel={() => setMaskEditor(null)}
         />,

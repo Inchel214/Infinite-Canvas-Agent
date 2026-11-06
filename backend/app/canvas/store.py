@@ -5,6 +5,7 @@ import copy
 import json
 import logging
 import os
+import threading
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -72,117 +73,130 @@ class InMemoryStore(BaseStore):
         # 轮次标记：{canvas_id: {round_id: history_length}}
         # 用于"撤回整轮 AI 操作"：记录对话开始时的 undo 栈深度
         self._round_markers: dict[str, dict[str, int]] = {}
+        # 全局锁：FastAPI 线程池并发下，读-改-写操作（get→修改→save）需要互斥，
+        # 否则后完成的线程覆盖先完成的，静默丢更新。粒度到整个 store 而非 per-canvas，
+        # 因为 list_canvases 需要遍历全部字典，且锁本身开销可忽略。
+        self._lock = threading.RLock()
 
     def create_canvas(self, name: str = "") -> CanvasState:
-        state = create_canvas(name)
-        self._canvases[state.canvas_id] = state
-        self._history[state.canvas_id] = []
-        self._redo[state.canvas_id] = []
-        return state
+        with self._lock:
+            state = create_canvas(name)
+            self._canvases[state.canvas_id] = state
+            self._history[state.canvas_id] = []
+            self._redo[state.canvas_id] = []
+            return state
 
     def get_canvas(self, canvas_id: str) -> CanvasState:
-        if canvas_id not in self._canvases:
-            raise ValueError(f"画布不存在: {canvas_id}")
-        # 返回深拷贝：调用方修改不影响内存中的"旧状态"，保证 undo 历史正确
-        return copy.deepcopy(self._canvases[canvas_id])
+        with self._lock:
+            if canvas_id not in self._canvases:
+                raise ValueError(f"画布不存在: {canvas_id}")
+            # 返回深拷贝：调用方修改不影响内存中的"旧状态"，保证 undo 历史正确
+            return copy.deepcopy(self._canvases[canvas_id])
 
     def save_canvas(self, state: CanvasState) -> None:
-        cid = state.canvas_id
-        state.updated_at = time.time()
-        # 入栈：保存"当前内存中的旧状态"的深拷贝，作为可撤销点
-        if cid in self._canvases:
-            hist = self._history.setdefault(cid, [])
-            hist.append(copy.deepcopy(self._canvases[cid]))
-            if len(hist) > _MAX_HISTORY:
-                hist.pop(0)
-        # 新操作清空 redo 栈（undo 后再操作，redo 历史失效）
-        self._redo[cid] = []
-        self._canvases[cid] = state
+        with self._lock:
+            cid = state.canvas_id
+            state.updated_at = time.time()
+            # 入栈：保存"当前内存中的旧状态"的深拷贝，作为可撤销点
+            if cid in self._canvases:
+                hist = self._history.setdefault(cid, [])
+                hist.append(copy.deepcopy(self._canvases[cid]))
+                if len(hist) > _MAX_HISTORY:
+                    hist.pop(0)
+            # 新操作清空 redo 栈（undo 后再操作，redo 历史失效）
+            self._redo[cid] = []
+            self._canvases[cid] = state
 
     def undo(self, canvas_id: str) -> CanvasState | None:
-        hist = self._history.get(canvas_id) or []
-        if not hist:
-            return None
-        prev = hist.pop()
-        # 把当前状态压入 redo 栈
-        redo_stack = self._redo.setdefault(canvas_id, [])
-        redo_stack.append(copy.deepcopy(self._canvases[canvas_id]))
-        if len(redo_stack) > _MAX_HISTORY:
-            redo_stack.pop(0)
-        # 恢复到内存（不重新入栈，否则无法重做/反复撤销）
-        self._canvases[canvas_id] = prev
-        return prev
+        with self._lock:
+            hist = self._history.get(canvas_id) or []
+            if not hist:
+                return None
+            prev = hist.pop()
+            # 把当前状态压入 redo 栈
+            redo_stack = self._redo.setdefault(canvas_id, [])
+            redo_stack.append(copy.deepcopy(self._canvases[canvas_id]))
+            if len(redo_stack) > _MAX_HISTORY:
+                redo_stack.pop(0)
+            # 恢复到内存（不重新入栈，否则无法重做/反复撤销）
+            self._canvases[canvas_id] = prev
+            return prev
 
     def redo(self, canvas_id: str) -> CanvasState | None:
-        redo_stack = self._redo.get(canvas_id) or []
-        if not redo_stack:
-            return None
-        nxt = redo_stack.pop()
-        # 把当前状态压回 undo 栈
-        hist = self._history.setdefault(canvas_id, [])
-        hist.append(copy.deepcopy(self._canvases[canvas_id]))
-        if len(hist) > _MAX_HISTORY:
-            hist.pop(0)
-        self._canvases[canvas_id] = nxt
-        return nxt
+        with self._lock:
+            redo_stack = self._redo.get(canvas_id) or []
+            if not redo_stack:
+                return None
+            nxt = redo_stack.pop()
+            # 把当前状态压回 undo 栈
+            hist = self._history.setdefault(canvas_id, [])
+            hist.append(copy.deepcopy(self._canvases[canvas_id]))
+            if len(hist) > _MAX_HISTORY:
+                hist.pop(0)
+            self._canvases[canvas_id] = nxt
+            return nxt
 
     def begin_round(self, canvas_id: str) -> str:
         """标记一轮对话的开始，记录当前 undo 栈深度。返回 round_id。"""
         import uuid
-        round_id = str(uuid.uuid4())[:8]
-        markers = self._round_markers.setdefault(canvas_id, {})
-        markers[round_id] = len(self._history.get(canvas_id) or [])
-        return round_id
+        with self._lock:
+            round_id = str(uuid.uuid4())[:8]
+            markers = self._round_markers.setdefault(canvas_id, {})
+            markers[round_id] = len(self._history.get(canvas_id) or [])
+            return round_id
 
     def undo_to_round(self, canvas_id: str, round_id: str) -> CanvasState | None:
         """撤销到指定轮次标记之前的状态。返回撤销后的状态，标记不存在返回 None。"""
-        markers = self._round_markers.get(canvas_id) or {}
-        if round_id not in markers:
-            return None
-        target_depth = markers[round_id]
-        # 删除该轮及之后的标记
-        to_remove = [rid for rid, depth in markers.items() if depth >= target_depth]
-        for rid in to_remove:
-            del markers[rid]
-        # 逐步撤销到目标深度
-        hist = self._history.get(canvas_id) or []
-        current = self._canvases.get(canvas_id)
-        if current is None:
-            return None
-        undone = 0
-        while len(hist) > target_depth:
-            prev = hist.pop()
-            redo_stack = self._redo.setdefault(canvas_id, [])
-            redo_stack.append(copy.deepcopy(current))
-            if len(redo_stack) > _MAX_HISTORY:
-                redo_stack.pop(0)
-            current = prev
-            undone += 1
-        self._canvases[canvas_id] = current
-        if undone == 0:
-            return None
-        return current
+        with self._lock:
+            markers = self._round_markers.get(canvas_id) or {}
+            if round_id not in markers:
+                return None
+            target_depth = markers[round_id]
+            # 删除该轮及之后的标记
+            to_remove = [rid for rid, depth in markers.items() if depth >= target_depth]
+            for rid in to_remove:
+                del markers[rid]
+            # 逐步撤销到目标深度
+            hist = self._history.get(canvas_id) or []
+            current = self._canvases.get(canvas_id)
+            if current is None:
+                return None
+            undone = 0
+            while len(hist) > target_depth:
+                prev = hist.pop()
+                redo_stack = self._redo.setdefault(canvas_id, [])
+                redo_stack.append(copy.deepcopy(current))
+                if len(redo_stack) > _MAX_HISTORY:
+                    redo_stack.pop(0)
+                current = prev
+                undone += 1
+            self._canvases[canvas_id] = current
+            if undone == 0:
+                return None
+            return current
 
     def list_canvases(self) -> list[dict]:
-        summaries = [
-            {
-                "canvas_id": cid,
-                "name": s.name or f"画布 {cid[:6]}",
-                "node_count": len(s.nodes),
-                "updated_at": s.updated_at,
-            }
-            for cid, s in self._canvases.items()
-        ]
-        summaries.sort(key=lambda x: x["updated_at"], reverse=True)
-        return summaries
+        with self._lock:
+            summaries = [
+                {
+                    "canvas_id": cid,
+                    "name": s.name or f"画布 {cid[:6]}",
+                    "node_count": len(s.nodes),
+                    "updated_at": s.updated_at,
+                }
+                for cid, s in self._canvases.items()
+            ]
+            summaries.sort(key=lambda x: x["updated_at"], reverse=True)
+            return summaries
 
     def delete_canvas(self, canvas_id: str) -> None:
-        if canvas_id not in self._canvases:
-            raise ValueError(f"画布不存在: {canvas_id}")
-        del self._canvases[canvas_id]
-        self._history.pop(canvas_id, None)
-        self._redo.pop(canvas_id, None)
-        self._round_markers.pop(canvas_id, None)
+        with self._lock:
+            if canvas_id not in self._canvases:
+                raise ValueError(f"画布不存在: {canvas_id}")
+            del self._canvases[canvas_id]
+            self._history.pop(canvas_id, None)
+            self._redo.pop(canvas_id, None)
+            self._round_markers.pop(canvas_id, None)
 
 
 class FileStore(InMemoryStore):
@@ -217,37 +231,39 @@ class FileStore(InMemoryStore):
             return None
 
     def create_canvas(self, name: str = "") -> CanvasState:
-        # 不走 save_canvas（避免创建动作本身被入栈为可撤销点）
-        state = create_canvas(name)
-        self._canvases[state.canvas_id] = state
-        self._history[state.canvas_id] = []
-        self._redo[state.canvas_id] = []
-        # 写入磁盘
-        path = self._canvas_path(state.canvas_id)
-        try:
-            with path.open("w", encoding="utf-8") as f:
-                json.dump(state.to_dict(), f, ensure_ascii=False)
-        except OSError as e:
-            logger.warning("新建画布落盘失败（内存仍可用）: %s: %s", path.name, e)
-        return state
+        with self._lock:
+            # 不走 save_canvas（避免创建动作本身被入栈为可撤销点）
+            state = create_canvas(name)
+            self._canvases[state.canvas_id] = state
+            self._history[state.canvas_id] = []
+            self._redo[state.canvas_id] = []
+            # 写入磁盘
+            path = self._canvas_path(state.canvas_id)
+            try:
+                with path.open("w", encoding="utf-8") as f:
+                    json.dump(state.to_dict(), f, ensure_ascii=False)
+            except OSError as e:
+                logger.warning("新建画布落盘失败（内存仍可用）: %s: %s", path.name, e)
+            return state
 
     def get_canvas(self, canvas_id: str) -> CanvasState:
-        # 优先内存，其次磁盘（懒加载，支持后端重启后恢复）
-        if canvas_id in self._canvases:
-            state = self._canvases[canvas_id]
+        with self._lock:
+            # 优先内存，其次磁盘（懒加载，支持后端重启后恢复）
+            if canvas_id in self._canvases:
+                state = self._canvases[canvas_id]
+                if normalize_state_image_sizes(state, self._image_size_cache):
+                    state.version += 1
+                    self._write_canvas(state)
+                # 返回深拷贝：调用方修改不影响内存中的"旧状态"，保证 undo 历史正确
+                return copy.deepcopy(state)
+            state = self._load_from_disk(canvas_id)
+            if state is None:
+                raise ValueError(f"画布不存在: {canvas_id}")
             if normalize_state_image_sizes(state, self._image_size_cache):
                 state.version += 1
                 self._write_canvas(state)
-            # 返回深拷贝：调用方修改不影响内存中的"旧状态"，保证 undo 历史正确
+            self._canvases[canvas_id] = state
             return copy.deepcopy(state)
-        state = self._load_from_disk(canvas_id)
-        if state is None:
-            raise ValueError(f"画布不存在: {canvas_id}")
-        if normalize_state_image_sizes(state, self._image_size_cache):
-            state.version += 1
-            self._write_canvas(state)
-        self._canvases[canvas_id] = state
-        return copy.deepcopy(state)
 
     def _write_canvas(self, state: CanvasState) -> None:
         """写回画布快照；用于正常保存与无撤销点的数据迁移。
@@ -279,107 +295,112 @@ class FileStore(InMemoryStore):
             logger.warning("残留临时文件清理失败: %s: %s", tmp.name, e)
 
     def save_canvas(self, state: CanvasState) -> None:
-        # base64 节点图片落盘为文件，画布 JSON 只存 http URL（KB 级）
-        materialize_state_images(state)
-        # 生成服务未返回可靠尺寸时，以最终图片真实比例为准
-        normalize_state_image_sizes(state, self._image_size_cache)
-        super().save_canvas(state)
-        # 写入磁盘，确保刷新/重启后可恢复
-        self._write_canvas(state)
+        with self._lock:
+            # base64 节点图片落盘为文件，画布 JSON 只存 http URL（KB 级）
+            materialize_state_images(state)
+            # 生成服务未返回可靠尺寸时，以最终图片真实比例为准
+            normalize_state_image_sizes(state, self._image_size_cache)
+            super().save_canvas(state)
+            # 写入磁盘，确保刷新/重启后可恢复
+            self._write_canvas(state)
 
     def undo(self, canvas_id: str) -> CanvasState | None:
-        prev = super().undo(canvas_id)
-        if prev is not None:
-            # 历史快照可能含旧 base64，落盘前同样物化为文件
-            materialize_state_images(prev)
-            normalize_state_image_sizes(prev, self._image_size_cache)
-            # 同步写回磁盘，保持内存/磁盘一致
-            self._write_canvas(prev)
-        return prev
+        with self._lock:
+            prev = super().undo(canvas_id)
+            if prev is not None:
+                # 历史快照可能含旧 base64，落盘前同样物化为文件
+                materialize_state_images(prev)
+                normalize_state_image_sizes(prev, self._image_size_cache)
+                # 同步写回磁盘，保持内存/磁盘一致
+                self._write_canvas(prev)
+            return prev
 
     def redo(self, canvas_id: str) -> CanvasState | None:
-        nxt = super().redo(canvas_id)
-        if nxt is not None:
-            materialize_state_images(nxt)
-            normalize_state_image_sizes(nxt, self._image_size_cache)
-            self._write_canvas(nxt)
-        return nxt
+        with self._lock:
+            nxt = super().redo(canvas_id)
+            if nxt is not None:
+                materialize_state_images(nxt)
+                normalize_state_image_sizes(nxt, self._image_size_cache)
+                self._write_canvas(nxt)
+            return nxt
 
     def list_canvases(self) -> list[dict]:
         """内存 + 磁盘合并列出所有画布摘要（磁盘文件为全集，内存数据更新）"""
-        seen: dict[str, dict] = {}
-        # 磁盘全集（重启后内存只含已访问过的画布，以磁盘为准）
-        for path in self._data_dir.glob("*.json"):
-            cid = path.stem
-            try:
-                with path.open("r", encoding="utf-8") as f:
-                    data = json.load(f)
-                state = self._canvases.get(cid)
-                if state is not None:
-                    # 内存中的版本更新（含未落盘的 updated_at）
+        with self._lock:
+            seen: dict[str, dict] = {}
+            # 磁盘全集（重启后内存只含已访问过的画布，以磁盘为准）
+            for path in self._data_dir.glob("*.json"):
+                cid = path.stem
+                try:
+                    with path.open("r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    state = self._canvases.get(cid)
+                    if state is not None:
+                        # 内存中的版本更新（含未落盘的 updated_at）
+                        seen[cid] = {
+                            "canvas_id": cid,
+                            "name": state.name or f"画布 {cid[:6]}",
+                            "node_count": len(state.nodes),
+                            "updated_at": state.updated_at,
+                        }
+                    else:
+                        seen[cid] = {
+                            "canvas_id": cid,
+                            "name": data.get("name") or f"画布 {cid[:6]}",
+                            "node_count": len(data.get("nodes", {})),
+                            "updated_at": data.get("updated_at", 0),
+                        }
+                except (json.JSONDecodeError, OSError) as e:
+                    # 读失败/半截文件：回退内存版本（若有），绝不静默缺项——
+                    # 列表里少一个画布比显示旧数据更让用户困惑
+                    logger.warning("画布列表读取失败（回退内存版本）: %s: %s", path.name, e)
+                    state = self._canvases.get(cid)
+                    if state is not None:
+                        seen[cid] = {
+                            "canvas_id": cid,
+                            "name": state.name or f"画布 {cid[:6]}",
+                            "node_count": len(state.nodes),
+                            "updated_at": state.updated_at,
+                        }
+                    continue
+            # 内存中存在但磁盘没有的（理论上不会出现，防御性保留）
+            for cid, state in self._canvases.items():
+                if cid not in seen:
                     seen[cid] = {
                         "canvas_id": cid,
                         "name": state.name or f"画布 {cid[:6]}",
                         "node_count": len(state.nodes),
                         "updated_at": state.updated_at,
                     }
-                else:
-                    seen[cid] = {
-                        "canvas_id": cid,
-                        "name": data.get("name") or f"画布 {cid[:6]}",
-                        "node_count": len(data.get("nodes", {})),
-                        "updated_at": data.get("updated_at", 0),
-                    }
-            except (json.JSONDecodeError, OSError) as e:
-                # 读失败/半截文件：回退内存版本（若有），绝不静默缺项——
-                # 列表里少一个画布比显示旧数据更让用户困惑
-                logger.warning("画布列表读取失败（回退内存版本）: %s: %s", path.name, e)
-                state = self._canvases.get(cid)
-                if state is not None:
-                    seen[cid] = {
-                        "canvas_id": cid,
-                        "name": state.name or f"画布 {cid[:6]}",
-                        "node_count": len(state.nodes),
-                        "updated_at": state.updated_at,
-                    }
-                continue
-        # 内存中存在但磁盘没有的（理论上不会出现，防御性保留）
-        for cid, state in self._canvases.items():
-            if cid not in seen:
-                seen[cid] = {
-                    "canvas_id": cid,
-                    "name": state.name or f"画布 {cid[:6]}",
-                    "node_count": len(state.nodes),
-                    "updated_at": state.updated_at,
-                }
-        summaries = list(seen.values())
-        summaries.sort(key=lambda x: x["updated_at"], reverse=True)
-        return summaries
+            summaries = list(seen.values())
+            summaries.sort(key=lambda x: x["updated_at"], reverse=True)
+            return summaries
 
     def delete_canvas(self, canvas_id: str) -> None:
-        path = self._canvas_path(canvas_id)
-        exists = path.exists()
-        if not exists and canvas_id not in self._canvases:
-            raise ValueError(f"画布不存在: {canvas_id}")
-        # 删除前收集该画布引用的本地图片（旧平铺格式），用于级联清理
-        state = self._canvases.get(canvas_id) or self._load_from_disk(canvas_id)
-        referenced = [
-            n.image_url for n in (state.nodes.values() if state else [])
-            if n.image_url and is_local_image_url(n.image_url)
-        ]
-        # 清内存与撤销/重做历史
-        self._canvases.pop(canvas_id, None)
-        self._history.pop(canvas_id, None)
-        self._redo.pop(canvas_id, None)
-        self._round_markers.pop(canvas_id, None)
-        # 删磁盘文件
-        if exists:
-            try:
-                path.unlink()
-            except OSError as e:
-                logger.warning("画布文件删除失败: %s: %s", path.name, e)
-        # 级联删除图片：整删画布子目录（新归类格式），再删旧平铺格式的引用文件
-        self._delete_canvas_images(canvas_id, referenced)
+        with self._lock:
+            path = self._canvas_path(canvas_id)
+            exists = path.exists()
+            if not exists and canvas_id not in self._canvases:
+                raise ValueError(f"画布不存在: {canvas_id}")
+            # 删除前收集该画布引用的本地图片（旧平铺格式），用于级联清理
+            state = self._canvases.get(canvas_id) or self._load_from_disk(canvas_id)
+            referenced = [
+                n.image_url for n in (state.nodes.values() if state else [])
+                if n.image_url and is_local_image_url(n.image_url)
+            ]
+            # 清内存与撤销/重做历史
+            self._canvases.pop(canvas_id, None)
+            self._history.pop(canvas_id, None)
+            self._redo.pop(canvas_id, None)
+            self._round_markers.pop(canvas_id, None)
+            # 删磁盘文件
+            if exists:
+                try:
+                    path.unlink()
+                except OSError as e:
+                    logger.warning("画布文件删除失败: %s: %s", path.name, e)
+            # 级联删除图片：整删画布子目录（新归类格式），再删旧平铺格式的引用文件
+            self._delete_canvas_images(canvas_id, referenced)
 
     def _delete_canvas_images(self, canvas_id: str, referenced_urls: list[str]) -> None:
         """画布删除后清理其图片文件；失败不阻断删除流程"""

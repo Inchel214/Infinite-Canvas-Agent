@@ -1,6 +1,7 @@
 """画布状态数据模型"""
 from __future__ import annotations
 
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -72,6 +73,13 @@ class CanvasState:
     updated_at: float = 0
     # 下一个节点编号（add_node 自增分配；删除不回收，保证 #N 指代稳定）
     next_index: int = 1
+    # 编号分配锁（不序列化）
+    _index_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    def __post_init__(self):
+        # 确保锁被初始化（从 dict 反序列化时不会自动调用 __post_init__）
+        if not hasattr(self, '_index_lock') or self._index_lock is None:
+            object.__setattr__(self, '_index_lock', threading.Lock())
 
     def to_dict(self) -> dict:
         return {
@@ -114,11 +122,17 @@ class CanvasState:
 
     def add_node(self, node: CanvasNode) -> None:
         # 统一编号分配：所有加节点路径（工具/上传/克隆）都经过这里
-        if node.index is None:
-            node.index = self.next_index
-            self.next_index += 1
-        self.nodes[node.id] = node
-        self.version += 1
+        # 使用锁保证原子性，避免并发操作导致编号冲突
+        with self._index_lock:
+            existing_indices = {n.index for n in self.nodes.values() if n.index is not None}
+            if node.index is None or node.index in existing_indices:
+                # 找到下一个可用的 index
+                while self.next_index in existing_indices:
+                    self.next_index += 1
+                node.index = self.next_index
+                self.next_index += 1
+            self.nodes[node.id] = node
+            self.version += 1
 
     def remove_node(self, node_id: str) -> None:
         if node_id in self.nodes:

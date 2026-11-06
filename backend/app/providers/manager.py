@@ -9,7 +9,7 @@ import os
 
 from app.agent.llm import BaseLLM, MockLLM
 from app.image.base import BaseImageGenerator
-from app.providers.schema import AppSettings, LLMConfig, ImageConfig, resolve_preset
+from app.providers.schema import AppSettings, LLMConfig, ImageConfig, PROVIDER_PRESETS, resolve_preset
 from app.providers.store import SettingsStore
 
 
@@ -170,21 +170,59 @@ class ProviderManager:
         # 2) 用户设置有效（选了服务商且有 key）→ 按预设补全后使用
         if conf.provider and conf.api_key:
             return resolve_preset(conf, is_image=is_image)
-        # 3) 回退 .env（仅 ARK，保持向后兼容）
-        env_key = os.getenv("ARK_API_KEY", "").strip()
-        if env_key:
-            fallback = LLMConfig(
-                provider="ark",
-                api_key=env_key,
-                base_url="https://ark.cn-beijing.volces.com/api/v3",
-                model=os.getenv("ARK_LLM_MODEL", "doubao-seed-2-1-pro-260915"),
-            ) if not is_image else ImageConfig(
-                provider="ark",
-                api_key=env_key,
-                base_url="https://ark.cn-beijing.volces.com/api/v3",
-                model=os.getenv("ARK_IMAGE_MODEL", "doubao-seedream-5-0-pro-260628"),
-                stream_model=os.getenv("ARK_IMAGE_STREAM_MODEL", ""),
-            )
-            return fallback
+        # 3) 回退 .env：逐个尝试各服务商的环境变量兜底
+        env_fallback = self._env_fallback(is_image)
+        if env_fallback is not None:
+            return env_fallback
         # 4) 无任何配置 → Mock
+        return None
+
+    @staticmethod
+    def _env_fallback(is_image: bool) -> LLMConfig | ImageConfig | None:
+        """遍历预设服务商，第一个在 .env 里配了 key 的即用作兜底配置。
+
+        顺序：ark → openai → deepseek → siliconflow。
+        Ark 保持向后兼容（ARK_API_KEY / ARK_LLM_MODEL / ARK_IMAGE_MODEL）；
+        其余服务商统一用 {PROVIDER}_API_KEY / {PROVIDER}_LLM_MODEL / {PROVIDER}_IMAGE_MODEL。
+        """
+        # Ark 优先（历史 .env 约定）
+        ark_key = os.getenv("ARK_API_KEY", "").strip()
+        if ark_key:
+            if is_image:
+                return ImageConfig(
+                    provider="ark",
+                    api_key=ark_key,
+                    base_url=PROVIDER_PRESETS["ark"]["base_url"],
+                    model=os.getenv("ARK_IMAGE_MODEL", PROVIDER_PRESETS["ark"]["image_model"]),
+                    stream_model=os.getenv("ARK_IMAGE_STREAM_MODEL", ""),
+                )
+            return LLMConfig(
+                provider="ark",
+                api_key=ark_key,
+                base_url=PROVIDER_PRESETS["ark"]["base_url"],
+                model=os.getenv("ARK_LLM_MODEL", PROVIDER_PRESETS["ark"]["llm_model"]),
+            )
+
+        # 通用模式：{PROVIDER}_API_KEY
+        for provider in ("openai", "deepseek", "siliconflow"):
+            preset = PROVIDER_PRESETS.get(provider) or {}
+            if preset.get("image_api") is None and is_image:
+                continue  # 该服务商不支持图片生成
+            key = os.getenv(f"{provider.upper()}_API_KEY", "").strip()
+            if key:
+                base_url = os.getenv(f"{provider.upper()}_BASE_URL", "").strip() or preset.get("base_url", "")
+                if is_image:
+                    return ImageConfig(
+                        provider=provider,
+                        api_key=key,
+                        base_url=base_url,
+                        model=os.getenv(f"{provider.upper()}_IMAGE_MODEL", preset.get("image_model", "")),
+                        stream_model=os.getenv(f"{provider.upper()}_STREAM_MODEL", ""),
+                    )
+                return LLMConfig(
+                    provider=provider,
+                    api_key=key,
+                    base_url=base_url,
+                    model=os.getenv(f"{provider.upper()}_LLM_MODEL", preset.get("llm_model", "")),
+                )
         return None

@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import time
 
 import requests
 
@@ -23,6 +24,42 @@ from app.image.files import is_local_image_url, local_url_to_data_url
 
 _DEFAULT_BASE_URL = "https://api.openai.com/v1"
 logger = logging.getLogger(__name__)
+
+# 网络重试：偶发超时/5xx/ConnectionError 时有限重试 + 指数退避
+_MAX_RETRIES = 3
+_RETRY_BASE_DELAY = 1.0
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """判断异常是否值得重试：网络错误、超时、5xx"""
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        return True
+    if isinstance(exc, requests.HTTPError):
+        resp = exc.response
+        if resp is not None and 500 <= resp.status_code < 600:
+            return True
+    return False
+
+
+def _retry_post(session: requests.Session, url: str, **kwargs) -> requests.Response:
+    """带有限重试 + 指数退避的 POST 封装。4xx 不重试（业务错误），仅 transient 错误重试。"""
+    last_exc: Exception | None = None
+    for attempt in range(_MAX_RETRIES):
+        try:
+            resp = session.post(url, **kwargs)
+            resp.raise_for_status()
+            return resp
+        except Exception as exc:
+            last_exc = exc
+            if not _is_retryable(exc) or attempt == _MAX_RETRIES - 1:
+                raise
+            delay = _RETRY_BASE_DELAY * (2 ** attempt)
+            logger.warning(
+                "[OpenAI] 请求失败（第 %d/%d 次），%ss 后重试: %s",
+                attempt + 1, _MAX_RETRIES, delay, exc,
+            )
+            time.sleep(delay)
+    raise last_exc  # 不会到达
 
 # 各档位映射的目标边长（OpenAI 官方最大 1024/1536，网关普遍支持更大值）
 _SIZE_MAP = {"1K": "1024x1024", "2K": "2048x2048", "4K": "2048x2048"}
@@ -90,10 +127,24 @@ def _fetch_image(url: str) -> tuple[bytes, str]:
         return base64.b64decode(b64), mime
     session = requests.Session()
     session.trust_env = False
-    resp = session.get(url, timeout=60, proxies={"http": None, "https": None})
-    resp.raise_for_status()
-    mime = resp.headers.get("Content-Type", "image/png").split(";")[0].strip()
-    return resp.content, mime
+    last_exc: Exception | None = None
+    for attempt in range(_MAX_RETRIES):
+        try:
+            resp = session.get(url, timeout=60, proxies={"http": None, "https": None})
+            resp.raise_for_status()
+            mime = resp.headers.get("Content-Type", "image/png").split(";")[0].strip()
+            return resp.content, mime
+        except Exception as exc:
+            last_exc = exc
+            if not _is_retryable(exc) or attempt == _MAX_RETRIES - 1:
+                raise
+            delay = _RETRY_BASE_DELAY * (2 ** attempt)
+            logger.warning(
+                "[OpenAI] 图片下载失败（第 %d/%d 次），%ss 后重试: %s",
+                attempt + 1, _MAX_RETRIES, delay, exc,
+            )
+            time.sleep(delay)
+    raise last_exc  # 不会到达
 
 
 def _mime_to_ext(mime: str) -> str:
@@ -155,18 +206,42 @@ class OpenAIImageGenerator(BaseImageGenerator):
             self.model, normalized_size, prompt[:80],
         )
         session = self._session()
-        resp = session.post(
-            self.generations_url,
-            headers={"Authorization": f"Bearer {self.api_key}"},
-            json={
-                "model": self.model,
-                "prompt": prompt,
-                "size": normalized_size,
-            },
-            timeout=180,
-            proxies={"http": None, "https": None},
-        )
-        _raise_provider_error(resp)
+        last_exc: Exception | None = None
+        for attempt in range(_MAX_RETRIES):
+            try:
+                resp = session.post(
+                    self.generations_url,
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    json={
+                        "model": self.model,
+                        "prompt": prompt,
+                        "size": normalized_size,
+                    },
+                    timeout=180,
+                    proxies={"http": None, "https": None},
+                )
+                # 5xx 可重试，其余（含 4xx）走正常错误处理
+                if 500 <= resp.status_code < 600 and attempt < _MAX_RETRIES - 1:
+                    delay = _RETRY_BASE_DELAY * (2 ** attempt)
+                    logger.warning(
+                        "[OpenAI] 生图请求 HTTP %d（第 %d/%d 次），%ss 后重试",
+                        resp.status_code, attempt + 1, _MAX_RETRIES, delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                _raise_provider_error(resp)
+                break  # 成功
+            except (requests.ConnectionError, requests.Timeout) as exc:
+                last_exc = exc
+                if attempt < _MAX_RETRIES - 1:
+                    delay = _RETRY_BASE_DELAY * (2 ** attempt)
+                    logger.warning(
+                        "[OpenAI] 生图请求网络错误（第 %d/%d 次），%ss 后重试: %s",
+                        attempt + 1, _MAX_RETRIES, delay, exc,
+                    )
+                    time.sleep(delay)
+                    continue
+                raise
         url = self._parse_response(resp.json())
         w, h = _display_size(_image_size(url), (300, 300))
         logger.debug(
@@ -198,14 +273,39 @@ class OpenAIImageGenerator(BaseImageGenerator):
             request_files = []
             for field, (filename, content, mime) in files:
                 request_files.append((field, (filename, content, mime)))
-            return session.post(
-                self.edits_url,
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                data={"model": self.model, "prompt": prompt, "size": request_size},
-                files=request_files,
-                timeout=180,
-                proxies={"http": None, "https": None},
-            )
+            # 网络层重试：仅对 ConnectionError/Timeout/5xx 重试，4xx 直接返回交给降级逻辑
+            last_net_exc: Exception | None = None
+            for attempt in range(_MAX_RETRIES):
+                try:
+                    resp = session.post(
+                        self.edits_url,
+                        headers={"Authorization": f"Bearer {self.api_key}"},
+                        data={"model": self.model, "prompt": prompt, "size": request_size},
+                        files=request_files,
+                        timeout=180,
+                        proxies={"http": None, "https": None},
+                    )
+                    if 500 <= resp.status_code < 600 and attempt < _MAX_RETRIES - 1:
+                        delay = _RETRY_BASE_DELAY * (2 ** attempt)
+                        logger.warning(
+                            "[OpenAI] 编辑请求 HTTP %d（第 %d/%d 次），%ss 后重试",
+                            resp.status_code, attempt + 1, _MAX_RETRIES, delay,
+                        )
+                        time.sleep(delay)
+                        continue
+                    return resp
+                except (requests.ConnectionError, requests.Timeout) as exc:
+                    last_net_exc = exc
+                    if attempt < _MAX_RETRIES - 1:
+                        delay = _RETRY_BASE_DELAY * (2 ** attempt)
+                        logger.warning(
+                            "[OpenAI] 编辑请求网络错误（第 %d/%d 次），%ss 后重试: %s",
+                            attempt + 1, _MAX_RETRIES, delay, exc,
+                        )
+                        time.sleep(delay)
+                        continue
+                    raise
+            raise last_net_exc  # 不会到达
 
         resp = post_edit(requested_size)
         fallback_size = _fallback_edit_size(requested_size)
@@ -291,14 +391,39 @@ class OpenAIImageGenerator(BaseImageGenerator):
                 ("image", (f"image.{image_ext}", image_content, image_mime)),
                 ("mask", ("mask.png", mask_content, "image/png")),
             ]
-            return session.post(
-                self.edits_url,
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                data={"model": self.model, "prompt": prompt, "size": request_size},
-                files=request_files,
-                timeout=180,
-                proxies={"http": None, "https": None},
-            )
+            # 网络层重试：仅对 ConnectionError/Timeout/5xx 重试，4xx 直接返回交给降级逻辑
+            last_net_exc: Exception | None = None
+            for attempt in range(_MAX_RETRIES):
+                try:
+                    resp = session.post(
+                        self.edits_url,
+                        headers={"Authorization": f"Bearer {self.api_key}"},
+                        data={"model": self.model, "prompt": prompt, "size": request_size},
+                        files=request_files,
+                        timeout=180,
+                        proxies={"http": None, "https": None},
+                    )
+                    if 500 <= resp.status_code < 600 and attempt < _MAX_RETRIES - 1:
+                        delay = _RETRY_BASE_DELAY * (2 ** attempt)
+                        logger.warning(
+                            "[OpenAI] Inpainting 请求 HTTP %d（第 %d/%d 次），%ss 后重试",
+                            resp.status_code, attempt + 1, _MAX_RETRIES, delay,
+                        )
+                        time.sleep(delay)
+                        continue
+                    return resp
+                except (requests.ConnectionError, requests.Timeout) as exc:
+                    last_net_exc = exc
+                    if attempt < _MAX_RETRIES - 1:
+                        delay = _RETRY_BASE_DELAY * (2 ** attempt)
+                        logger.warning(
+                            "[OpenAI] Inpainting 请求网络错误（第 %d/%d 次），%ss 后重试: %s",
+                            attempt + 1, _MAX_RETRIES, delay, exc,
+                        )
+                        time.sleep(delay)
+                        continue
+                    raise
+            raise last_net_exc  # 不会到达
 
         resp = post_inpaint(requested_size)
         fallback_size = _fallback_edit_size(requested_size)

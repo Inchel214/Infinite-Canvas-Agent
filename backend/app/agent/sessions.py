@@ -13,6 +13,7 @@ import copy
 import json
 import logging
 import os
+import threading
 import uuid
 from pathlib import Path
 
@@ -82,6 +83,9 @@ class ChatSessionStore:
         self._sessions: dict[str, list[dict]] = {}
         # canvas_id -> 执行记录（每轮一条：状态/计划/工具参数），与 messages 同文件
         self._runs: dict[str, list[dict]] = {}
+        # 全局锁：Agent worker 线程与 SSE 线程并发读写同一 canvas 的消息/步骤时，
+        # 不加锁会出现消息丢失或 run 步骤错乱。RLock 允许同线程内 _ensure_loaded→_save 重入。
+        self._lock = threading.RLock()
 
     def _path(self, canvas_id: str) -> Path:
         # canvas_id 为 uuid，直接作文件名
@@ -108,156 +112,169 @@ class ChatSessionStore:
 
     def get_messages(self, canvas_id: str) -> list[dict]:
         """全量历史（前端展示用），返回副本防止外部改写内部状态"""
-        self._ensure_loaded(canvas_id)
-        return copy.deepcopy(self._sessions[canvas_id])
+        with self._lock:
+            self._ensure_loaded(canvas_id)
+            return copy.deepcopy(self._sessions[canvas_id])
 
     def get_context(self, canvas_id: str) -> list[dict]:
         """注入 LLM 的历史尾部（最近 _MAX_CONTEXT_MESSAGES 条），防止上下文爆炸"""
-        msgs = self.get_messages(canvas_id)
-        total = len(msgs)
-        if total > _MAX_CONTEXT_MESSAGES:
-            msgs = msgs[-_MAX_CONTEXT_MESSAGES:]
-        logger.debug(
-            "[Session] 上下文注入 canvas=%s | 总历史=%d条 | 注入=%d条",
-            canvas_id, total, len(msgs),
-        )
-        return msgs
+        with self._lock:
+            msgs = self.get_messages(canvas_id)
+            total = len(msgs)
+            if total > _MAX_CONTEXT_MESSAGES:
+                msgs = msgs[-_MAX_CONTEXT_MESSAGES:]
+            logger.debug(
+                "[Session] 上下文注入 canvas=%s | 总历史=%d条 | 注入=%d条",
+                canvas_id, total, len(msgs),
+            )
+            return msgs
 
     def append_user_message(self, canvas_id: str, user_message: str) -> None:
         """立即保存用户消息（发送时调用，确保切换画布后历史不丢失）"""
-        msgs = self._messages_internal(canvas_id)
-        msgs.append({"role": "user", "content": user_message})
-        # 超限丢弃最早的消息
-        if len(msgs) > _MAX_MESSAGES:
-            del msgs[: len(msgs) - _MAX_MESSAGES]
-        logger.debug(
-            "[Session] 保存用户消息 canvas=%s | 当前=%d条 | user=%s",
-            canvas_id, len(msgs), user_message[:60].replace("\n", " "),
-        )
-        self._save(canvas_id)
+        with self._lock:
+            msgs = self._messages_internal(canvas_id)
+            msgs.append({"role": "user", "content": user_message})
+            # 超限丢弃最早的消息
+            if len(msgs) > _MAX_MESSAGES:
+                del msgs[: len(msgs) - _MAX_MESSAGES]
+            logger.debug(
+                "[Session] 保存用户消息 canvas=%s | 当前=%d条 | user=%s",
+                canvas_id, len(msgs), user_message[:60].replace("\n", " "),
+            )
+            self._save(canvas_id)
 
     def append_assistant_message(self, canvas_id: str, assistant_message: str) -> None:
         """保存助手回复（worker 完成后调用）"""
-        msgs = self._messages_internal(canvas_id)
-        msgs.append({"role": "assistant", "content": assistant_message})
-        # 超限丢弃最早的消息
-        if len(msgs) > _MAX_MESSAGES:
-            del msgs[: len(msgs) - _MAX_MESSAGES]
-        logger.debug(
-            "[Session] 保存助手回复 canvas=%s | 当前=%d条",
-            canvas_id, len(msgs),
-        )
-        self._save(canvas_id)
+        with self._lock:
+            msgs = self._messages_internal(canvas_id)
+            msgs.append({"role": "assistant", "content": assistant_message})
+            # 超限丢弃最早的消息
+            if len(msgs) > _MAX_MESSAGES:
+                del msgs[: len(msgs) - _MAX_MESSAGES]
+            logger.debug(
+                "[Session] 保存助手回复 canvas=%s | 当前=%d条",
+                canvas_id, len(msgs),
+            )
+            self._save(canvas_id)
 
     def append_round(self, canvas_id: str, user_message: str, assistant_message: str) -> None:
         """追加一轮完整对话（用户原文 + Agent 最终回复）并落盘"""
-        msgs = self._messages_internal(canvas_id)
-        msgs.append({"role": "user", "content": user_message})
-        msgs.append({"role": "assistant", "content": assistant_message})
-        # 超限丢弃最早的消息
-        if len(msgs) > _MAX_MESSAGES:
-            del msgs[: len(msgs) - _MAX_MESSAGES]
-        logger.debug(
-            "[Session] 追加对话 canvas=%s | 当前=%d条 | user=%s",
-            canvas_id, len(msgs), user_message[:60].replace("\n", " "),
-        )
-        self._save(canvas_id)
+        with self._lock:
+            msgs = self._messages_internal(canvas_id)
+            msgs.append({"role": "user", "content": user_message})
+            msgs.append({"role": "assistant", "content": assistant_message})
+            # 超限丢弃最早的消息
+            if len(msgs) > _MAX_MESSAGES:
+                del msgs[: len(msgs) - _MAX_MESSAGES]
+            logger.debug(
+                "[Session] 追加对话 canvas=%s | 当前=%d条 | user=%s",
+                canvas_id, len(msgs), user_message[:60].replace("\n", " "),
+            )
+            self._save(canvas_id)
 
     def append_run(self, canvas_id: str, record: dict) -> None:
         """追加一条执行记录（状态/计划/工具参数）并落盘。
 
         与 messages 分离：记录不注入上下文，只在需要"重试"时被取用。
         """
-        self._ensure_loaded(canvas_id)
-        runs = self._runs.setdefault(canvas_id, [])
-        runs.append(record)
-        if len(runs) > _MAX_RUNS:
-            del runs[: len(runs) - _MAX_RUNS]
-        self._save(canvas_id)
+        with self._lock:
+            self._ensure_loaded(canvas_id)
+            runs = self._runs.setdefault(canvas_id, [])
+            runs.append(record)
+            if len(runs) > _MAX_RUNS:
+                del runs[: len(runs) - _MAX_RUNS]
+            self._save(canvas_id)
 
     def begin_run(self, canvas_id: str, prompt: str) -> str:
         """开始一轮执行，创建 in_progress 状态的 run 记录并落盘。
 
         返回 run_id，后续通过 update_run_steps 增量更新步骤。
         """
-        self._ensure_loaded(canvas_id)
-        runs = self._runs.setdefault(canvas_id, [])
-        run_id = uuid.uuid4().hex[:12]
-        record = {
-            "id": run_id,
-            "at": __import__("time").time(),
-            "prompt": prompt,
-            "status": "in_progress",
-            "plan": "",
-            "steps": [],
-            "message": "",
-            "error": None,
-        }
-        runs.append(record)
-        if len(runs) > _MAX_RUNS:
-            del runs[: len(runs) - _MAX_RUNS]
-        self._save(canvas_id)
-        logger.debug("[Session] 开始执行 canvas=%s run_id=%s", canvas_id, run_id)
-        return run_id
+        with self._lock:
+            self._ensure_loaded(canvas_id)
+            runs = self._runs.setdefault(canvas_id, [])
+            run_id = uuid.uuid4().hex[:12]
+            record = {
+                "id": run_id,
+                "at": __import__("time").time(),
+                "prompt": prompt,
+                "status": "in_progress",
+                "plan": "",
+                "steps": [],
+                "message": "",
+                "error": None,
+            }
+            runs.append(record)
+            if len(runs) > _MAX_RUNS:
+                del runs[: len(runs) - _MAX_RUNS]
+            self._save(canvas_id)
+            logger.debug("[Session] 开始执行 canvas=%s run_id=%s", canvas_id, run_id)
+            return run_id
 
     def update_run_plan(self, canvas_id: str, run_id: str, plan: str) -> None:
         """更新 run 记录的计划（规划阶段完成后调用）"""
-        self._ensure_loaded(canvas_id)
-        runs = self._runs.get(canvas_id) or []
-        for run in runs:
-            if run.get("id") == run_id:
-                run["plan"] = plan
-                break
-        self._save(canvas_id)
+        with self._lock:
+            self._ensure_loaded(canvas_id)
+            runs = self._runs.get(canvas_id) or []
+            for run in runs:
+                if run.get("id") == run_id:
+                    run["plan"] = plan
+                    break
+            self._save(canvas_id)
 
     def append_step(self, canvas_id: str, run_id: str, step: dict) -> None:
         """追加一个工具步骤到 run 记录并立即落盘（实时持久化）"""
-        self._ensure_loaded(canvas_id)
-        runs = self._runs.get(canvas_id) or []
-        for run in runs:
-            if run.get("id") == run_id:
-                run.setdefault("steps", []).append(step)
-                break
-        self._save(canvas_id)
-        logger.debug(
-            "[Session] 追加步骤 canvas=%s run_id=%s tool=%s",
-            canvas_id, run_id, step.get("tool"),
-        )
+        with self._lock:
+            self._ensure_loaded(canvas_id)
+            runs = self._runs.get(canvas_id) or []
+            for run in runs:
+                if run.get("id") == run_id:
+                    run.setdefault("steps", []).append(step)
+                    break
+            self._save(canvas_id)
+            logger.debug(
+                "[Session] 追加步骤 canvas=%s run_id=%s tool=%s",
+                canvas_id, run_id, step.get("tool"),
+            )
 
     def finish_run(self, canvas_id: str, run_id: str, status: str, message: str = "", error: str | None = None) -> None:
         """完成 run 记录，更新状态为 done/failed/stopped"""
-        self._ensure_loaded(canvas_id)
-        runs = self._runs.get(canvas_id) or []
-        for run in runs:
-            if run.get("id") == run_id:
-                run["status"] = status
-                run["message"] = message
-                if error:
-                    run["error"] = error
-                break
-        self._save(canvas_id)
-        logger.debug("[Session] 完成执行 canvas=%s run_id=%s status=%s", canvas_id, run_id, status)
+        with self._lock:
+            self._ensure_loaded(canvas_id)
+            runs = self._runs.get(canvas_id) or []
+            for run in runs:
+                if run.get("id") == run_id:
+                    run["status"] = status
+                    run["message"] = message
+                    if error:
+                        run["error"] = error
+                    break
+            self._save(canvas_id)
+            logger.debug("[Session] 完成执行 canvas=%s run_id=%s status=%s", canvas_id, run_id, status)
 
     def last_run(self, canvas_id: str) -> dict | None:
         """最近一条执行记录（判断"重试/继续"指向哪个任务），无记录返回 None"""
-        self._ensure_loaded(canvas_id)
-        runs = self._runs.get(canvas_id) or []
-        return copy.deepcopy(runs[-1]) if runs else None
+        with self._lock:
+            self._ensure_loaded(canvas_id)
+            runs = self._runs.get(canvas_id) or []
+            return copy.deepcopy(runs[-1]) if runs else None
 
     def clear(self, canvas_id: str) -> None:
         """清空对话历史与执行记录（内存 + 磁盘）"""
-        self._sessions[canvas_id] = []
-        self._runs[canvas_id] = []
-        self._save(canvas_id)
+        with self._lock:
+            self._sessions[canvas_id] = []
+            self._runs[canvas_id] = []
+            self._save(canvas_id)
 
     def delete(self, canvas_id: str) -> None:
         """画布被删除时级联清理会话"""
-        self._sessions.pop(canvas_id, None)
-        self._runs.pop(canvas_id, None)
-        try:
-            self._path(canvas_id).unlink(missing_ok=True)
-        except OSError as e:
-            logger.warning("会话文件删除失败: %s: %s", canvas_id, e)
+        with self._lock:
+            self._sessions.pop(canvas_id, None)
+            self._runs.pop(canvas_id, None)
+            try:
+                self._path(canvas_id).unlink(missing_ok=True)
+            except OSError as e:
+                logger.warning("会话文件删除失败: %s: %s", canvas_id, e)
 
     def _messages_internal(self, canvas_id: str) -> list[dict]:
         """内部可变引用（先走一遍懒加载确保已初始化）"""
