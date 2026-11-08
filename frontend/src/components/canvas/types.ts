@@ -70,7 +70,7 @@ export interface CanvasProps {
 
 // 快捷键绑定
 export interface ShortcutBinding {
-  key: string;           // 如 "z", "y", "delete"
+  key: string;           // 如 "z", "y", "delete"；空字符串表示未绑定
   modifiers?: { ctrl?: boolean; shift?: boolean; alt?: boolean; meta?: boolean };
   description: string;   // 用户可读描述
   category: "view" | "edit" | "selection" | "generation";
@@ -78,7 +78,7 @@ export interface ShortcutBinding {
   alternatives?: Array<{ key: string; modifiers?: { ctrl?: boolean; shift?: boolean; alt?: boolean; meta?: boolean } }>; // 备选快捷键（如重做的 Ctrl+Shift+Z）
 }
 
-// 快捷键完整配置
+// 画布快捷键配置
 export interface ShortcutConfig {
   undo: ShortcutBinding;
   redo: ShortcutBinding;
@@ -88,10 +88,38 @@ export interface ShortcutConfig {
   escape: ShortcutBinding;
   togglePan: ShortcutBinding;
   selectAll?: ShortcutBinding;
+  openInpaint: ShortcutBinding;   // 局部编辑（默认不绑定）
+  openEdit: ShortcutBinding;      // 编辑图片（默认不绑定）
+  downloadImage: ShortcutBinding; // 下载选中图片（默认不绑定）
+  newCanvas: ShortcutBinding;     // 新建画布（默认不绑定）
+}
+
+// 局部编辑器内快捷键配置
+export interface EditorShortcutConfig {
+  brush: ShortcutBinding;
+  eraser: ShortcutBinding;
+  lasso: ShortcutBinding;
+  rect: ShortcutBinding;
+  wand: ShortcutBinding;
+  invert: ShortcutBinding;
+  brushSmaller: ShortcutBinding;
+  brushLarger: ShortcutBinding;
+  confirm: ShortcutBinding;
+  help: ShortcutBinding;
+}
+
+// 快捷键设置分组
+export type ShortcutScope = "canvas" | "editor";
+
+// 完整快捷键配置（画布 + 局部编辑器统一存储）
+export interface ShortcutStore {
+  canvas: ShortcutConfig;
+  editor: EditorShortcutConfig;
 }
 
 // 快捷键冲突信息
 export interface ShortcutConflict {
+  scope: ShortcutScope;
   actions: string[];     // 冲突的动作名
   binding: string;       // 冲突的按键
   severity: "error" | "warning";

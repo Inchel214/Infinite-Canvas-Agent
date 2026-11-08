@@ -62,7 +62,9 @@ export function closestResolutionKey(longEdge: number): string {
 }
 
 // 按比例 + 分辨率档位计算 size 字符串（如 "2048x1152"）
+// 比例为空表示“自动”：返回空串，调用方不传 size，交由模型决定输出比例
 export function calcSize(ratioKey: string, res: string): string {
+  if (!ratioKey) return "";
   const ratio = parseRatio(ratioKey);
   const long = res === "1K" ? 1024 : res === "4K" ? 4096 : 2048;
   let w = ratio.w >= ratio.h ? long : Math.round((long * ratio.w) / ratio.h);

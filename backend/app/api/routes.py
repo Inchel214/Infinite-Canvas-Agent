@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import logging
-import queue
 import subprocess
 import sys
 import threading
@@ -18,7 +17,6 @@ from pydantic import BaseModel
 
 from app import deps
 from app import experiences
-from app.agent.sessions import format_failure_note
 from app.canvas.state import CanvasNode, CanvasState
 from app.providers.schema import (
     AppSettings,
@@ -57,6 +55,7 @@ class ChatRequest(BaseModel):
     canvas_id: str
     prompt: str
     referenced_images: Optional[List[ReferencedImage]] = None  # Vision: 用户引用的图片列表
+    round_id: Optional[str] = None  # 本轮撤回标识（前端 begin-round 生成）
 
 
 class ChatResponse(BaseModel):
@@ -124,10 +123,11 @@ class StreamGenRequest(BaseModel):
 
 
 class ExperienceIn(BaseModel):
-    """导入风格 MD：名称/描述/正文"""
+    """导入提示词条目：名称/描述/正文；kind=style 为风格指南，kind=preset 为场景预设"""
     name: str
     description: str = ""
     content: str
+    kind: str = "style"
 
 
 class ExperienceUpdate(BaseModel):
@@ -313,12 +313,30 @@ def variate_image(canvas_id: str, req: VariateRequest):
     if req.y is not None:
         kwargs["y"] = req.y
     result = tool.run(state, **kwargs)
-    if result.state:
-        deps.store.save_canvas(result.state)
+    if not result.success or not result.state:
+        return {
+            "success": False,
+            "message": result.message,
+            "canvas": (result.state or state).to_dict(),
+        }
+    # 并发安全提交：多张变体并行提交时，锁内重读最新画布增量添加，避免整体覆盖丢图
+    node_id = (result.data or {}).get("node_id")
+    node = result.state.nodes.get(node_id) if node_id else None
+    if node is None:
+        return {
+            "success": False,
+            "message": "生成失败：未返回节点",
+            "canvas": result.state.to_dict(),
+        }
+    with _canvas_lock(canvas_id):
+        latest = deps.store.get_canvas(canvas_id)
+        node.index = None  # 旧快照编号可能与并发写入撞号，按最新画布统一重新分配
+        latest.add_node(node)
+        deps.store.save_canvas(latest)
     return {
-        "success": result.success,
+        "success": True,
         "message": result.message,
-        "canvas": result.state.to_dict(),
+        "canvas": latest.to_dict(),
     }
 
 
@@ -338,12 +356,30 @@ def edit_image(canvas_id: str, req: EditRequest):
     if req.mask is not None:
         kwargs["mask"] = req.mask  # 蒙版（局部编辑 Inpainting）
     result = tool.run(state, **kwargs)
-    if result.state:
-        deps.store.save_canvas(result.state)
+    if not result.success or not result.state:
+        return {
+            "success": False,
+            "message": result.message,
+            "canvas": (result.state or state).to_dict(),
+        }
+    # 并发安全提交：与 /variate 同模式，锁内重读最新画布增量添加
+    node_id = (result.data or {}).get("node_id")
+    node = result.state.nodes.get(node_id) if node_id else None
+    if node is None:
+        return {
+            "success": False,
+            "message": "生成失败：未返回节点",
+            "canvas": result.state.to_dict(),
+        }
+    with _canvas_lock(canvas_id):
+        latest = deps.store.get_canvas(canvas_id)
+        node.index = None  # 旧快照编号可能与并发写入撞号，按最新画布统一重新分配
+        latest.add_node(node)
+        deps.store.save_canvas(latest)
     return {
-        "success": result.success,
+        "success": True,
         "message": result.message,
-        "canvas": result.state.to_dict(),
+        "canvas": latest.to_dict(),
     }
 
 
@@ -602,14 +638,32 @@ def begin_round(canvas_id: str):
 
 @router.post("/canvas/{canvas_id}/undo-round", summary="撤回整轮 AI 操作")
 def undo_round(canvas_id: str, round_id: str):
-    """撤销到指定轮次标记之前的状态，回退该轮所有画布修改。"""
+    """撤销到指定轮次标记之前的状态，回退该轮所有画布修改。
+
+    优先走内存 undo 栈（精确、可从任意旧轮次回退）；后端重启导致栈丢失时，
+    回退到随该轮用户消息落盘的前置画布快照。
+    """
     try:
         result = deps.store.undo_to_round(canvas_id, round_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     if result is None:
+        pre = deps.chat_sessions.get_round_pre_canvas(canvas_id, round_id)
+        if pre is not None:
+            try:
+                result = deps.store.restore_canvas(canvas_id, pre)
+            except ValueError as e:
+                raise HTTPException(status_code=404, detail=str(e))
+    if result is None:
         current = deps.store.get_canvas(canvas_id)
-        return {"success": False, "message": "无可撤回的操作", "canvas": current.to_dict()}
+        return {
+            "success": False,
+            "message": "这一轮没有可撤回的修改（如果服务重启过，旧记录可能已失效）",
+            "canvas": current.to_dict(),
+        }
+    # 画布已回退：同步截断对话历史（该轮及其后的消息/执行记录），
+    # 前端把这条输入放回编辑框，用户可修改后重新发送
+    deps.chat_sessions.delete_round_from(canvas_id, round_id)
     return {"success": True, "message": "已撤回整轮操作", "canvas": result.to_dict()}
 
 
@@ -929,100 +983,34 @@ def generate_image_stream(canvas_id: str, req: StreamGenRequest):
     return StreamingResponse(sse(), media_type="text/event-stream")
 
 
-def _run_record(
-    prompt: str,
-    *,
-    status: str,
-    result: object | None = None,
-    error: str | None = None,
-) -> dict:
-    """构造一轮执行记录（落盘到会话 runs，供"重试/继续"精确重放失败任务）。
-
-    status: done / failed / stopped
-    """
-    plan = ""
-    steps: list[dict] = []
-    message = ""
-    if result is not None:
-        message = getattr(result, "message", "")
-        for step in getattr(result, "steps", []) or []:
-            if step.get("type") == "plan":
-                plan = step.get("content", "")
-            elif step.get("type") == "tool_call":
-                steps.append({
-                    "tool": step.get("tool"),
-                    "args": step.get("args") or {},
-                    "result": step.get("result"),
-                    "success": step.get("success", True),
-                })
-    return {
-        "id": uuid.uuid4().hex[:12],
-        "at": time.time(),
-        "prompt": prompt,
-        "status": status,
-        "plan": plan,
-        "steps": steps,
-        "message": message,
-        "error": error,
-    }
-
-
-def _run_status(result: object) -> str:
-    """判定一轮执行结果：stopped > failed > done。
-
-    最后一个工具步骤失败也视为失败——Agent 可能吞掉错误后正常收尾
-    （如"生成失败，账户欠费"），此时 success 为 True 但任务实际未完成。
-    """
-    if getattr(result, "stopped", False):
-        return "stopped"
-    if not getattr(result, "success", True):
-        return "failed"
-    steps = getattr(result, "steps", []) or []
-    last_tool = next((s for s in reversed(steps) if s.get("type") == "tool_call"), None)
-    if last_tool is not None and not last_tool.get("success", True):
-        return "failed"
-    return "done"
-
-
 @router.post("/agent/chat", response_model=ChatResponse, summary="发送提示词给 Agent（携带对话历史）")
 def chat(req: ChatRequest):
-    # 注入该画布的历史对话尾部，Agent 具备跨轮记忆
-    history = deps.chat_sessions.get_context(req.canvas_id)
-    # 上一轮未完成任务的摘要：让"重试/继续"能精确复用原参数
-    failure_note = format_failure_note(deps.chat_sessions.last_run(req.canvas_id))
+    # 预校验画布存在（dispatcher 不做存在性校验）
     try:
-        result = deps.agent.run(
-            req.prompt, req.canvas_id, history=history, failure_note=failure_note
-        )
+        deps.store.get_canvas(req.canvas_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        logger.exception("Agent 对话执行异常")
-        # 失败轮同样入库：否则下一轮"重试"在历史里找不到这个任务
-        msg = f"Agent 执行失败：{e}"
-        deps.chat_sessions.append_round(req.canvas_id, req.prompt, msg)
-        # 异常时 run 记录可能已创建（in_progress 状态），需要标记为 failed
-        last_run = deps.chat_sessions.last_run(req.canvas_id)
-        if last_run and last_run.get("status") == "in_progress":
-            deps.chat_sessions.finish_run(
-                req.canvas_id, last_run["id"], "failed", msg, error=str(e)
-            )
-        else:
-            deps.chat_sessions.append_run(
-                req.canvas_id,
-                _run_record(req.prompt, status="failed", error=str(e))
-            )
-        raise HTTPException(status_code=500, detail=msg)
 
-    # 回写一轮对话（用户原文 + Agent 最终回复），供下轮上下文与前端历史展示
-    # 注意：run 记录已由 agent.run() 内部实时持久化，无需再调用 append_run
-    deps.chat_sessions.append_round(req.canvas_id, req.prompt, result.message)
+    # 走调度器：与流式端点同一套排队/串行语义，消除并发双跑隐患
+    handle = deps.dispatcher.submit(req.canvas_id, req.prompt)
+    done_evt = None
+    while True:
+        evt = handle.evq.get()
+        if evt is None:
+            break
+        if evt.get("type") == "done":
+            done_evt = evt
+    if done_evt is None:
+        raise HTTPException(status_code=500, detail="Agent 执行异常结束")
 
+    canvas_dict = done_evt.get("canvas")
+    if not canvas_dict:
+        canvas_dict = deps.store.get_canvas(req.canvas_id).to_dict()
     return ChatResponse(
-        success=result.success,
-        message=result.message,
-        canvas=result.state.to_dict(),
-        steps=result.steps,
+        success=bool(done_evt.get("success")),
+        message=done_evt.get("message", ""),
+        canvas=canvas_dict,
+        steps=done_evt.get("steps") or [],
     )
 
 
@@ -1032,28 +1020,30 @@ class StopRequest(BaseModel):
 
 @router.post(
     "/agent/chat/stream",
-    summary="Agent 对话（SSE 流式：计划/思考/工具过程/最终结果，支持停止）",
+    summary="Agent 对话（SSE 流式：计划/思考/工具过程/最终结果，支持停止与排队 steering）",
 )
 def chat_stream(req: ChatRequest):
     """SSE 事件协议：
 
     - start                  流开始
-    - plan      {content}    执行计划（规划阶段产出，立即展示）
-    - thought   {content}    模型边想边调工具时的自述
+    - queued    {position}   画布忙碌，请求已排队（仅实时连接，不进事件缓冲）
+    - plan_delta {content}   执行计划（规划阶段产出，逐字）
+    - reasoning_delta {content} 深度思考过程（逐字）
+    - delta     {content}    文本增量（打字机）
     - tool_start  {tool, args}           工具开始执行
     - tool_result {tool, result, success, canvas?} 工具执行完成（canvas 随事件增量刷新）
+    - user_message {content} 排队消息被 steering 注入当前回合（工具边界）
+    - ask_user  {question, options?, timeout?, default_action?} Agent 询问用户
     - response {content}     最终文本回复
     - done      {success, stopped, message, canvas, steps} 终止事件
     """
-    # 预校验画布存在：错误走标准 404，而不是流内 done 事件
+    # 预校验画布存在：错误走标准 404，而不是流内 done 事件。
+    # 同时取当前状态作为本轮前置快照（撤回依据，随用户消息持久化）
     try:
-        deps.store.get_canvas(req.canvas_id)
+        state = deps.store.get_canvas(req.canvas_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
-    history = deps.chat_sessions.get_context(req.canvas_id)
-    # 上一轮未完成任务的摘要：让"重试/继续"能精确复用原参数
-    failure_note = format_failure_note(deps.chat_sessions.last_run(req.canvas_id))
     # Vision: 把引用图片列表转为 dict 列表
     referenced_images = None
     if req.referenced_images:
@@ -1062,76 +1052,30 @@ def chat_stream(req: ChatRequest):
             for img in req.referenced_images
         ]
     logger.debug(
-        "[SSE] Agent 对话流开始 canvas=%s prompt=%s history=%d条 failure_note=%s referenced_images=%d",
-        req.canvas_id, req.prompt[:80].replace("\n", " "), len(history),
-        "有" if failure_note else "无",
+        "[SSE] Agent 对话流提交 canvas=%s prompt=%s referenced_images=%d",
+        req.canvas_id, req.prompt[:80].replace("\n", " "),
         len(referenced_images) if referenced_images else 0,
     )
-    q: "queue.Queue[dict | None]" = queue.Queue()
 
-    # 立即保存用户消息（确保切换画布后历史不丢失）
-    deps.chat_sessions.append_user_message(req.canvas_id, req.prompt)
-
-    def worker():
-        try:
-            result = deps.agent.run(
-                req.prompt, req.canvas_id, history=history,
-                on_event=lambda e: q.put(e),
-                failure_note=failure_note,
-                referenced_images=referenced_images,
-            )
-            # 保存助手回复（用户消息已在流开始时保存）
-            deps.chat_sessions.append_assistant_message(req.canvas_id, result.message)
-            q.put({
-                "type": "done",
-                "success": result.success,
-                "stopped": result.stopped,
-                "message": result.message,
-                "canvas": result.state.to_dict(),
-                "steps": result.steps,
-            })
-        except Exception as e:
-            # worker 异常也必须发 done，否则前端会一直等
-            logger.exception("Agent 流式对话执行异常")
-            msg = f"Agent 执行失败：{e}"
-            # 保存失败回复（用户消息已在流开始时保存）
-            try:
-                deps.chat_sessions.append_assistant_message(req.canvas_id, msg)
-                # 异常时 run 记录可能已创建（in_progress 状态），需要标记为 failed
-                # 查找最近的 in_progress run 并更新
-                last_run = deps.chat_sessions.last_run(req.canvas_id)
-                if last_run and last_run.get("status") == "in_progress":
-                    deps.chat_sessions.finish_run(
-                        req.canvas_id, last_run["id"], "failed", msg, error=str(e)
-                    )
-                else:
-                    # 没有 in_progress 的 run，创建一个新的 failed 记录
-                    deps.chat_sessions.append_run(
-                        req.canvas_id,
-                        _run_record(req.prompt, status="failed", error=str(e))
-                    )
-            except Exception:
-                logger.exception("失败轮对话落盘失败（忽略，不阻断事件流）")
-            q.put({
-                "type": "done",
-                "success": False,
-                "message": msg,
-                "steps": [],
-            })
-        finally:
-            q.put(None)
-
-    threading.Thread(
-        target=worker, daemon=True, name=f"agent-stream-{req.canvas_id[:8]}"
-    ).start()
+    # 提交到调度器：空闲立即执行；忙碌排队（steering 注入或下一轮执行）。
+    # 用户消息在 submit 内到达即持久化；history/failure_note 在 worker 启动 run 时计算。
+    handle = deps.dispatcher.submit(
+        req.canvas_id,
+        req.prompt,
+        referenced_images,
+        round_id=req.round_id,
+        pre_canvas=state.to_dict() if req.round_id else None,
+    )
 
     def sse():
         finished = False
         _evt_count = 0
         try:
             yield _sse({"type": "start"})
+            if handle.queued:
+                yield _sse({"type": "queued", "position": handle.position})
             while True:
-                evt = q.get()
+                evt = handle.evq.get()
                 if evt is None:
                     finished = True
                     logger.debug("[SSE] Agent 对话流结束 canvas=%s events=%d", req.canvas_id, _evt_count)
@@ -1140,7 +1084,7 @@ def chat_stream(req: ChatRequest):
                 yield _sse(evt)
         finally:
             # 客户端断开（切换画布/关页面/刷新/网络中断）不视为放弃：
-            # 后台 worker 继续执行，用户切换回来时通过 run-status 轮询获取结果
+            # 后台继续执行，用户切换回来时通过 run-status 轮询+事件快照回放获取结果
             if not finished:
                 logger.info("[SSE] 客户端断开但后台继续执行 canvas=%s events=%d", req.canvas_id, _evt_count)
 
@@ -1173,7 +1117,12 @@ def respond_to_agent(req: RespondRequest):
 
 @router.get("/agent/history", summary="获取画布对话历史")
 def get_agent_history(canvas_id: str):
-    return {"canvas_id": canvas_id, "messages": deps.chat_sessions.get_messages(canvas_id)}
+    """返回消息文本对 + 执行记录（runs 带 timeline，供前端按时间线还原执行过程）"""
+    return {
+        "canvas_id": canvas_id,
+        "messages": deps.chat_sessions.get_messages(canvas_id),
+        "runs": deps.chat_sessions.get_runs(canvas_id),
+    }
 
 
 @router.get("/agent/run-status", summary="获取画布最近一次执行状态")
@@ -1183,6 +1132,17 @@ def get_run_status(canvas_id: str):
     if last_run:
         return {"canvas_id": canvas_id, "run": last_run}
     return {"canvas_id": canvas_id, "run": None}
+
+
+@router.get("/agent/stream-snapshot", summary="获取当前画布的流式事件快照（切换画布回放用）")
+def get_stream_snapshot(canvas_id: str, since: int = 0):
+    """返回自 since 起的流式事件。
+
+    前端切换画布会断开 SSE，但后端 worker 仍在执行；切回时先回放这里的事件，
+    可完整恢复计划、思考过程与工具调用记录（只存内存，后端重启后为空）。
+    """
+    snap = deps.chat_sessions.live_snapshot(canvas_id, since)
+    return {"canvas_id": canvas_id, **snap}
 
 
 @router.delete("/agent/history", summary="清空画布对话历史")
@@ -1281,15 +1241,23 @@ def _parse_settings(req: SettingsRequest) -> AppSettings:
     return AppSettings(llm=llm, image=image)
 
 
-@router.get("/experiences", summary="列出风格库（热加载：每次重扫目录）")
-def list_experiences_route():
-    return {"experiences": experiences.list_experiences()}
+@router.get("/experiences", summary="列出提示词库（kind=style 风格 / kind=preset 场景预设）")
+def list_experiences_route(kind: Optional[str] = None):
+    return {"experiences": experiences.list_experiences(kind)}
+
+
+@router.get("/experiences/{exp_id}", summary="读取单条提示词（含正文）")
+def get_experience_route(exp_id: str):
+    item = experiences.read_experience(exp_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="提示词条目不存在")
+    return {"experience": item}
 
 
 @router.post("/experiences", summary="导入风格 MD（立即生效）")
 def add_experience_route(req: ExperienceIn):
     try:
-        item = experiences.add_experience(req.name, req.description, req.content)
+        item = experiences.add_experience(req.name, req.description, req.content, req.kind)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"success": True, "experience": item}
@@ -1452,8 +1420,9 @@ class ModelsQueryRequest(BaseModel):
 
 # 火山方舟未开放 GET /models 列表接口，回退到内置常见模型（模型迭代后可按需增补）
 ARK_FALLBACK_MODELS: dict[str, list[str]] = {
+    # 默认模型取自 PROVIDER_PRESETS["ark"]，避免与预设里的默认值重复维护后漂移
     "llm": [
-        "doubao-seed-2-1-pro-260915",
+        PROVIDER_PRESETS["ark"]["llm_model"],
         "doubao-seed-1-6-250615",
         "doubao-seed-1-6-flash-250715",
         "doubao-seed-1-6-thinking-250615",
@@ -1461,7 +1430,7 @@ ARK_FALLBACK_MODELS: dict[str, list[str]] = {
         "deepseek-r1-250528",
     ],
     "image": [
-        "doubao-seedream-5-0-pro-260628",
+        PROVIDER_PRESETS["ark"]["image_model"],
         "doubao-seedream-5-0-lite-260708",
         "doubao-seedream-4-0-250920",
         "doubao-seededit-3-0-i2i-250628",

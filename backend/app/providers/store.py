@@ -36,6 +36,12 @@ class SettingsStore:
             json.dumps(settings.to_dict(), ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        # API key 明文存盘，尽量收紧文件权限（POSIX 下为 0600，仅当前用户可读写；
+        # Windows 的 chmod 只支持只读位，此处不产生副作用）
+        try:
+            os.chmod(self._path, 0o600)
+        except OSError as e:
+            logger.debug("settings.json 权限收紧失败: %s: %s", self._path.name, e)
 
     def clear(self) -> None:
         self._path.unlink(missing_ok=True)

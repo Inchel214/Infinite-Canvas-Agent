@@ -58,8 +58,14 @@ def _safe_filename(name: str) -> str:
     return (cleaned or "style")[:50]
 
 
-def list_experiences() -> list[dict]:
-    """列出全部风格（热加载：每次重扫目录同步注册表）。"""
+def list_experiences(kind: str | None = None) -> list[dict]:
+    """列出风格/预设条目（热加载：每次重扫目录同步注册表）。
+
+    kind 用于区分同一份提示词库的两种用途：
+    - "style"：风格指南，生图时全文拼接进 prompt
+    - "preset"：场景预设，点击后作为可编辑的指令模板填入输入框
+    为 None 时返回全部。
+    """
     with _lock:
         _ensure_dir()
         reg = _load_registry()
@@ -82,6 +88,7 @@ def list_experiences() -> list[dict]:
                 "name": f.stem,
                 "description": _extract_desc(content),
                 "file": f.name,
+                "kind": "style",
             }
             new_files.append(f.name)
 
@@ -102,11 +109,19 @@ def list_experiences() -> list[dict]:
             logger.debug("[Experiences] 清理已删除风格: %s", removed)
 
         _save_registry(reg)
-        logger.debug("[Experiences] 目录扫描完成 | 风格数=%d", len(reg))
-        return [
-            {"id": k, "name": v["name"], "description": v["description"]}
+        logger.debug("[Experiences] 目录扫描完成 | 条目数=%d", len(reg))
+        items = [
+            {
+                "id": k,
+                "name": v["name"],
+                "description": v["description"],
+                "kind": v.get("kind", "style"),
+            }
             for k, v in reg.items()
         ]
+        if kind:
+            items = [item for item in items if item["kind"] == kind]
+        return items
 
 
 def read_experience(exp_id: str) -> dict | None:
@@ -134,11 +149,12 @@ def read_experience(exp_id: str) -> dict | None:
             "id": exp_id,
             "name": meta["name"],
             "description": meta["description"],
+            "kind": meta.get("kind", "style"),
             "content": content,
         }
 
 
-def add_experience(name: str, description: str, content: str) -> dict:
+def add_experience(name: str, description: str, content: str, kind: str = "style") -> dict:
     """导入新风格：写 MD 文件 + 登记注册表，立即生效"""
     if not name.strip():
         raise ValueError("风格名称不能为空")
@@ -160,10 +176,16 @@ def add_experience(name: str, description: str, content: str) -> dict:
             "name": name.strip(),
             "description": (description or _extract_desc(content)).strip(),
             "file": filename,
+            "kind": kind if kind in ("style", "preset") else "style",
         }
         _save_registry(reg)
-        logger.info("[Experiences] 新增风格《%s》| id=%s | 文件=%s", name.strip(), exp_id, filename)
-        return {"id": exp_id, "name": name.strip(), "description": reg[exp_id]["description"]}
+        logger.info("[Experiences] 新增《%s》| id=%s | 类型=%s | 文件=%s", name.strip(), exp_id, reg[exp_id]["kind"], filename)
+        return {
+            "id": exp_id,
+            "name": name.strip(),
+            "description": reg[exp_id]["description"],
+            "kind": reg[exp_id]["kind"],
+        }
 
 
 def update_experience(exp_id: str, name: str | None = None, description: str | None = None) -> dict | None:

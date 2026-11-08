@@ -231,7 +231,9 @@ const CONTAINER_BASE_W = 320; // 与右侧编辑面板接近的紧凑宽度，�
 const CONTAINER_BASE_H = 480; // 紧凑字号体系下的自然高度；基准须覆盖内容高度，避免拉伸柄错位
 
 // 按比例 + 分辨率档位计算 size 字符串（如 "2048x1152"）
+// 比例为空表示“自动”：返回空串，调用方不传 size，交由模型决定输出比例
 function calcSize(ratioKey: string, res: string): string {
+  if (!ratioKey) return "";
   const ratio = parseRatio(ratioKey);
   const long = res === "1K" ? 1024 : res === "4K" ? 4096 : 2048;
   let w = ratio.w >= ratio.h ? long : Math.round((long * ratio.w) / ratio.h);
@@ -400,7 +402,7 @@ function getConnectionEndpoints(src: BBox, tgt: BBox) {
 type MenuState = {
   x: number;
   y: number;
-  mode: "menu" | "compose" | "variate" | "background";
+  mode: "menu" | "compose" | "background";
 };
 
 // 编辑图片框：独立于右键菜单，可与之并存
@@ -428,6 +430,8 @@ interface CanvasProps {
   onAddToChat?: (nodeIds: string[]) => void;
   // 右侧对话面板展开时占据的宽度（含定位边距前的面板净宽）；用于缩放指示器避让
   chatDockWidth?: number;
+  // 新建画布（由应用层提供，供快捷键调用）
+  onNewCanvas?: () => void;
 }
 
 /**
@@ -436,7 +440,7 @@ interface CanvasProps {
  * 多选：单击/Ctrl+Shift+点选、空白直接拖动框选、右键菜单直接生成
  * 平移：空格+拖动 / Shift+拖动 / 鼠标中键拖动
  */
-export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved, onAction, onCanvasUpdate, onAddToChat, chatDockWidth = 0 }: CanvasProps) {
+export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved, onAction, onCanvasUpdate, onAddToChat, chatDockWidth = 0, onNewCanvas }: CanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   // 相机视角存档：每个画布记住用户上次停留的视角（localStorage），切回/刷新时还原。
   // 否则切画布时组件重挂载、视角重置到世界原点——内容不在原点附近时就表现为"画布空白不显示"
@@ -535,9 +539,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   // 快捷键 Hook：提供快捷键配置和帮助面板支持
   // 注意：实际快捷键逻辑仍保留在原有 useEffect 中（与画布状态紧密耦合）
   // 这里只使用 hook 的配置管理和帮助面板功能
-  const shortcuts = useCanvasShortcuts({
-    enabled: false, // 禁用自动监听，使用原有逻辑
-  });
+  const shortcuts = useCanvasShortcuts();
   const [sizeOverrides, setSizeOverrides] = useState<Record<string, { width: number; height: number }>>(() => {
     try {
       const saved = JSON.parse(localStorage.getItem(sizeStorageKey) ?? "{}");
@@ -576,7 +578,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   const [experiences, setExperiences] = useState<ExperienceMeta[]>([]);
   const [menuStyleIds, setMenuStyleIds] = useState<string[]>([]); // 右键菜单 compose/variate 输入面板多选
   const refreshExperiences = useCallback(() => {
-    listExperiences()
+    listExperiences("style")
       .then((list) => setExperiences(list))
       .catch(() => {
         // 后端不可用时静默忽略（风格下拉退化为"无"）
@@ -607,7 +609,17 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   const [editPanel, setEditPanel] = useState<EditPanelState | null>(null);
   const editPanelRef = useRef<HTMLDivElement>(null);
   // 蒙版编辑器（局部编辑 Inpainting）
-  const [maskEditor, setMaskEditor] = useState<{ nodeId: string; imageUrl: string; width: number; height: number } | null>(null);
+  const [maskEditor, setMaskEditor] = useState<{
+    nodeId: string;
+    imageUrl: string;
+    width: number;
+    height: number;
+    // 由编辑面板带入，进入蒙版时自动回填
+    prompt?: string;
+    aspect?: string;
+    resolution?: string;
+    styleIds?: string[];
+  } | null>(null);
   // 生成中占位框：编辑/变体/组合执行时，在新图将要出现的位置预先画出矩形框，
   // 框内显示"正在编辑图片..."等状态；完成后新图淡入该位置。
   // 数组形式支持多张图同时编辑：每个操作绑定自己的占位框，完成时只移除自己的
@@ -694,7 +706,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
 
   // Esc：关闭激活容器 / 关闭菜单 / 清空选择 / 取消连线
   // Delete/Backspace：删除选中节点
-  // Ctrl+C / Cmd+C：复制选中图片到系统剪贴板（可在文件管理器粘贴为 PNG）
+  // Ctrl+C / Cmd+C：复制选中图片到系统剪贴板（位图格式，可粘贴到微信/飞书/PS 等；
+  // Windows 资源管理器只认文件列表格式，无法据此生成文件，需要保存文件请用「下载 PNG」）
   // 使用 shortcuts.bindings 支持自定义快捷键
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -1578,7 +1591,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   }, [selectedIds]);
 
   // 菜单操作
-  const handleMenuAction = useCallback((mode: "compose" | "variate" | "edit") => {
+  const handleMenuAction = useCallback((mode: "compose" | "edit") => {
     // 编辑图片：打开独立编辑框（带连线），默认回填原提示词，与普通菜单分离
     if (mode === "edit" && selectedIds.size === 1) {
       const node = nodes.find((n) => n.id === [...selectedIds][0]);
@@ -1689,39 +1702,15 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       Promise.resolve(
         onAction({ type: "compose", nodeIds: ids, prompt, size, x: box.x, y: box.y, experienceIds: menuStyleIds.length ? menuStyleIds : undefined })
       ).finally(() => removeProcessingBox(boxId));
-    } else if (menu.mode === "variate" && ids.length === 1) {
-      recordExperienceUsage(menuStyleIds);
-      setMenu(null);
-      setPromptInput("");
-      const sname = styleNamesByIds(menuStyleIds);
-      const jobs = Array.from({ length: variantCount }, (_, i) => {
-        const position = { ...box, x: box.x + i * (box.w + 40) };
-        return { position, boxId: addProcessingBox(position, `${sname ? `《${sname}》` : ""}变体 ${i + 1}/${variantCount} · 等待生成`) };
-      });
-      // 逐张提交，每张独立落图；其中一张失败不会阻止后续任务。
-      void (async () => {
-        let succeeded = 0;
-        for (const job of jobs) {
-          setProcessingBoxes((prev) => prev.map((item) => item.id === job.boxId
-            ? { ...item, label: item.label.replace("等待生成", "正在生成…") } : item));
-          try {
-            const ok = await onAction({ type: "variate", nodeId: ids[0], prompt, size,
-              x: job.position.x, y: job.position.y, experienceIds: menuStyleIds.length ? menuStyleIds : undefined });
-            if (ok) succeeded++;
-          } catch { /* 单张失败后继续后续任务，最终汇总结果。 */ }
-          finally { removeProcessingBox(job.boxId); }
-        }
-        setLocalStatusMsg(`变体生成完成：${succeeded}/${variantCount} 张${succeeded < variantCount ? "，失败项可重新生成" : ""}`);
-      })();
     }
-  }, [onAction, menu, selectedIds, nodes, promptInput, aspect, resolution, variantCount, buildProcessingBox, menuStyleIds, styleNamesByIds, addProcessingBox, removeProcessingBox]);
+  }, [onAction, menu, selectedIds, nodes, promptInput, aspect, resolution, buildProcessingBox, menuStyleIds, styleNamesByIds, addProcessingBox, removeProcessingBox]);
 
-  // 编辑框执行：图1始终是编辑底图；追加参考图时按当前顺序走多图组合能力。
-  // 点生成 → 面板关闭 → 在新图位置（原图右侧）画占位框显示"正在编辑图片..."
+  // 编辑框执行：图1始终是底图；追加参考图时按当前顺序走多图组合能力。
+  // 单图按“生成数量”提交 N 次图生图（留空提示词由后端兜底为默认变体描述），
+  // 因此“变体”不再需要独立入口，只是数量 > 1 的一种用法。
   const handleEditPanelExecute = useCallback(() => {
     if (!onAction || !editPanel) return;
     const prompt = editPanel.prompt.trim();
-    if (!prompt) return;
     const size = calcSize(editPanel.aspect, editPanel.resolution);
     const refNodes = editPanel.refIds
       .map((id) => nodes.find((n) => n.id === id))
@@ -1732,25 +1721,59 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     const expIds = editPanel.experienceIds;
     recordExperienceUsage(expIds);
     setEditPanel(null);
-    const boxId = addProcessingBox(
-      box,
-      sname
-        ? `正在按《${sname}》编辑图片...`
-        : refNodes.length > 1
-          ? `正在参考 ${refNodes.length} 张图片编辑...`
-          : "正在编辑图片...",
-    );
-    const action: CanvasAction = refNodes.length > 1
-      ? { type: "compose", nodeIds: refNodes.map((node) => node.id), prompt, size, x: box.x, y: box.y, experienceIds: expIds?.length ? expIds : undefined }
-      : { type: "edit", nodeId: refNodes[0].id, prompt, size, x: box.x, y: box.y, experienceIds: expIds?.length ? expIds : undefined };
-    Promise.resolve(onAction(action)).finally(() => removeProcessingBox(boxId));
-  }, [onAction, editPanel, nodes, buildProcessingBox, styleNamesByIds, addProcessingBox, removeProcessingBox]);
+
+    // 多图：组合为一张新图（数量不适用）
+    if (refNodes.length > 1) {
+      const boxId = addProcessingBox(
+        box,
+        sname ? `正在按《${sname}》组合...` : `正在组合 ${refNodes.length} 张图片...`,
+      );
+      Promise.resolve(onAction({
+        type: "compose",
+        nodeIds: refNodes.map((node) => node.id),
+        prompt, size, x: box.x, y: box.y,
+        experienceIds: expIds?.length ? expIds : undefined,
+      })).finally(() => removeProcessingBox(boxId));
+      return;
+    }
+
+    // 单图：按数量并行提交，单张失败不影响其它张
+    const count = Math.min(4, Math.max(1, variantCount));
+    const nodeId = refNodes[0].id;
+    const jobs = Array.from({ length: count }, (_, i) => {
+      const position = { ...box, x: box.x + i * (box.w + 40) };
+      const label = count > 1
+        ? `${sname ? `《${sname}》` : ""}修改 ${i + 1}/${count} · 等待生成`
+        : `${sname ? `《${sname}》` : ""}正在修改图片...`;
+      return { position, boxId: addProcessingBox(position, label) };
+    });
+    void (async () => {
+      let succeeded = 0;
+      await Promise.all(jobs.map(async (job) => {
+        setProcessingBoxes((prev) => prev.map((item) => item.id === job.boxId
+          ? { ...item, label: item.label.replace("等待生成", "正在生成…") } : item));
+        try {
+          const ok = await onAction({
+            type: "variate", nodeId, prompt, size,
+            x: job.position.x, y: job.position.y,
+            experienceIds: expIds?.length ? expIds : undefined,
+          });
+          if (ok) succeeded++;
+        } catch { /* 单张失败后继续后续任务，最终汇总结果。 */ }
+        finally { removeProcessingBox(job.boxId); }
+      }));
+      if (count > 1) {
+        setLocalStatusMsg(`修改完成：${succeeded}/${count} 张${succeeded < count ? "，失败项可重新生成" : ""}`);
+      }
+    })();
+  }, [onAction, editPanel, nodes, buildProcessingBox, styleNamesByIds, addProcessingBox, removeProcessingBox, variantCount]);
 
   // 蒙版编辑器确认：执行局部编辑（Inpainting）
   const handleMaskEditorConfirm = useCallback(
     (mask: string, prompt: string, size: string, experienceIds?: string[]) => {
       if (!onAction || !maskEditor) return;
-      if (!prompt.trim()) return;
+      // 留空提示词时给默认描述，避免后端收到空 prompt
+      const finalPrompt = prompt.trim() || "按蒙版区域重新生成，保持周围内容一致";
       const node = nodes.find((n) => n.id === maskEditor.nodeId);
       if (!node) return;
       const box = buildProcessingBox(
@@ -1762,7 +1785,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       const action: CanvasAction = {
         type: "edit",
         nodeId: node.id,
-        prompt: prompt.trim(),
+        prompt: finalPrompt,
         size,
         x: box.x,
         y: box.y,
@@ -1946,6 +1969,64 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     e.preventDefault();
     setMenu({ x: e.clientX, y: e.clientY, mode: "background" });
   }, []);
+
+  // 操作类快捷键（默认不绑定）：全选 / 局部编辑 / 编辑图片 / 下载 / 新建画布
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.isComposing || e.keyCode === 229) return;
+      // 蒙版编辑器打开时按键由编辑器自身处理
+      if (maskEditor) return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+
+      if (matchesShortcut(e, shortcuts.bindings.selectAll)) {
+        e.preventDefault();
+        setSelectedIds(new Set(nodes.map((n) => n.id)));
+        return;
+      }
+
+      const single = selectedIds.size === 1 ? nodes.find((n) => n.id === [...selectedIds][0]) : undefined;
+
+      if (matchesShortcut(e, shortcuts.bindings.openInpaint) && single?.image_url) {
+        e.preventDefault();
+        setMaskEditor({
+          nodeId: single.id,
+          imageUrl: single.image_url,
+          width: single.width,
+          height: single.height,
+        });
+        setEditPanel(null);
+        return;
+      }
+
+      if (matchesShortcut(e, shortcuts.bindings.openEdit) && single?.image_url) {
+        e.preventDefault();
+        handleMenuAction("edit");
+        return;
+      }
+
+      if (matchesShortcut(e, shortcuts.bindings.downloadImage) && single?.image_url) {
+        e.preventDefault();
+        void handleSaveImage();
+        return;
+      }
+
+      if (matchesShortcut(e, shortcuts.bindings.newCanvas)) {
+        e.preventDefault();
+        onNewCanvas?.();
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [
+    maskEditor,
+    nodes,
+    selectedIds,
+    shortcuts.bindings,
+    handleMenuAction,
+    handleSaveImage,
+    onNewCanvas,
+  ]);
 
   // 菜单点击「新建图片容器」：在右键位置（转世界坐标）居中创建
   const handleCreateContainer = useCallback(() => {
@@ -2599,26 +2680,11 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
           styleIds={menuStyleIds}
           onStyleChange={setMenuStyleIds}
           onMenuAction={handleMenuAction}
-          onInpaint={() => {
-            const nodeId = [...selectedIds][0];
-            const node = nodes.find((n) => n.id === nodeId);
-            if (node && node.image_url) {
-              setMaskEditor({
-                nodeId: node.id,
-                imageUrl: node.image_url,
-                width: node.width,
-                height: node.height,
-              });
-              setMenu(null);
-            }
-          }}
           onExecute={handleExecute}
           onDelete={handleDelete}
           onCopyImage={handleCopyImage}
           onSaveImage={handleSaveImage}
           onRevealImage={handleRevealImage}
-          variantCount={variantCount}
-          onVariantCountChange={setVariantCount}
           onCreateText={() => {
             if (!menu) return;
             const position = screenToWorld(menu.x, menu.y);
@@ -2698,7 +2764,25 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
           experiences={experiences}
           styleIds={editPanel.experienceIds ?? []}
           onStyleChange={(v) => setEditPanel((p) => (p ? { ...p, experienceIds: v.length ? v : undefined } : p))}
+          variantCount={variantCount}
+          onVariantCountChange={setVariantCount}
           onExecute={handleEditPanelExecute}
+          onInpaint={() => {
+            const baseNode = nodes.find((n) => n.id === editPanel.refIds[0]);
+            if (!baseNode?.image_url) return;
+            // 携带面板已填的提示词/比例/风格进入蒙版，避免重复填写
+            setMaskEditor({
+              nodeId: baseNode.id,
+              imageUrl: baseNode.image_url,
+              width: baseNode.width,
+              height: baseNode.height,
+              prompt: editPanel.prompt,
+              aspect: editPanel.aspect,
+              resolution: editPanel.resolution,
+              styleIds: editPanel.experienceIds,
+            });
+            setEditPanel(null);
+          }}
           onClose={() => setEditPanel(null)}
           onMove={(nx, ny) => setEditPanel((p) => (p ? { ...p, x: nx, y: ny } : p))}
           onRect={setEditPanelRect}
@@ -2747,6 +2831,14 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
           width={maskEditor.width}
           height={maskEditor.height}
           experiences={experiences}
+          initialPrompt={maskEditor.prompt}
+          initialAspect={maskEditor.aspect}
+          initialResolution={maskEditor.resolution}
+          initialStyleIds={maskEditor.styleIds}
+          shortcutBindings={shortcuts.editorBindings}
+          conflicts={shortcuts.editorConflicts}
+          onUpdateShortcut={shortcuts.updateEditorShortcut}
+          onResetShortcuts={shortcuts.resetShortcuts}
           onConfirm={handleMaskEditorConfirm}
           onCancel={() => setMaskEditor(null)}
         />,
@@ -2932,10 +3024,14 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       {showHelp && (
         <ShortcutHelpPanel
           bindings={shortcuts.bindings}
+          editorBindings={shortcuts.editorBindings}
           conflicts={shortcuts.conflicts}
+          editorConflicts={shortcuts.editorConflicts}
           isRecording={shortcuts.isRecording}
           recordingAction={shortcuts.recordingAction}
+          recordingScope={shortcuts.recordingScope}
           onStartRecording={shortcuts.startRecording}
+          onStartEditorRecording={shortcuts.startEditorRecording}
           onStopRecording={shortcuts.stopRecording}
           onReset={shortcuts.resetShortcuts}
           onClose={() => setShowHelp(false)}
@@ -3205,14 +3301,17 @@ function AspectRatioButtons({
   const confirmCustom = () => {
     const w = parseInt(customW);
     const h = parseInt(customH);
-    if (w > 0 && h > 0) {
-      // 简化 GCD
-      const gcd = (a: number, b: number): number => (b === 0 ? a : gcd(b, a % b));
-      const g = gcd(w, h) || 1;
-      const key = `${w / g}:${h / g}`;
-      onAspectChange(key);
+    if (!(w > 0 && h > 0)) {
+      // 没填比例：交给模型自行决定宽高比（不传 size）
+      onAspectChange("");
       setCustomMode(false);
+      return;
     }
+    // 简化 GCD
+    const gcd = (a: number, b: number): number => (b === 0 ? a : gcd(b, a % b));
+    const g = gcd(w, h) || 1;
+    onAspectChange(`${w / g}:${h / g}`);
+    setCustomMode(false);
   };
 
   // 自定义输入框（小号，inline）
@@ -3289,9 +3388,9 @@ function AspectRatioButtons({
               }
               setCustomMode(true);
             }}
-            style={btnStyle(isCustom)}
+            style={btnStyle(isCustom || aspect === "")}
           >
-            {isCustom ? aspect : "自定义"}
+            {isCustom ? aspect : aspect === "" ? "自动" : "自定义"}
           </button>
         )}
       </div>
@@ -3320,7 +3419,6 @@ const ContextMenu = ({
   styleIds,
   onStyleChange,
   onMenuAction,
-  onInpaint,
   onExecute,
   onDelete,
   onCopyImage,
@@ -3328,8 +3426,6 @@ const ContextMenu = ({
   onRevealImage,
   onCreateContainer,
   onCreateText,
-  variantCount,
-  onVariantCountChange,
   onAddToChat,
   onCollect,
   onClose,
@@ -3337,7 +3433,7 @@ const ContextMenu = ({
   ref: React.RefObject<HTMLDivElement | null>;
   x: number;
   y: number;
-  mode: "menu" | "compose" | "variate" | "background";
+  mode: "menu" | "compose" | "background";
   selectedCount: number;
   selectedImageCount: number;
   selectedNodeContent: string;
@@ -3350,8 +3446,7 @@ const ContextMenu = ({
   experiences: ExperienceMeta[];
   styleIds: string[];
   onStyleChange: (v: string[]) => void;
-  onMenuAction: (mode: "compose" | "variate" | "edit") => void;
-  onInpaint: () => void;
+  onMenuAction: (mode: "compose" | "edit") => void;
   onExecute: () => void;
   onDelete: () => void;
   onCopyImage: () => void;
@@ -3359,8 +3454,6 @@ const ContextMenu = ({
   onRevealImage: () => void;
   onCreateContainer: () => void;
   onCreateText: () => void;
-  variantCount: number;
-  onVariantCountChange: (count: number) => void;
   onAddToChat: () => void;
   onCollect: () => void;
   onClose: () => void;
@@ -3418,8 +3511,8 @@ const ContextMenu = ({
   // 输入框模式（组合 / 变体）
   const inputPlaceholder =
     mode === "compose"
-      ? "组合描述，留空直接生成"
-      : "变体描述，留空直接生成";
+      ? "留空直接生成"
+      : "留空用默认提示词，同一提示词结果每次不同，填描述控制变体方向";
 
   return (
     <div
@@ -3576,22 +3669,9 @@ const ContextMenu = ({
           </div>
           {selectedCount === 1 && (
             <>
-              <div style={itemStyle} onMouseEnter={hoverBg} onMouseLeave={hoverOut} onClick={() => onMenuAction("variate")}>
-                <span>🎨 生成变体</span>
-                <span style={{ fontSize: 11, color: "rgba(255,255,255,0.35)" }}>图生图</span>
-              </div>
               <div style={itemStyle} onMouseEnter={hoverBg} onMouseLeave={hoverOut} onClick={() => onMenuAction("edit")}>
-                <span>✏️ 编辑图片</span>
-                <span style={{ fontSize: 11, color: "rgba(255,255,255,0.35)" }}>全图重绘</span>
-              </div>
-              <div
-                style={itemStyle}
-                onMouseEnter={hoverBg}
-                onMouseLeave={hoverOut}
-                onClick={onInpaint}
-              >
-                <span>🖌️ 局部编辑</span>
-                <span style={{ fontSize: 11, color: "rgba(255,255,255,0.35)" }}>蒙版修改</span>
+                <span>🪄 修改图片</span>
+                <span style={{ fontSize: 11, color: "rgba(255,255,255,0.35)" }}>指令 / 变体 / 局部</span>
               </div>
               <div style={itemStyle} onMouseEnter={hoverBg} onMouseLeave={hoverOut} onClick={onCopyImage}>
                 <span>📋 复制图片</span>
@@ -3682,7 +3762,6 @@ const ContextMenu = ({
             </div>
           </div>
 
-          {mode === "variate" && <QuantitySelect value={variantCount} onChange={onVariantCountChange} />}
           {/* 风格选择（风格库为空时隐藏） */}
           <StyleSelect experiences={experiences} value={styleIds} onChange={onStyleChange} />
 
@@ -3700,7 +3779,7 @@ const ContextMenu = ({
                 cursor: "pointer",
               }}
             >
-              {mode === "variate" ? `生成 ${variantCount} 张` : "执行"}
+              执行
             </button>
             <button
               onClick={onClose}
@@ -3792,7 +3871,10 @@ const EditPanel = ({
   experiences,
   styleIds,
   onStyleChange,
+  onVariantCountChange,
+  variantCount,
   onExecute,
+  onInpaint,
   onClose,
   onMove,
   onRect,
@@ -3813,7 +3895,10 @@ const EditPanel = ({
   experiences: ExperienceMeta[];
   styleIds: string[];
   onStyleChange: (v: string[]) => void;
+  variantCount: number;
+  onVariantCountChange: (count: number) => void;
   onExecute: () => void;
+  onInpaint: () => void;
   onClose: () => void;
   onMove: (x: number, y: number) => void;
   onRect: (rect: { x: number; y: number; w: number; h: number }) => void;
@@ -3954,7 +4039,7 @@ const EditPanel = ({
     return () => ro.disconnect();
   }, [left, top, panelW, panelH, onRect, ref]);
 
-  const canExecute = prompt.trim().length > 0;
+  const canExecute = refNodes.length > 0;
 
   const finishReferenceDrag = (e: React.PointerEvent<HTMLElement>) => {
     const drag = referenceDragRef.current;
@@ -4283,7 +4368,7 @@ const EditPanel = ({
         <ImageMentionPrompt
           value={prompt}
           refNodes={refNodes}
-          placeholder="编辑描述（必填），输入 @ 可引用图片"
+          placeholder={refNodes.length > 1 ? "组合描述，留空直接生成" : "修改描述，留空按原图生成新变体"}
           onChange={onPromptChange}
           onGenerate={() => {
             if (canExecute) onExecute();
@@ -4295,11 +4380,11 @@ const EditPanel = ({
 
         {/* 尺寸选择：宽高比 + 分辨率 */}
         <div style={{ marginTop: 10 }}>
-          <div style={{ fontSize: 11, color: "rgba(255,255,255,0.4)", marginBottom: 5 }}>
+          <div style={{ fontSize: 11, color: "rgba(255,255,255,0.62)", marginBottom: 5 }}>
             宽高比
           </div>
           <AspectRatioButtons aspect={aspect} onAspectChange={onAspectChange} variant="edit" />
-          <div style={{ fontSize: 11, color: "rgba(255,255,255,0.4)", margin: "8px 0 5px" }}>
+          <div style={{ fontSize: 11, color: "rgba(255,255,255,0.62)", margin: "8px 0 5px" }}>
             分辨率
           </div>
           <div style={{ display: "flex", gap: 4 }}>
@@ -4327,7 +4412,33 @@ const EditPanel = ({
         {/* 风格选择（风格库为空时隐藏） */}
         <StyleSelect experiences={experiences} value={styleIds} onChange={onStyleChange} />
 
-        <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+        {/* 生成数量：单图修改可用；多图组合固定 1 张（标题由 QuantitySelect 自带） */}
+        {refNodes.length <= 1 && (
+          <QuantitySelect value={variantCount} onChange={onVariantCountChange} />
+        )}
+
+        {/* 局部编辑入口：进入蒙版涂抹，与全图编辑共用同一套提示词/比例/风格 */}
+        <button
+          onClick={onInpaint}
+          disabled={!refNodes[0]?.image_url}
+          title="涂抹要修改的区域，不涂抹则按整图修改；仅作用于底图"
+          style={{
+            width: "100%",
+            marginTop: 10,
+            padding: "7px 0",
+            background: "rgba(255,255,255,0.08)",
+            color: "rgba(255,255,255,0.75)",
+            border: "1px solid rgba(255,255,255,0.12)",
+            borderRadius: 6,
+            fontSize: 12,
+            cursor: refNodes[0]?.image_url ? "pointer" : "not-allowed",
+            opacity: refNodes[0]?.image_url ? 1 : 0.4,
+          }}
+        >
+          🖌️ 涂抹区域，只改局部
+        </button>
+
+        <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
           <button
             onClick={onExecute}
             disabled={!canExecute}
@@ -4342,7 +4453,7 @@ const EditPanel = ({
               cursor: canExecute ? "pointer" : "not-allowed",
             }}
           >
-            执行
+            {refNodes.length <= 1 && variantCount > 1 ? `生成 ${variantCount} 张` : "执行"}
           </button>
           <button
             onClick={onClose}
@@ -5664,7 +5775,7 @@ function PendingContainerNode({
                 fontVariantNumeric: "tabular-nums",
               }}
             >
-              {calcSize(container.aspect, container.resolution)}
+              {calcSize(container.aspect, container.resolution) || "自动"}
             </span>
           </div>
         </div>
@@ -5844,7 +5955,7 @@ function PendingContainerNode({
 
 function QuantitySelect({ value, onChange }: { value: number; onChange: (count: number) => void }) {
   return <div style={{ marginTop: 8 }}>
-    <div style={{ fontSize: 11, color: "#aaa5bf", marginBottom: 5 }}>生成数量</div>
+    <div style={{ fontSize: 11, color: "rgba(255,255,255,0.62)", marginBottom: 5 }}>生成数量</div>
     <div style={{ display: "flex", gap: 4 }}>
       {[1, 2, 3, 4].map((count) => <button type="button" key={count} aria-pressed={value === count}
         onClick={() => onChange(count)} style={{ flex: 1, padding: "5px 0", border: 0, borderRadius: 5,

@@ -28,6 +28,9 @@ _MAX_CONTEXT_MESSAGES = 20
 # 每画布保留的执行记录条数（超出丢弃最早）
 _MAX_RUNS = 50
 
+# 可整段合并的流式增量事件：连续同类增量合并成一条，避免逐 token 存事件
+_COALESCE_TYPES = ("delta", "reasoning_delta", "plan_delta")
+
 
 def format_failure_note(run: dict | None) -> str | None:
     """把最近一条未完成的执行记录压缩成上下文提示，供 Agent 精确重放。
@@ -83,6 +86,10 @@ class ChatSessionStore:
         self._sessions: dict[str, list[dict]] = {}
         # canvas_id -> 执行记录（每轮一条：状态/计划/工具参数），与 messages 同文件
         self._runs: dict[str, list[dict]] = {}
+        # canvas_id -> 当前/最近一轮的流式事件缓冲（仅内存）。
+        # 前端切换画布会断开 SSE，靠这份缓冲回放"计划/思考/工具过程"，
+        # 否则这些内容只存在于前端内存，切回后必然丢失。
+        self._live: dict[str, dict] = {}
         # 全局锁：Agent worker 线程与 SSE 线程并发读写同一 canvas 的消息/步骤时，
         # 不加锁会出现消息丢失或 run 步骤错乱。RLock 允许同线程内 _ensure_loaded→_save 重入。
         self._lock = threading.RLock()
@@ -123,31 +130,102 @@ class ChatSessionStore:
             total = len(msgs)
             if total > _MAX_CONTEXT_MESSAGES:
                 msgs = msgs[-_MAX_CONTEXT_MESSAGES:]
+            # 只回注 role/content：round_id/pre_canvas/steered_run_id 是前端渲染与
+            # 回退用的元数据，混进上下文会污染提示词甚至被严格校验的接口拒绝
+            ctx = [
+                {"role": m.get("role"), "content": m.get("content", "")}
+                for m in msgs
+            ]
             logger.debug(
                 "[Session] 上下文注入 canvas=%s | 总历史=%d条 | 注入=%d条",
-                canvas_id, total, len(msgs),
+                canvas_id, total, len(ctx),
             )
-            return msgs
+            return ctx
 
-    def append_user_message(self, canvas_id: str, user_message: str) -> None:
-        """立即保存用户消息（发送时调用，确保切换画布后历史不丢失）"""
+    def append_user_message(
+        self,
+        canvas_id: str,
+        user_message: str,
+        round_id: str | None = None,
+        pre_canvas: dict | None = None,
+    ) -> None:
+        """立即保存用户消息（发送时调用，确保切换画布后历史不丢失）。
+
+        round_id + pre_canvas 供"整轮回退"：本轮开始前的画布快照随消息落盘，
+        即使后端重启（内存 undo 栈丢失）也能回到本轮之前的状态。
+        """
         with self._lock:
             msgs = self._messages_internal(canvas_id)
-            msgs.append({"role": "user", "content": user_message})
+            record: dict = {"role": "user", "content": user_message}
+            if round_id:
+                record["round_id"] = round_id
+                if pre_canvas is not None:
+                    record["pre_canvas"] = pre_canvas
+            msgs.append(record)
             # 超限丢弃最早的消息
             if len(msgs) > _MAX_MESSAGES:
                 del msgs[: len(msgs) - _MAX_MESSAGES]
             logger.debug(
-                "[Session] 保存用户消息 canvas=%s | 当前=%d条 | user=%s",
-                canvas_id, len(msgs), user_message[:60].replace("\n", " "),
+                "[Session] 保存用户消息 canvas=%s | 当前=%d条 | round=%s | user=%s",
+                canvas_id, len(msgs), round_id, user_message[:60].replace("\n", " "),
             )
             self._save(canvas_id)
 
-    def append_assistant_message(self, canvas_id: str, assistant_message: str) -> None:
-        """保存助手回复（worker 完成后调用）"""
+    def get_round_pre_canvas(self, canvas_id: str, round_id: str) -> dict | None:
+        """按 round_id 取该轮开始前的画布快照（整轮回退的后备依据）"""
         with self._lock:
             msgs = self._messages_internal(canvas_id)
-            msgs.append({"role": "assistant", "content": assistant_message})
+            for msg in reversed(msgs):
+                if msg.get("role") == "user" and msg.get("round_id") == round_id:
+                    pre = msg.get("pre_canvas")
+                    return copy.deepcopy(pre) if pre else None
+            return None
+
+    def delete_round_from(self, canvas_id: str, round_id: str) -> bool:
+        """撤回该轮：截断对话历史中该用户消息及其之后的所有消息与执行记录。
+
+        与画布回退语义保持一致（回到本轮开始前的状态），因此被撤回轮次之后
+        的对话也一并丢弃；前端随后把该条输入放回编辑框供修改后重发。
+        """
+        with self._lock:
+            msgs = self._messages_internal(canvas_id)
+            cut_at = next(
+                (
+                    i
+                    for i, m in enumerate(msgs)
+                    if m.get("role") == "user" and m.get("round_id") == round_id
+                ),
+                None,
+            )
+            if cut_at is None:
+                return False
+            dropped = msgs[cut_at:]
+            # 被截断消息关联的 run（含 steering 注入产生的 run 标记）
+            run_ids = {m.get("run_id") for m in dropped if m.get("run_id")}
+            run_ids |= {m.get("steered_run_id") for m in dropped if m.get("steered_run_id")}
+            del msgs[cut_at:]
+            runs = self._runs.get(canvas_id)
+            if runs:
+                first = next(
+                    (i for i, r in enumerate(runs) if r.get("id") in run_ids), None
+                )
+                if first is not None:
+                    del runs[first:]
+            logger.debug(
+                "[Session] 撤回轮次 canvas=%s | round=%s | 移除消息=%d条 | 剩余=%d条",
+                canvas_id, round_id, len(dropped), len(msgs),
+            )
+            self._save(canvas_id)
+            return True
+
+    def append_assistant_message(self, canvas_id: str, assistant_message: str, run_id: str | None = None) -> None:
+        """保存助手回复（worker 完成后调用）；run_id 用于前端历史重建时关联 run 的 timeline"""
+        with self._lock:
+            msgs = self._messages_internal(canvas_id)
+            record = {"role": "assistant", "content": assistant_message}
+            if run_id:
+                record["run_id"] = run_id
+            msgs.append(record)
             # 超限丢弃最早的消息
             if len(msgs) > _MAX_MESSAGES:
                 del msgs[: len(msgs) - _MAX_MESSAGES]
@@ -201,6 +279,8 @@ class ChatSessionStore:
                 "status": "in_progress",
                 "plan": "",
                 "steps": [],
+                # 有序时间线段（plan/text/tool/user），供前端按时间线完整还原执行过程
+                "timeline": [],
                 "message": "",
                 "error": None,
             }
@@ -222,6 +302,42 @@ class ChatSessionStore:
                     break
             self._save(canvas_id)
 
+    def append_timeline_segment(self, canvas_id: str, run_id: str, segment: dict) -> None:
+        """追加一个时间线段到 run 记录并立即落盘（实时持久化）。
+
+        段类型：plan / text / tool / user，按发生顺序追加，
+        前端据此把执行过程按时间线还原（工具卡片穿插在文本流中）。
+        """
+        with self._lock:
+            self._ensure_loaded(canvas_id)
+            runs = self._runs.get(canvas_id) or []
+            for run in runs:
+                if run.get("id") == run_id:
+                    run.setdefault("timeline", []).append(segment)
+                    break
+            self._save(canvas_id)
+
+    def mark_user_steered(self, canvas_id: str, content: str, run_id: str) -> None:
+        """给最后一条内容匹配的 user 消息打 steered_run_id 标记。
+
+        steering 消息在请求到达时已持久化为独立 user 消息；
+        被注入 run 后打上标记，前端历史渲染跳过其独立气泡，
+        改由该 run 的 timeline 中的 user 锚点渲染。
+        """
+        with self._lock:
+            msgs = self._messages_internal(canvas_id)
+            for msg in reversed(msgs):
+                if msg.get("role") == "user" and msg.get("content") == content:
+                    msg["steered_run_id"] = run_id
+                    break
+            self._save(canvas_id)
+
+    def get_runs(self, canvas_id: str) -> list[dict]:
+        """全量执行记录（前端历史时间线还原用），返回副本"""
+        with self._lock:
+            self._ensure_loaded(canvas_id)
+            return copy.deepcopy(self._runs.get(canvas_id, []))
+
     def append_step(self, canvas_id: str, run_id: str, step: dict) -> None:
         """追加一个工具步骤到 run 记录并立即落盘（实时持久化）"""
         with self._lock:
@@ -238,7 +354,8 @@ class ChatSessionStore:
             )
 
     def finish_run(self, canvas_id: str, run_id: str, status: str, message: str = "", error: str | None = None) -> None:
-        """完成 run 记录，更新状态为 done/failed/stopped"""
+        """完成 run 记录，更新状态为 done/failed/stopped；
+        最终回复作为末尾 text 段补进 timeline（前端历史还原的收尾气泡）"""
         with self._lock:
             self._ensure_loaded(canvas_id)
             runs = self._runs.get(canvas_id) or []
@@ -248,6 +365,15 @@ class ChatSessionStore:
                     run["message"] = message
                     if error:
                         run["error"] = error
+                    if message:
+                        timeline = run.setdefault("timeline", [])
+                        # 末尾已有相同文本段时不重复（如 stopped 前刚好 flush 过）
+                        if not (
+                            timeline
+                            and timeline[-1].get("kind") == "text"
+                            and timeline[-1].get("text") == message
+                        ):
+                            timeline.append({"kind": "text", "text": message})
                     break
             self._save(canvas_id)
             logger.debug("[Session] 完成执行 canvas=%s run_id=%s status=%s", canvas_id, run_id, status)
@@ -259,11 +385,64 @@ class ChatSessionStore:
             runs = self._runs.get(canvas_id) or []
             return copy.deepcopy(runs[-1]) if runs else None
 
+    # ---------- 流式事件缓冲（切换画布回放用） ----------
+
+    def begin_live(self, canvas_id: str) -> None:
+        """新一轮执行开始：重置该画布的流式事件缓冲"""
+        with self._lock:
+            self._live[canvas_id] = {"events": [], "finished": False}
+            logger.debug("[Live] 开始缓冲流式事件 canvas=%s", canvas_id)
+
+    def append_live_event(self, canvas_id: str, evt: dict) -> None:
+        """记录一个流式事件。
+
+        连续的同类文本增量合并为一条，因此缓冲长度约等于"轮数×3"，
+        不会因 token 级事件而无限增长。
+        """
+        with self._lock:
+            live = self._live.get(canvas_id)
+            if live is None:
+                live = {"events": [], "finished": False}
+                self._live[canvas_id] = live
+            events: list[dict] = live["events"]
+            etype = evt.get("type")
+            if (
+                etype in _COALESCE_TYPES
+                and events
+                and events[-1].get("type") == etype
+            ):
+                prev = events[-1]
+                prev["content"] = (prev.get("content") or "") + (evt.get("content") or "")
+            else:
+                events.append(dict(evt))
+
+    def finish_live(self, canvas_id: str) -> None:
+        """标记缓冲已结束（前端轮询据此停止）"""
+        with self._lock:
+            live = self._live.get(canvas_id)
+            if live is not None:
+                live["finished"] = True
+
+    def live_snapshot(self, canvas_id: str, since: int = 0) -> dict:
+        """返回自 since 起的流式事件（含 cursor/finished），供前端回放/增量拉取"""
+        with self._lock:
+            live = self._live.get(canvas_id)
+            if not live:
+                return {"events": [], "cursor": 0, "finished": True}
+            events = live["events"]
+            start = max(0, min(since, len(events)))
+            return {
+                "events": copy.deepcopy(events[start:]),
+                "cursor": len(events),
+                "finished": live["finished"],
+            }
+
     def clear(self, canvas_id: str) -> None:
         """清空对话历史与执行记录（内存 + 磁盘）"""
         with self._lock:
             self._sessions[canvas_id] = []
             self._runs[canvas_id] = []
+            self._live.pop(canvas_id, None)
             self._save(canvas_id)
 
     def delete(self, canvas_id: str) -> None:
@@ -271,6 +450,7 @@ class ChatSessionStore:
         with self._lock:
             self._sessions.pop(canvas_id, None)
             self._runs.pop(canvas_id, None)
+            self._live.pop(canvas_id, None)
             try:
                 self._path(canvas_id).unlink(missing_ok=True)
             except OSError as e:
@@ -298,5 +478,6 @@ class ChatSessionStore:
             logger.warning("对话历史落盘失败（仅保留内存版）: %s: %s", path.name, e)
             try:
                 tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
+            except OSError as cleanup_err:
+                # 临时文件清理失败不影响主流程，但保留痕迹便于排查磁盘问题
+                logger.debug("对话历史临时文件清理失败: %s: %s", tmp.name, cleanup_err)

@@ -386,6 +386,9 @@ function App() {
         }}
         onAction={handleAction}
         onCanvasUpdate={applyCanvasState}
+        onNewCanvas={() => {
+          void createNewCanvas();
+        }}
         onAddToChat={(ids) => {
           // 去重追加引用，并弹出对话面板让用户直接输入指令
           setChatRefIds((prev) => [...new Set([...prev, ...ids])]);

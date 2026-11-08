@@ -4,6 +4,7 @@ LLM / 图片生成器由 ProviderManager 统一管理：
 配置优先级为 前端用户设置 > .env 环境变量 > Mock 降级，
 更新配置（PUT /api/settings）后热切换生效，无需重启。
 """
+from app.agent.dispatcher import CanvasDispatcher
 from app.agent.react_loop import ReActAgent, RunControl
 from app.agent.sessions import ChatSessionStore
 from app.canvas.store import FileStore
@@ -56,3 +57,6 @@ agent = ReActAgent(
     control=control,
     chat_sessions=chat_sessions,  # 工具步骤实时持久化
 )
+
+# 每画布请求调度器：串行执行 + 排队 + 工具边界 steering 注入
+dispatcher = CanvasDispatcher(agent, chat_sessions)

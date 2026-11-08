@@ -1,6 +1,6 @@
 // 画布相关常量
 
-import type { ShortcutConfig } from "./types";
+import type { ShortcutConfig, EditorShortcutConfig } from "./types";
 
 // 宽高比预设（长边 = 分辨率档位）
 export const ASPECT_RATIOS = [
@@ -85,6 +85,96 @@ export const DEFAULT_SHORTCUTS: ShortcutConfig = {
     modifiers: { ctrl: true },
     description: "全选",
     category: "selection",
+    editable: true,
+  },
+  // 以下为「操作类」动作：默认不绑定按键，由用户按需设置，避免升级时抢占已有键位
+  openInpaint: {
+    key: "",
+    description: "局部编辑（选中单张图片）",
+    category: "generation",
+    editable: true,
+  },
+  openEdit: {
+    key: "",
+    description: "编辑图片（选中单张图片）",
+    category: "edit",
+    editable: true,
+  },
+  downloadImage: {
+    key: "",
+    description: "下载选中图片",
+    category: "edit",
+    editable: true,
+  },
+  newCanvas: {
+    key: "",
+    description: "新建画布",
+    category: "view",
+    editable: true,
+  },
+};
+
+// 局部编辑器内默认快捷键
+export const DEFAULT_EDITOR_SHORTCUTS: EditorShortcutConfig = {
+  brush: {
+    key: "b",
+    description: "画笔",
+    category: "edit",
+    editable: true,
+  },
+  eraser: {
+    key: "e",
+    description: "橡皮擦",
+    category: "edit",
+    editable: true,
+  },
+  lasso: {
+    key: "l",
+    description: "套索",
+    category: "selection",
+    editable: true,
+  },
+  rect: {
+    key: "r",
+    description: "矩形框选",
+    category: "selection",
+    editable: true,
+  },
+  wand: {
+    key: "w",
+    description: "魔棒",
+    category: "selection",
+    editable: true,
+  },
+  invert: {
+    key: "i",
+    description: "反选",
+    category: "selection",
+    editable: true,
+  },
+  brushSmaller: {
+    key: "[",
+    description: "缩小笔刷",
+    category: "edit",
+    editable: true,
+  },
+  brushLarger: {
+    key: "]",
+    description: "放大笔刷",
+    category: "edit",
+    editable: true,
+  },
+  confirm: {
+    key: "Enter",
+    modifiers: { ctrl: true },
+    description: "确认编辑",
+    category: "generation",
+    editable: true,
+  },
+  help: {
+    key: "?",
+    description: "快捷键提示",
+    category: "view",
     editable: true,
   },
 };

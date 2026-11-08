@@ -169,6 +169,7 @@ class AgentResult:
     stopped: bool = False  # 用户主动停止
     waiting_for_user: bool = False  # 等待用户回复
     pending_question: dict | None = None  # 等待中的问题
+    run_id: str | None = None  # 本轮执行记录 ID（持久化 assistant 消息关联用）
 
 
 class ReActAgent:
@@ -202,13 +203,17 @@ class ReActAgent:
         on_event: EventCallback | None = None,
         failure_note: str | None = None,
         referenced_images: list[dict] | None = None,  # Vision: 用户引用的图片列表
+        steer_provider: Callable[[], dict | None] | None = None,  # 工具边界注入排队消息（steering）
     ) -> AgentResult:
         """执行 Agent 循环。
 
         history 为该画布的历史对话（user/assistant），注入 LLM 上下文；
         failure_note 为上一轮未完成任务的摘要（供"重试/继续"精确重放）；
         on_event 非空时逐步推送执行事件（SSE 流式）；
-        referenced_images 为用户引用的图片列表（Vision 能力）。
+        referenced_images 为用户引用的图片列表（Vision 能力）；
+        steer_provider 非空时，每个 ReAct 步骤的 LLM 调用前调用一次，
+        若返回排队消息（{"prompt", "referenced_images"}）则注入对话（steering），
+        Agent 在同一回合内即可响应新指令。
         """
         state = self.store.get_canvas(canvas_id)
 
@@ -221,6 +226,11 @@ class ReActAgent:
         run_id = None
         if self.chat_sessions:
             run_id = self.chat_sessions.begin_run(canvas_id, prompt)
+
+        def add_timeline(segment: dict) -> None:
+            """追加一个时间线段（plan/text/tool/user），供前端按时间线还原执行过程"""
+            if self.chat_sessions and run_id:
+                self.chat_sessions.append_timeline_segment(canvas_id, run_id, segment)
         try:
             # system + 历史对话 + 当前用户消息（当前消息每步重建画布状态）
             system_prompt = build_system_prompt()
@@ -260,7 +270,7 @@ class ReActAgent:
                 # 完成 run 记录
                 if self.chat_sessions and run_id:
                     self.chat_sessions.finish_run(canvas_id, run_id, "done", chat_answer)
-                return AgentResult(success=True, message=chat_answer, state=state, steps=steps)
+                return AgentResult(success=True, message=chat_answer, state=state, steps=steps, run_id=run_id)
             if plan:
                 # 检查计划是否是询问用户（包含问号或询问句式，且没有明确的工具调用步骤）
                 if self._is_inquiry_plan(plan):
@@ -272,12 +282,13 @@ class ReActAgent:
                     # 完成 run 记录
                     if self.chat_sessions and run_id:
                         self.chat_sessions.finish_run(canvas_id, run_id, "done", plan)
-                    return AgentResult(success=True, message=plan, state=state, steps=steps)
+                    return AgentResult(success=True, message=plan, state=state, steps=steps, run_id=run_id)
                 logger.debug("[Agent] 路由决策: 工具任务（plan），进入 ReAct 循环")
                 steps.append({"type": "plan", "content": plan})
                 # 持久化计划
                 if self.chat_sessions and run_id:
                     self.chat_sessions.update_run_plan(canvas_id, run_id, plan)
+                add_timeline({"kind": "plan", "text": plan})
                 # 计划注入上下文，执行阶段模型能看到自己的计划
                 messages.append({"role": "assistant", "content": f"执行计划：\n{plan}"})
                 logger.info("[Agent] 计划已生成 canvas=%s plan=%s", canvas_id, _clip(plan, 120))
@@ -288,12 +299,37 @@ class ReActAgent:
                     # 完成 run 记录
                     if self.chat_sessions and run_id:
                         self.chat_sessions.finish_run(canvas_id, run_id, "stopped", "")
-                    return self._stopped_result(state, steps)
+                    return self._stopped_result(state, steps, run_id)
 
                 logger.debug(
                     "[Agent] ReAct 步骤 %d/%d canvas=%s | 消息数=%d",
                     _step + 1, self.max_steps, canvas_id, len(messages),
                 )
+
+                # 工具边界注入（steering）：LLM 调用前检查排队消息，
+                # 有则注入本轮对话，Agent 同一回合内即可看到并响应新指令
+                if steer_provider is not None:
+                    steered = steer_provider()
+                    if steered and steered.get("prompt"):
+                        steer_prompt = steered["prompt"]
+                        logger.info(
+                            "[Agent] steering 注入排队消息 canvas=%s prompt=%s",
+                            canvas_id, _clip(steer_prompt, 80),
+                        )
+                        emit({"type": "user_message", "content": steer_prompt})
+                        messages.append({
+                            "role": "user",
+                            "content": self._build_user_message(
+                                steer_prompt, state, None,
+                                steered.get("referenced_images"),
+                            ),
+                        })
+                        user_msg_index = len(messages) - 1
+                        add_timeline({"kind": "user", "text": steer_prompt})
+                        if self.chat_sessions and run_id:
+                            self.chat_sessions.mark_user_steered(
+                                canvas_id, steer_prompt, run_id
+                            )
 
                 # LLM 流式调用：深度思考过程实时推前端（reasoning_delta），
                 # 文本增量实时推前端（delta 打字机），tool_calls 聚合后照常执行。
@@ -326,7 +362,13 @@ class ReActAgent:
                         message=response.content,
                         state=state,
                         steps=steps,
+                        run_id=run_id,
                     )
+
+                # 中间说明文本 flush 到 timeline：工具卡片前的过程文本，
+                # 前端据此把"文本→工具→文本"按时间线完整还原
+                if response.content and response.content.strip():
+                    add_timeline({"kind": "text", "text": response.content})
 
                 # 执行工具调用（支持并行执行生图工具）
                 aborted = False
@@ -341,8 +383,19 @@ class ReActAgent:
                         "[Tool] 并行执行 %d 个生图工具 canvas=%s",
                         len(image_tool_calls), canvas_id,
                     )
-                    # 为每个工具创建独立的 state 副本（用索引作 key，ToolCall 含 dict 字段不可哈希）
-                    state_copies = {i: copy.deepcopy(state) for i, tc in enumerate(image_tool_calls)}
+                    # 编号统一管理：派发前从主画布一次性预留号段，各副本以此起步。
+                    # 否则副本各自从相同的 next_index 自增，会抢注到同一个编号。
+                    reserved_indices = state.reserve_indices(len(image_tool_calls))
+                    state_copies: dict[int, CanvasState] = {}
+                    for i, tc in enumerate(image_tool_calls):
+                        state_copy = copy.deepcopy(state)
+                        state_copy.next_index = reserved_indices[i]
+                        state_copies[i] = state_copy
+
+                    # 必须先推 tool_start：前端靠它清空本轮的中间说明文本，
+                    # 否则并行生图时多轮 delta 会累加到同一个气泡里（表现为大量重复句子）
+                    for tool_call in image_tool_calls:
+                        emit({"type": "tool_start", "tool": tool_call.name, "args": tool_call.args})
 
                     def execute_image_tool(idx: int, tool_call: ToolCall, tool_state: CanvasState) -> tuple[int, ToolResult, float]:
                         """执行单个生图工具，返回 (index, result, cost_ms)"""
@@ -398,6 +451,13 @@ class ReActAgent:
                                 "result": result.message,
                                 "success": result.success,
                             })
+                        add_timeline({
+                            "kind": "tool",
+                            "tool": tool_call.name,
+                            "args": tool_call.args,
+                            "result": result.message,
+                            "success": result.success,
+                        })
 
                         # 工具结果加入消息
                         tool_content = result.message
@@ -429,6 +489,11 @@ class ReActAgent:
                             "canvas": state.to_dict() if result.success else None,
                         })
                 
+                # 单个生图工具走串行路径（并行分支只处理 >1 的情况，
+                # 不补这里会直接漏执行）
+                if len(image_tool_calls) <= 1:
+                    other_tool_calls = image_tool_calls + other_tool_calls
+
                 # 串行执行其他工具
                 for tool_call in other_tool_calls:
                     if stop_evt.is_set():
@@ -482,6 +547,13 @@ class ReActAgent:
                             "result": result.message,
                             "success": result.success,
                         })
+                    add_timeline({
+                        "kind": "tool",
+                        "tool": tool_call.name,
+                        "args": tool_call.args,
+                        "result": result.message,
+                        "success": result.success,
+                    })
 
                     # 工具结果加入消息，供 LLM 决策下一步；失败时附反思提示
                     tool_content = result.message
@@ -516,7 +588,7 @@ class ReActAgent:
                     # 完成 run 记录
                     if self.chat_sessions and run_id:
                         self.chat_sessions.finish_run(canvas_id, run_id, "stopped", "")
-                    return self._stopped_result(state, steps)
+                    return self._stopped_result(state, steps, run_id)
 
                 # 更新当前用户消息中的画布状态（历史消息保持原样）
                 messages[user_msg_index] = {
@@ -535,6 +607,7 @@ class ReActAgent:
                 message=max_steps_msg,
                 state=state,
                 steps=steps,
+                run_id=run_id,
             )
         finally:
             self.control.unregister(canvas_id, stop_evt)
@@ -656,13 +729,14 @@ class ReActAgent:
         return content, ""
 
     @staticmethod
-    def _stopped_result(state: CanvasState, steps: list[dict]) -> AgentResult:
+    def _stopped_result(state: CanvasState, steps: list[dict], run_id: str | None = None) -> AgentResult:
         return AgentResult(
             success=False,
             stopped=True,
             message="已按你的要求停止执行。",
             state=state,
             steps=steps,
+            run_id=run_id,
         )
 
     def _execute_tool(self, tool_call: ToolCall, state: CanvasState) -> ToolResult:

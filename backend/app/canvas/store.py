@@ -25,6 +25,21 @@ logger = logging.getLogger(__name__)
 _MAX_HISTORY = 50
 
 
+def _snapshot(state: CanvasState) -> str:
+    """紧凑快照：用 JSON 字符串代替 dataclass 深拷贝。
+
+    undo/redo 栈最多各存 50 份状态，深拷贝会保留完整的 Python 对象图
+    （每个节点对象 + dict + 字符串对象都有固定开销）；序列化后的字符串
+    只保留数据本身，大画布下内存占用明显更低，代价是撤销时多一次反序列化。
+    """
+    return json.dumps(state.to_dict(), ensure_ascii=False, separators=(",", ":"))
+
+
+def _restore(snapshot: str) -> CanvasState:
+    """从紧凑快照还原画布状态"""
+    return CanvasState.from_dict(json.loads(snapshot))
+
+
 class BaseStore(ABC):
     """存储抽象接口，后续可替换为 Postgres/Redis"""
 
@@ -66,10 +81,11 @@ class InMemoryStore(BaseStore):
 
     def __init__(self):
         self._canvases: dict[str, CanvasState] = {}
-        # 每个 canvas_id 对应一份快照栈，按时间顺序，最后入栈的是最近一次保存前的状态
-        self._history: dict[str, list[CanvasState]] = {}
+        # 每个 canvas_id 对应一份快照栈（存 JSON 字符串，见 _snapshot），
+        # 按时间顺序，最后入栈的是最近一次保存前的状态
+        self._history: dict[str, list[str]] = {}
         # redo 栈：undo 时把当前状态压入，redo 时弹出
-        self._redo: dict[str, list[CanvasState]] = {}
+        self._redo: dict[str, list[str]] = {}
         # 轮次标记：{canvas_id: {round_id: history_length}}
         # 用于"撤回整轮 AI 操作"：记录对话开始时的 undo 栈深度
         self._round_markers: dict[str, dict[str, int]] = {}
@@ -97,10 +113,10 @@ class InMemoryStore(BaseStore):
         with self._lock:
             cid = state.canvas_id
             state.updated_at = time.time()
-            # 入栈：保存"当前内存中的旧状态"的深拷贝，作为可撤销点
+            # 入栈：把"当前内存中的旧状态"序列化为紧凑快照，作为可撤销点
             if cid in self._canvases:
                 hist = self._history.setdefault(cid, [])
-                hist.append(copy.deepcopy(self._canvases[cid]))
+                hist.append(_snapshot(self._canvases[cid]))
                 if len(hist) > _MAX_HISTORY:
                     hist.pop(0)
             # 新操作清空 redo 栈（undo 后再操作，redo 历史失效）
@@ -112,10 +128,13 @@ class InMemoryStore(BaseStore):
             hist = self._history.get(canvas_id) or []
             if not hist:
                 return None
-            prev = hist.pop()
+            prev = _restore(hist.pop())
+            # 版本号保持单调递增：前端用版本号丢弃过期状态，
+            # 回退若让版本倒退会被误判为过期而不生效
+            prev.version = self._canvases[canvas_id].version + 1
             # 把当前状态压入 redo 栈
             redo_stack = self._redo.setdefault(canvas_id, [])
-            redo_stack.append(copy.deepcopy(self._canvases[canvas_id]))
+            redo_stack.append(_snapshot(self._canvases[canvas_id]))
             if len(redo_stack) > _MAX_HISTORY:
                 redo_stack.pop(0)
             # 恢复到内存（不重新入栈，否则无法重做/反复撤销）
@@ -127,10 +146,11 @@ class InMemoryStore(BaseStore):
             redo_stack = self._redo.get(canvas_id) or []
             if not redo_stack:
                 return None
-            nxt = redo_stack.pop()
+            nxt = _restore(redo_stack.pop())
+            nxt.version = self._canvases[canvas_id].version + 1
             # 把当前状态压回 undo 栈
             hist = self._history.setdefault(canvas_id, [])
-            hist.append(copy.deepcopy(self._canvases[canvas_id]))
+            hist.append(_snapshot(self._canvases[canvas_id]))
             if len(hist) > _MAX_HISTORY:
                 hist.pop(0)
             self._canvases[canvas_id] = nxt
@@ -161,19 +181,36 @@ class InMemoryStore(BaseStore):
             current = self._canvases.get(canvas_id)
             if current is None:
                 return None
+            base_version = current.version
             undone = 0
             while len(hist) > target_depth:
-                prev = hist.pop()
+                prev = _restore(hist.pop())
                 redo_stack = self._redo.setdefault(canvas_id, [])
-                redo_stack.append(copy.deepcopy(current))
+                redo_stack.append(_snapshot(current))
                 if len(redo_stack) > _MAX_HISTORY:
                     redo_stack.pop(0)
                 current = prev
                 undone += 1
             self._canvases[canvas_id] = current
+            # 与 undo/redo 一致：版本号不回退，避免前端把回退结果当成过期状态丢弃
+            current.version = base_version + 1
             if undone == 0:
                 return None
             return current
+
+    def restore_canvas(self, canvas_id: str, data: dict) -> CanvasState:
+        """把画布整体恢复为指定快照（整轮回退的兜底路径）。
+
+        后端重启会丢失内存 undo 栈与轮次标记，此时用随对话消息落盘的
+        "本轮开始前快照"恢复。当前状态会先入 undo 栈，回退本身仍可撤销。
+        """
+        with self._lock:
+            current = self.get_canvas(canvas_id)  # 深拷贝同时验证画布存在
+            state = CanvasState.from_dict(data)
+            state.canvas_id = canvas_id
+            state.version = current.version + 1
+            self.save_canvas(state)
+            return copy.deepcopy(state)
 
     def list_canvases(self) -> list[dict]:
         with self._lock:
@@ -315,6 +352,17 @@ class FileStore(InMemoryStore):
                 self._write_canvas(prev)
             return prev
 
+    def undo_to_round(self, canvas_id: str, round_id: str) -> CanvasState | None:
+        with self._lock:
+            prev = super().undo_to_round(canvas_id, round_id)
+            if prev is not None:
+                # 与 undo/redo 一致：回退结果必须写回磁盘，
+                # 否则刷新/重启会重新读到回退前的旧文件
+                materialize_state_images(prev)
+                normalize_state_image_sizes(prev, self._image_size_cache)
+                self._write_canvas(prev)
+            return prev
+
     def redo(self, canvas_id: str) -> CanvasState | None:
         with self._lock:
             nxt = super().redo(canvas_id)
@@ -429,8 +477,9 @@ class FileStore(InMemoryStore):
                     if u and is_local_image_url(u):
                         try:
                             other_refs.add(_rel_from_url(u))
-                        except ValueError:
-                            pass
+                        except ValueError as e:
+                            # 非本地图片 URL / 畸形 URL：跳过该节点，不影响其它引用统计
+                            logger.debug("级联清理跳过无法解析的图片 URL: %s: %s", p.name, e)
             except (json.JSONDecodeError, OSError) as e:
                 logger.warning("级联清理时其他画布读取失败（跳过该文件）: %s: %s", p.name, e)
                 continue

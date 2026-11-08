@@ -59,4 +59,27 @@ export interface ChatResponse {
 export interface ChatMessage {
   role: "user" | "assistant";
   content: string;
+  /** assistant 消息关联的执行记录 ID（用于按 run.timeline 还原时间线） */
+  run_id?: string;
+  /** user 消息：本轮撤回标识（刷新/切换画布后仍可整轮回退） */
+  round_id?: string;
+  /** user 消息被 steering 注入的执行记录 ID（其独立气泡由 timeline 锚点渲染） */
+  steered_run_id?: string;
+}
+
+/** run 记录中的有序时间线段：按发生顺序还原"计划→文本→工具→…"执行过程 */
+export type TimelineSegment =
+  | { kind: "plan"; text: string }
+  | { kind: "text"; text: string }
+  | { kind: "tool"; tool: string; args?: Record<string, unknown>; result: string; success?: boolean }
+  | { kind: "user"; text: string };
+
+/** 一轮执行的结构化记录（GET /agent/history 随 messages 一同返回） */
+export interface RunRecord {
+  id: string;
+  status: string;
+  plan?: string;
+  steps?: AgentStep[];
+  timeline?: TimelineSegment[];
+  message?: string;
 }

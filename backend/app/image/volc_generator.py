@@ -47,6 +47,38 @@ def _is_retryable(exc: Exception) -> bool:
     return False
 
 
+def _sensitive_hint(code: str) -> str:
+    """把 Ark 的内容安全错误码翻译成用户能看懂的原因"""
+    if "SensitiveContent" not in code and "PolicyViolation" not in code:
+        return ""
+    if code.startswith("InputText"):
+        return "提示词触发内容安全审核，请调整描述"
+    if code.startswith("InputImage"):
+        return "参考图触发内容安全审核，请更换参考图"
+    if "PolicyViolation" in code or code.startswith("OutputImage"):
+        return "输出可能涉及版权内容（如星球大战、漫威、迪士尼等受保护 IP），请改用原创描述"
+    return "内容安全审核未通过，请调整描述"
+
+
+def _friendly_http_error(exc: Exception) -> Exception:
+    """把 Ark 返回的 {"error": {...}} 转成带原因的 ValueError，避免前端只看到 400"""
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        return exc
+    try:
+        payload = resp.json()
+    except Exception:
+        return exc
+    err = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(err, dict):
+        return exc
+    code = str(err.get("code") or "")
+    message = str(err.get("message") or "")
+    logger.warning("[Volc] API 拒绝请求 status=%s code=%s message=%s", resp.status_code, code, message)
+    detail = _sensitive_hint(code) or message or f"HTTP {resp.status_code}"
+    return ValueError(f"图片生成被拒绝：{detail}" + (f"（{code}）" if code else ""))
+
+
 def _retry_request(session: requests.Session, method: str, url: str, **kwargs) -> requests.Response:
     """带有限重试 + 指数退避的请求封装。仅对 transient 错误重试。"""
     last_exc: Exception | None = None
@@ -61,7 +93,7 @@ def _retry_request(session: requests.Session, method: str, url: str, **kwargs) -
         except Exception as exc:
             last_exc = exc
             if not _is_retryable(exc) or attempt == _MAX_RETRIES - 1:
-                raise
+                raise _friendly_http_error(exc) from exc
             delay = _RETRY_BASE_DELAY * (2 ** attempt)
             logger.warning(
                 "[Volc] 请求失败（第 %d/%d 次），%ss 后重试: %s",
@@ -148,17 +180,19 @@ class VolcEngineImageGenerator(BaseImageGenerator):
         body: dict = {
             "model": self.model,
             "prompt": prompt,
-            "size": _clamp_size(size, self.model),
             "response_format": "url",
             "watermark": False,
         }
+        if size:
+            # 未指定 size 时不传该字段，交由模型默认输出（前端“自动”宽高比）
+            body["size"] = _clamp_size(size, self.model)
         refs = self._valid_refs(image_urls)
         if refs:
             body["image"] = refs
 
         logger.debug(
             "[Volc] 生图请求 model=%s size=%s refs=%d prompt=%s",
-            self.model, body["size"], len(refs), prompt[:80],
+            self.model, body.get("size", "auto"), len(refs), prompt[:80],
         )
 
         # trust_env=False 绕过系统代理，proxies 禁用代理
@@ -219,11 +253,13 @@ class VolcEngineImageGenerator(BaseImageGenerator):
         body: dict = {
             "model": self.stream_model,
             "prompt": prompt,
-            "size": _clamp_size(size, self.stream_model),
             "response_format": "url",
             "watermark": False,
             "stream": True,
         }
+        if size:
+            # 未指定 size 时不传，交由模型默认输出
+            body["size"] = _clamp_size(size, self.stream_model)
         refs = self._valid_refs(image_urls)
         if refs:
             body["image"] = refs
@@ -388,16 +424,18 @@ class VolcEngineImageGenerator(BaseImageGenerator):
         body: dict = {
             "model": self.model,
             "prompt": prompt,
-            "size": _clamp_size(size, self.model),
             "response_format": "url",
             "watermark": False,
             "image": image_ref,
             "mask": mask_ref,  # inpainting 专用参数
         }
+        if size:
+            # 未指定 size 时不传，交由模型默认输出
+            body["size"] = _clamp_size(size, self.model)
 
         logger.debug(
             "[Volc] Inpainting 请求 model=%s size=%s prompt=%s",
-            self.model, body["size"], prompt[:80],
+            self.model, body.get("size", "auto"), prompt[:80],
         )
 
         session = requests.Session()

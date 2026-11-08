@@ -6,6 +6,7 @@ import type {
   CanvasSummary,
   ChatMessage,
   ChatResponse,
+  RunRecord,
 } from "../types/canvas";
 
 // 后端 API 地址：优先读 Vite 环境变量，开发时回退到本地默认
@@ -53,11 +54,14 @@ export interface AgentStreamEvent {
   // delta / plan_delta / reasoning_delta 为 token 级文本增量（打字机），其余为节点事件
   type:
     | "start"
+    | "queued"
+    | "run_start"
     | "plan_delta"
     | "reasoning_delta"
     | "delta"
     | "tool_start"
     | "tool_result"
+    | "user_message"
     | "response"
     | "done"
     | "ask_user";
@@ -70,6 +74,12 @@ export interface AgentStreamEvent {
   message?: string;
   canvas?: CanvasState;
   steps?: AgentStep[];
+  /** queued 事件：排队位置（画布忙碌时请求进入队列） */
+  position?: number;
+  /** 后端全局递增事件序号：多 SSE 连接（steering 广播）时前端据此去重 */
+  _seq?: number;
+  /** 后端进程启动标识：重启后 _seq 归零，前端据此重置去重水位 */
+  _boot?: string;
   // ask_user 事件专用
   question?: string;
   options?: string[];
@@ -82,7 +92,8 @@ export async function chatWithAgentStream(
   canvasId: string,
   prompt: string,
   referencedImages: Array<{ node_id: string; image_url: string }>,
-  onEvent: (evt: AgentStreamEvent) => void
+  onEvent: (evt: AgentStreamEvent) => void,
+  roundId?: string | null
 ): Promise<void> {
   const res = await fetch(`${API_BASE}/agent/chat/stream`, {
     method: "POST",
@@ -91,6 +102,8 @@ export async function chatWithAgentStream(
       canvas_id: canvasId,
       prompt,
       referenced_images: referencedImages,
+      // 本轮撤回标识：后端随用户消息持久化，刷新/切换画布后仍能整轮回退
+      round_id: roundId || undefined,
     }),
   });
   if (!res.ok || !res.body) {
@@ -152,14 +165,16 @@ export async function respondToAgent(
   return res.json();
 }
 
-// 获取画布对话历史（后端按画布持久化）
-export async function getChatHistory(canvasId: string): Promise<ChatMessage[]> {
+// 获取画布对话历史（后端按画布持久化）：消息文本对 + 执行记录（含 timeline）
+export async function getChatHistory(
+  canvasId: string
+): Promise<{ messages: ChatMessage[]; runs: RunRecord[] }> {
   const res = await fetch(
     `${API_BASE}/agent/history?canvas_id=${encodeURIComponent(canvasId)}`
   );
   if (!res.ok) throw new Error(`${res.status}`);
   const data = await res.json();
-  return data.messages ?? [];
+  return { messages: data.messages ?? [], runs: data.runs ?? [] };
 }
 
 // 获取画布最近一次执行状态
@@ -187,6 +202,19 @@ export async function waitForRunCompletion(
   }
   // 超时后不再等待，直接返回（历史可能不完整）
   console.warn("[Agent] 等待 run 完成超时 canvas=%s", canvasId);
+}
+
+// 获取当前画布的流式事件快照（切换画布回放：计划/思考/工具过程）
+// since 为已拉取的游标（cursor），只返回新增事件
+export async function getStreamSnapshot(
+  canvasId: string,
+  since: number = 0
+): Promise<{ events: AgentStreamEvent[]; cursor: number; finished: boolean }> {
+  const res = await fetch(
+    `${API_BASE}/agent/stream-snapshot?canvas_id=${encodeURIComponent(canvasId)}&since=${since}`
+  );
+  if (!res.ok) throw new Error(`${res.status}`);
+  return res.json();
 }
 
 // 清空画布对话历史
@@ -733,11 +761,14 @@ export interface ExperienceMeta {
   id: string;
   name: string;
   description: string;
+  // style：风格指南（生图时全文拼接）；preset：场景预设（填入输入框的指令模板）
+  kind?: "style" | "preset";
 }
 
-// 列出风格（后端每次热扫描目录，手动放文件也生效）
-export async function listExperiences(): Promise<ExperienceMeta[]> {
-  const res = await fetch(`${API_BASE}/experiences`);
+// 列出提示词条目（后端每次热扫描目录，手动放文件也生效）
+export async function listExperiences(kind?: "style" | "preset"): Promise<ExperienceMeta[]> {
+  const url = kind ? `${API_BASE}/experiences?kind=${kind}` : `${API_BASE}/experiences`;
+  const res = await fetch(url);
   if (!res.ok) {
     throw new Error(`${res.status}`);
   }
@@ -745,16 +776,29 @@ export async function listExperiences(): Promise<ExperienceMeta[]> {
   return data.experiences;
 }
 
-// 导入风格 MD（name/description/正文），立即生效
+// 读取单条提示词全文（预设回填输入框用）
+export async function getExperience(
+  id: string
+): Promise<ExperienceMeta & { content: string }> {
+  const res = await fetch(`${API_BASE}/experiences/${id}`);
+  if (!res.ok) {
+    throw new Error(`${res.status}`);
+  }
+  const data = await res.json();
+  return data.experience;
+}
+
+// 导入提示词条目（name/description/正文 + kind），立即生效
 export async function addExperience(
   name: string,
   description: string,
-  content: string
+  content: string,
+  kind: "style" | "preset" = "style"
 ): Promise<ExperienceMeta> {
   const res = await fetch(`${API_BASE}/experiences`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name, description, content }),
+    body: JSON.stringify({ name, description, content, kind }),
   });
   if (!res.ok) {
     const payload = await res.json().catch(() => null);

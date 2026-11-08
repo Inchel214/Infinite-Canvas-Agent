@@ -81,6 +81,20 @@ class CanvasState:
         if not hasattr(self, '_index_lock') or self._index_lock is None:
             object.__setattr__(self, '_index_lock', threading.Lock())
 
+    def __getstate__(self) -> dict:
+        """pickle / deepcopy 时剔除不可复制的线程锁。
+
+        store 用 copy.deepcopy 返回画布快照，而 threading.Lock 无法被复制，
+        不剔除会直接抛 TypeError: cannot pickle '_thread.lock' object。
+        """
+        data = self.__dict__.copy()
+        data.pop("_index_lock", None)
+        return data
+
+    def __setstate__(self, data: dict) -> None:
+        self.__dict__.update(data)
+        object.__setattr__(self, "_index_lock", threading.Lock())
+
     def to_dict(self) -> dict:
         return {
             "canvas_id": self.canvas_id,
@@ -119,6 +133,25 @@ class CanvasState:
             updated_at=data.get("updated_at", 0),
             next_index=next_index,
         )
+
+    def reserve_indices(self, count: int) -> list[int]:
+        """一次性预留 count 个唯一编号（原子操作）。
+
+        并行生图时每个工具在独立的 state 副本上执行，若各自从相同的 next_index
+        自增，就会"抢注"到同一个编号。因此在派发前从主画布统一预留号段，
+        每个副本以预留编号为起点，保证编号分配唯一、生成即最终值，不会被二次改写。
+        """
+        if count <= 0:
+            return []
+        with self._index_lock:
+            existing = {n.index for n in self.nodes.values() if n.index is not None}
+            reserved: list[int] = []
+            while len(reserved) < count:
+                idx = self.next_index
+                self.next_index += 1
+                if idx not in existing:
+                    reserved.append(idx)
+            return reserved
 
     def add_node(self, node: CanvasNode) -> None:
         # 统一编号分配：所有加节点路径（工具/上传/克隆）都经过这里

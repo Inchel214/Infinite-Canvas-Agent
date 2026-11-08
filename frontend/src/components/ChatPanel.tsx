@@ -7,22 +7,39 @@ import {
   clearChatHistory,
   stopAgent,
   respondToAgent,
-  waitForRunCompletion,
+  getStreamSnapshot,
   beginRound,
   undoRound,
+  type AgentStreamEvent,
 } from "../api/agent";
-import type { AgentStep, CanvasNode, CanvasState } from "../types/canvas";
+import type { CanvasNode, CanvasState, ChatMessage, RunRecord, TimelineSegment } from "../types/canvas";
 
-// 面板内展示条目：历史消息不含 steps（后端只存文本对），本轮对话带工具调用过程
+// assistant 条目的时间线段：按发生顺序渲染（计划/思考/文本/工具自然穿插）
+type Segment =
+  | { kind: "plan"; text: string }
+  | { kind: "reasoning"; text: string; open: boolean }
+  | { kind: "text"; text: string }
+  | {
+      kind: "tool";
+      tool: string;
+      args?: Record<string, unknown>;
+      result: string;
+      success?: boolean;
+      pending: boolean;
+    };
+
+// 面板内展示条目：assistant 携带时间线段（实时流/回放/历史 timeline 三条路径统一结构）
 interface ChatEntry {
   role: "user" | "assistant";
   content: string;
-  steps?: AgentStep[];
-  plan?: string; // 执行计划（流式 plan 事件，展示为路线图卡片）
-  reasoning?: string; // 深度思考过程（reasoning_content 流，与正文分离）
-  reasoningOpen?: boolean; // 思考区展开态：思考中自动展开，正文开始自动折叠
-  stopped?: boolean; // 用户中途停止
   timestamp: number;
+  // assistant：时间线段（计划/思考/文本/工具按发生顺序排列）
+  segments?: Segment[];
+  // assistant：直播中标记（done/异常后置 false）；忙碌判断与思考指示据此派生
+  live?: boolean;
+  // user：排队中（等待 steering 注入或下一轮执行）
+  queued?: boolean;
+  stopped?: boolean; // 用户中途停止
   error?: boolean;
   roundId?: string; // 轮次标记 ID（用于整轮撤回）
   // 人在回路：Agent 询问用户
@@ -42,6 +59,291 @@ interface ChatReference {
   label: string;
   content?: string;
   imageUrl?: string;
+}
+
+/** 找到 tail 中最后一个 assistant 条目的下标（直播位） */
+function lastAssistantIndex(tail: ChatEntry[]): number {
+  for (let i = tail.length - 1; i >= 0; i--) {
+    if (tail[i].role === "assistant") return i;
+  }
+  return -1;
+}
+
+/** 更新 tail 中最后一个 assistant 条目 */
+function patchLive(
+  tail: ChatEntry[],
+  patch: (e: ChatEntry) => ChatEntry
+): ChatEntry[] {
+  const idx = lastAssistantIndex(tail);
+  if (idx < 0) return tail;
+  const next = [...tail];
+  next[idx] = patch(next[idx]);
+  return next;
+}
+
+/** 向条目追加一个时间线段；连续同类文本段合并（token 级增量归并） */
+function appendSegment(entry: ChatEntry, seg: Segment): ChatEntry {
+  const segs = [...(entry.segments || [])];
+  const last = segs[segs.length - 1];
+  if (
+    last &&
+    ((seg.kind === "text" && last.kind === "text") ||
+      (seg.kind === "reasoning" && last.kind === "reasoning") ||
+      (seg.kind === "plan" && last.kind === "plan"))
+  ) {
+    segs[segs.length - 1] = { ...last, text: last.text + seg.text } as Segment;
+  } else {
+    segs.push(seg);
+  }
+  return { ...entry, segments: segs };
+}
+
+function newLiveAssistant(): ChatEntry {
+  return {
+    role: "assistant",
+    content: "",
+    segments: [],
+    timestamp: Date.now(),
+    live: true,
+  };
+}
+
+/**
+ * 把单个流式事件应用到条目序列（纯函数，无副作用，返回新数组）。
+ * 实时流与"切换画布后的回放"共用同一套归约逻辑，保证两种路径渲染一致。
+ * 事件按时间顺序落为 segments：工具卡片自然穿插在文本流中，中间过程文本保留。
+ *
+ * 全量操作（非仅尾部）：多条消息排队时，被 steering 消费的排队气泡可能位于
+ * 直播条目之后，新直播条目须插入"被消费的气泡之后"以保持
+ * 「回复段 → 用户气泡 → 回复段」的时间顺序。
+ */
+function reduceStreamEvent(
+  entries: ChatEntry[],
+  evt: AgentStreamEvent
+): ChatEntry[] {
+  const content = (evt.content as string) || "";
+  switch (evt.type) {
+    case "run_start": {
+      // 新一轮开始（队列推进）：清除本条消息的排队标记，并在该气泡后
+      // 插入直播条目承接后续事件；无匹配气泡（单请求/回放路径）则在末尾补
+      const next = [...entries];
+      let bubbleIdx = -1;
+      for (let i = 0; i < next.length; i++) {
+        if (
+          next[i].role === "user" &&
+          next[i].queued &&
+          (!content || next[i].content === content)
+        ) {
+          bubbleIdx = i;
+          break;
+        }
+      }
+      if (bubbleIdx >= 0) {
+        next[bubbleIdx] = { ...next[bubbleIdx], queued: false };
+        const after = next[bubbleIdx + 1];
+        if (!after || after.role !== "assistant" || after.live === false) {
+          next.splice(bubbleIdx + 1, 0, newLiveAssistant());
+        }
+        return next;
+      }
+      const last = next[next.length - 1];
+      if (!last || last.role !== "assistant" || last.live === false) {
+        next.push(newLiveAssistant());
+      }
+      return next;
+    }
+    case "plan_delta":
+      return content
+        ? patchLive(entries, (e) => appendSegment(e, { kind: "plan", text: content }))
+        : entries;
+    case "reasoning_delta":
+      return content
+        ? patchLive(entries, (e) =>
+            appendSegment(e, { kind: "reasoning", text: content, open: true })
+          )
+        : entries;
+    case "delta":
+      if (!content) return entries;
+      return patchLive(entries, (e) => {
+        // 正文开始：折叠正在展开的思考段
+        let entry = e;
+        if (entry.segments?.some((s) => s.kind === "reasoning" && s.open)) {
+          entry = {
+            ...entry,
+            segments: entry.segments.map((s) =>
+              s.kind === "reasoning" ? { ...s, open: false } : s
+            ),
+          };
+        }
+        return appendSegment(entry, { kind: "text", text: content });
+      });
+    case "tool_start":
+      return patchLive(entries, (e) =>
+        appendSegment(e, {
+          kind: "tool",
+          tool: evt.tool || "",
+          args: evt.args,
+          result: "",
+          pending: true,
+        })
+      );
+    case "tool_result":
+      return patchLive(entries, (e) => {
+        const segs = [...(e.segments || [])];
+        for (let k = segs.length - 1; k >= 0; k--) {
+          const s = segs[k];
+          if (s.kind === "tool" && s.pending) {
+            segs[k] = {
+              ...s,
+              result: evt.result || "",
+              success: evt.success,
+              pending: false,
+            };
+            break;
+          }
+        }
+        return { ...e, segments: segs };
+      });
+    case "user_message": {
+      // 排队消息被 steering 注入当前回合：
+      // 1) 全量查找其排队气泡清除标记（回放路径无匹配则在定稿条目后补气泡）
+      // 2) 当前直播条目定稿
+      // 3) 新直播条目插入该气泡之后，承接注入后的 Agent 输出
+      const next = [...entries];
+      let bubbleIdx = -1;
+      for (let i = 0; i < next.length; i++) {
+        if (next[i].role === "user" && next[i].queued && next[i].content === content) {
+          bubbleIdx = i;
+          break;
+        }
+      }
+      if (bubbleIdx >= 0) {
+        next[bubbleIdx] = { ...next[bubbleIdx], queued: false };
+      }
+      const liveIdx = lastAssistantIndex(next);
+      if (liveIdx >= 0 && next[liveIdx].live) {
+        next[liveIdx] = { ...next[liveIdx], live: false };
+      }
+      if (bubbleIdx < 0) {
+        bubbleIdx = liveIdx + 1;
+        next.splice(bubbleIdx, 0, {
+          role: "user",
+          content,
+          timestamp: Date.now(),
+        });
+      }
+      next.splice(bubbleIdx + 1, 0, newLiveAssistant());
+      return next;
+    }
+    case "ask_user":
+      return patchLive(entries, (e) => ({
+        ...e,
+        askUser: {
+          question: evt.question || "",
+          options: evt.options,
+          timeout: evt.timeout,
+          default_action: evt.default_action,
+          startTime: Date.now(),
+        },
+      }));
+    case "response":
+      return patchLive(entries, (e) => ({ ...e, content: evt.content || e.content }));
+    case "done":
+      return patchLive(entries, (e) => {
+        let entry: ChatEntry = {
+          ...e,
+          content: evt.message || e.content,
+          stopped: evt.stopped,
+          error: !evt.success && !evt.stopped,
+          live: false,
+        };
+        // 兜底：没有任何文本段但有最终回复（异常路径流内无 delta）→ 补文本段
+        if (
+          evt.message &&
+          !(entry.segments || []).some((s) => s.kind === "text" && s.text)
+        ) {
+          entry = appendSegment(entry, { kind: "text", text: evt.message });
+        }
+        return entry;
+      });
+    default:
+      return entries;
+  }
+}
+
+/**
+ * 历史消息 + 执行记录 → 面板条目序列。
+ * assistant 消息优先按关联 run 的 timeline 展开（工具卡片穿插在文本流中），
+ * 旧数据无 timeline 时用 steps 合成；steering 注入的用户消息由 timeline 锚点渲染。
+ */
+function buildHistoryEntries(
+  messages: ChatMessage[],
+  runs: RunRecord[]
+): ChatEntry[] {
+  const runById = new Map(runs.map((r) => [r.id, r]));
+  const entries: ChatEntry[] = [];
+
+  for (const m of messages) {
+    if (m.role === "user") {
+      // steering 注入的用户消息：独立气泡由对应 run 的 timeline 锚点渲染，跳过避免重复。
+      // run 记录被裁剪丢失时兜底显示，避免消息丢失。
+      if (m.steered_run_id && runById.has(m.steered_run_id)) continue;
+      entries.push({
+        role: "user",
+        content: m.content,
+        timestamp: 0,
+        // 撤回标识随消息持久化：刷新/切换画布后撤回按钮依然可用
+        roundId: m.round_id,
+      });
+      continue;
+    }
+    const run = m.run_id ? runById.get(m.run_id) : undefined;
+    let timeline: TimelineSegment[] | null = null;
+    if (run?.timeline?.length) {
+      timeline = run.timeline;
+    } else if (run?.steps?.length) {
+      // 旧数据兼容：无 timeline 时用 steps 合成（计划 + 工具段 + 末尾回复段）
+      timeline = [
+        ...(run.plan ? [{ kind: "plan", text: run.plan } as TimelineSegment] : []),
+        ...run.steps.map(
+          (s) =>
+            ({
+              kind: "tool",
+              tool: s.tool || "",
+              args: s.args,
+              result: s.result || "",
+              success: s.success,
+            }) as TimelineSegment
+        ),
+        ...(m.content ? [{ kind: "text", text: m.content } as TimelineSegment] : []),
+      ];
+    }
+    if (!timeline) {
+      entries.push({ role: "assistant", content: m.content, timestamp: 0 });
+      continue;
+    }
+    // timeline → 条目序列（user 锚点把 assistant 拆成多段，中间夹用户气泡）
+    let cur: ChatEntry = {
+      role: "assistant",
+      content: "",
+      segments: [],
+      timestamp: 0,
+    };
+    entries.push(cur);
+    for (const seg of timeline) {
+      if (seg.kind === "user") {
+        entries.push({ role: "user", content: seg.text, timestamp: 0 });
+        cur = { role: "assistant", content: "", segments: [], timestamp: 0 };
+        entries.push(cur);
+      } else if (seg.kind === "tool") {
+        cur.segments!.push({ ...seg, pending: false });
+      } else {
+        cur.segments!.push({ ...seg } as Segment);
+      }
+    }
+    cur.content = m.content;
+  }
+  return entries;
 }
 
 interface ChatPanelProps {
@@ -386,6 +688,14 @@ function parseMessageSegments(
   });
 }
 
+/** 把含换行的纯文本写入 contenteditable（\n 还原为 <br>），用于撤回后回填输入框 */
+function appendTextWithBreaks(root: HTMLElement, text: string) {
+  text.split("\n").forEach((part, idx) => {
+    if (idx > 0) root.appendChild(document.createElement("br"));
+    if (part) root.appendChild(document.createTextNode(part));
+  });
+}
+
 // 芯片 → 发送给 Agent 的标记文本（格式与旧版逐行前置完全一致，仅位置改为行内）
 function chipMarker(dataset: DOMStringMap): string {
   const label = dataset.label || "图";
@@ -521,7 +831,6 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
   // “@数字”引用菜单：null 表示关闭，空字符串表示刚输入 @、展示全部画布图片
   const [mentionQuery, setMentionQuery] = useState<string | null>(null);
   const [mentionIndex, setMentionIndex] = useState(0);
-  const [sending, setSending] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
   const [resizing, setResizing] = useState(false);
   const [hoverHandle, setHoverHandle] = useState(false);
@@ -535,6 +844,15 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
   const panelDragRef = useRef<{ x: number; y: number; left: number; top: number } | null>(null);
   const mentionRangeRef = useRef<Range | null>(null);
   const resizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
+  // 已消费的最大事件序号：steering 后后端把同一事件广播给所有订阅者，
+  // 同一面板的并发 SSE 连接会重复投递，按 _seq 跳过重复（序号全局递增）
+  const lastSeqRef = useRef(0);
+  // 后端进程启动标识：重启后 _seq 归零，检测到变化时重置去重水位
+  const lastBootRef = useRef<string | null>(null);
+
+  // Agent 是否执行中（存在直播中的 assistant 条目）：思考指示/停止按钮据此显示。
+  // 执行中用户可继续输入，消息进入队列（steering 注入或下一轮执行）。
+  const sending = entries.some((e) => e.role === "assistant" && e.live);
 
   // 暴露 saveDraft 方法给父组件（保留接口兼容性，实际草稿已实时保存）
   useImperativeHandle(ref, () => ({
@@ -542,6 +860,26 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
       // 草稿已通过 syncEditorState 实时保存，无需额外操作
     },
   }), []);
+
+  // 应用单个流式事件：画布增量刷新 + 全量归约条目序列。
+  // 排队气泡可能位于直播条目之后（多排队场景），故按全量归约而非仅尾部。
+  const applyStreamEvent = (evt: AgentStreamEvent) => {
+    // 多连接去重：steering 注入后同一事件会经多条 SSE 连接重复送达，按全局
+    // 递增序号只消费首次到达的拷贝；无序号（回放/旧协议）不检查。
+    // 后端重启序号归零：_boot 变化时先重置水位，避免新事件被旧水位误跳过
+    if (typeof evt._seq === "number") {
+      if (evt._boot && evt._boot !== lastBootRef.current) {
+        lastBootRef.current = evt._boot;
+        lastSeqRef.current = 0;
+      }
+      if (evt._seq <= lastSeqRef.current) return;
+      lastSeqRef.current = evt._seq;
+    }
+    if ((evt.type === "tool_result" || evt.type === "done") && evt.canvas) {
+      onCanvasUpdate(evt.canvas);
+    }
+    setEntries((prev) => reduceStreamEvent(prev, evt));
+  };
 
   useEffect(() => {
     if (!panelDragging) return;
@@ -751,32 +1089,18 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
     }
 
     (async () => {
-      // 检查是否有正在执行的生成任务
-      try {
-        await waitForRunCompletion(canvasId, 30000, 1000);
-      } catch (err) {
-        console.warn('[ChatPanel] 等待 run 完成失败:', err);
-      }
-
-      if (cancelled) return;
-
-      // 加载历史（带重试，防止后端未就绪时首次加载失败）
-      const loadHistory = async (retries = 2) => {
+      // 加载历史（带重试，防止后端未就绪时首次加载失败）；返回已渲染的条目
+      const loadHistoryMessages = async (retries = 2): Promise<ChatEntry[] | null> => {
         for (let i = 0; i <= retries; i++) {
           try {
-            const messages = await getChatHistory(canvasId);
-            if (cancelled) return;
-            console.log('[ChatPanel] 历史加载成功:', messages.length, '条');
-            setEntries(
-              messages.map((m) => ({
-                role: m.role,
-                content: m.content,
-                timestamp: 0, // 历史不展示时间戳
-              }))
-            );
-            return; // 成功则返回
+            const { messages, runs } = await getChatHistory(canvasId);
+            if (cancelled) return null;
+            console.log('[ChatPanel] 历史加载成功:', messages.length, '条消息 /', runs.length, '条执行记录');
+            const loaded = buildHistoryEntries(messages, runs);
+            setEntries(loaded);
+            return loaded;
           } catch (err) {
-            if (cancelled) return;
+            if (cancelled) return null;
             if (i < retries) {
               console.warn(`[ChatPanel] 历史加载失败，${i + 1}s 后重试 (${i + 1}/${retries}):`, err);
               await new Promise(r => setTimeout(r, 1000));
@@ -786,8 +1110,53 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
             }
           }
         }
+        return null;
       };
-      loadHistory();
+
+      // 先立即渲染已保存的持久化历史，避免切回画布时长时间空白
+      const messages = await loadHistoryMessages();
+      if (cancelled || !messages) return;
+
+      // 回放后端缓存的流式事件：仅用于"仍在执行中"的 run。
+      // 已结束的 run 由历史里的 timeline 持久化完整还原（含中间过程文本与工具卡片），无需回放。
+      try {
+        const snap = await getStreamSnapshot(canvasId, 0);
+        if (cancelled || !snap.events.length || snap.finished) return;
+
+        // 回放期间画布也要同步增量刷新（工具结果里带画布快照）
+        for (const evt of snap.events) {
+          if ((evt.type === "tool_result" || evt.type === "done") && evt.canvas) {
+            onCanvasUpdate(evt.canvas);
+          }
+        }
+
+        // 进行中：与实时流共用同一套 reduce，从空直播条目归约出尾部条目序列
+        const builtTail = snap.events.reduce(reduceStreamEvent, [newLiveAssistant()]);
+        setEntries((prev) => [...prev, ...builtTail]);
+
+        // 轮询增量事件，直到后端标记结束，回复自动补全
+        let cursor = snap.cursor;
+        const deadline = Date.now() + 30 * 60 * 1000;
+        while (!cancelled && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 1000));
+          if (cancelled) break;
+          let next;
+          try {
+            next = await getStreamSnapshot(canvasId, cursor);
+          } catch {
+            continue; // 后端短暂不可用：保留游标，下一轮重试
+          }
+          if (cancelled) break;
+          for (const evt of next.events) {
+            if (cancelled) break;
+            applyStreamEvent(evt);
+          }
+          cursor = next.cursor;
+          if (next.finished) break;
+        }
+      } catch (err) {
+        console.warn('[ChatPanel] 回放流式事件失败:', err);
+      }
     })();
 
     return () => {
@@ -841,9 +1210,42 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
       )
     );
 
+  // 撤回后把该条输入回填到编辑框：引用标记还原为芯片、换行还原为 <br>，
+  // 与原始发送内容一致，用户可直接修改后重新发送
+  const restoreEditorContent = (content: string) => {
+    const editor = editorRef.current;
+    if (!editor) return;
+    editor.innerHTML = "";
+    for (const seg of parseMessageSegments(content, nodeById)) {
+      if (seg.type === "text") {
+        appendTextWithBreaks(editor, seg.text);
+      } else {
+        const node = nodeById.get(seg.ref.id);
+        if (node) {
+          editor.appendChild(buildRefChip(node));
+          editor.appendChild(document.createTextNode(" "));
+        } else {
+          // 节点已不存在：退化为纯文本标签，避免输入内容丢失
+          appendTextWithBreaks(editor, seg.ref.label);
+        }
+      }
+    }
+    syncEditorState();
+    // 光标落到末尾，方便继续编辑
+    editor.focus();
+    const sel = window.getSelection();
+    if (sel) {
+      const range = document.createRange();
+      range.selectNodeContents(editor);
+      range.collapse(false);
+      sel.removeAllRanges();
+      sel.addRange(range);
+    }
+  };
+
   const handleSend = async () => {
     const editor = editorRef.current;
-    if (!editor || !canvasId || sending) return;
+    if (!editor || !canvasId) return;
     // 序列化编辑器：文本原样保留，引用芯片在原位置展开为标记。
     // 同时收集引用图片信息（node_id + image_url），供 Vision 能力使用。
     // 本地气泡与历史持久化共用这份文本，渲染时再解析回芯片
@@ -856,111 +1258,60 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
     localStorage.removeItem(`chat_draft_${canvasId}`);
     // 引用已随消息序列化，清空 App 侧收件箱避免残留
     onClearRefs();
-    setSending(true);
     const ts = Date.now();
-    
+
     // 标记本轮对话开始（用于整轮撤回）
     const roundId = await beginRound(canvasId);
-    
-    // 立刻挂一条空的 assistant 条目作为"直播位"，流式事件逐步填充它
-    setEntries((prev) => [
-      ...prev,
-      { role: "user", content: trimmedMessage, timestamp: ts, roundId: roundId || undefined },
-      { role: "assistant", content: "", steps: [], timestamp: ts },
-    ]);
 
-    // 更新直播条目（entries 末尾那条 assistant）
-    const updateLive = (patch: (e: ChatEntry) => ChatEntry) => {
-      setEntries((prev) => {
-        if (prev.length === 0) return prev;
-        const last = prev[prev.length - 1];
-        if (last.role !== "assistant") return prev;
-        const next = [...prev];
-        next[next.length - 1] = patch(last);
-        return next;
-      });
-    };
+    // 忙碌（上一轮仍在执行）时本条进入队列：气泡标记"排队中"，
+    // 后端在工具边界注入（steering）或下一轮执行时通过 run_start/user_message 事件清除标记。
+    // 空闲时立即挂直播条目；忙碌时等待事件创建（保持"段1→用户气泡→段2"的视觉顺序）。
+    setEntries((prev) => {
+      const busy = prev.some((e) => e.role === "assistant" && e.live);
+      const next: ChatEntry[] = [
+        ...prev,
+        {
+          role: "user",
+          content: trimmedMessage,
+          timestamp: ts,
+          roundId: roundId || undefined,
+          queued: busy || undefined,
+        },
+      ];
+      if (!busy) {
+        next.push({ role: "assistant", content: "", segments: [], timestamp: ts, live: true });
+      }
+      return next;
+    });
 
     try {
-      await chatWithAgentStream(canvasId, trimmedMessage, referencedImages, (evt) => {
-        if (evt.type === "plan_delta" && evt.content) {
-          // 计划逐字流出（打字机），追加渲染
-          updateLive((e) => ({ ...e, plan: (e.plan || "") + evt.content }));
-        } else if (evt.type === "reasoning_delta" && evt.content) {
-          // 深度思考过程实时流出：自动展开思考区（正文开始后折叠）
-          updateLive((e) => ({
-            ...e,
-            reasoning: (e.reasoning || "") + evt.content,
-            reasoningOpen: true,
-          }));
-        } else if (evt.type === "delta" && evt.content) {
-          // LLM 正文逐字流出；正文一出现就把思考区折叠起来
-          updateLive((e) => ({
-            ...e,
-            content: (e.content || "") + evt.content,
-            reasoningOpen: e.reasoning ? false : e.reasoningOpen,
-          }));
-        } else if (evt.type === "tool_start") {
-          // ReAct 多轮循环：LLM 要调工具时，之前流的 delta 是中间思考说明，
-          // 不是最终回复。清空 content 防止下一轮 delta 累加导致重复输出。
-          updateLive((e) => ({
-            ...e,
-            content: "",
-            steps: [
-              ...(e.steps || []),
-              { type: "tool_call", tool: evt.tool, args: evt.args, result: "", pending: true },
-            ],
-          }));
-        } else if (evt.type === "tool_result") {
-          // 画布随工具执行增量刷新：生成的图片立刻出现在画布上
-          if (evt.canvas) onCanvasUpdate(evt.canvas);
-          updateLive((e) => {
-            const steps = [...(e.steps || [])];
-            for (let k = steps.length - 1; k >= 0; k--) {
-              if (steps[k].pending) {
-                steps[k] = {
-                  ...steps[k],
-                  result: evt.result || "",
-                  success: evt.success,
-                  pending: false,
-                };
-                break;
-              }
-            }
-            return { ...e, steps };
-          });
-        } else if (evt.type === "ask_user") {
-          // 人在回路：Agent 询问用户
-          updateLive((e) => ({
-            ...e,
-            askUser: {
-              question: evt.question || "",
-              options: evt.options,
-              timeout: evt.timeout,
-              default_action: evt.default_action,
-              startTime: Date.now(), // 记录开始等待的时间
-            },
-          }));
-        } else if (evt.type === "done") {
-          updateLive((e) => ({
-            ...e,
-            content: evt.message || e.content,
-            steps: evt.steps || e.steps,
-            stopped: evt.stopped,
-            error: !evt.success && !evt.stopped,
-          }));
-          if (evt.canvas) onCanvasUpdate(evt.canvas);
-        }
-        // start / response 事件无需单独处理（response 与 done.message 一致）
-      });
+      await chatWithAgentStream(canvasId, trimmedMessage, referencedImages, applyStreamEvent, roundId);
     } catch (e) {
-      updateLive((live) => ({
-        ...live,
-        content: `请求失败：${(e as Error).message}（请检查后端与模型配置）`,
-        error: true,
-      }));
-    } finally {
-      setSending(false);
+      setEntries((prev) => {
+        let idx = -1;
+        for (let i = prev.length - 1; i >= 0; i--) {
+          if (prev[i].role === "assistant" && prev[i].live) { idx = i; break; }
+        }
+        if (idx < 0) {
+          return [
+            ...prev,
+            {
+              role: "assistant",
+              content: `请求失败：${(e as Error).message}（请检查后端与模型配置）`,
+              timestamp: Date.now(),
+              error: true,
+            },
+          ];
+        }
+        const next = [...prev];
+        next[idx] = {
+          ...next[idx],
+          content: `请求失败：${(e as Error).message}（请检查后端与模型配置）`,
+          error: true,
+          live: false,
+        };
+        return next;
+      });
     }
   };
 
@@ -1176,10 +1527,26 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
             /* 用户消息：右对齐气泡（引用以行内芯片还原在原文位置） */
             <div
               key={i}
-              style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 5 }}
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                alignItems: "flex-end",
+                gap: 5,
+                // 占满整行：气泡的 maxWidth 百分比才有确定的参照宽度，
+                // 否则收缩成极小宽度导致"你好"也被折成两行
+                width: "100%",
+              }}
               className="chat-user-message"
             >
-              <div style={{ display: "flex", alignItems: "flex-end", gap: 6 }}>
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "flex-end",
+                  gap: 6,
+                  maxWidth: "86%",
+                  justifyContent: "flex-end",
+                }}
+              >
                 {/* 撤回按钮：悬停时显示，仅当有 roundId 且不是正在发送时可用 */}
                 {entry.roundId && !sending && (
                   <button
@@ -1187,14 +1554,36 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
                     title="撤回本轮 AI 的所有修改"
                     onClick={async () => {
                       if (!canvasId || !entry.roundId) return;
-                      const res = await undoRound(canvasId, entry.roundId);
-                      if (res.success) {
+                      const roundId = entry.roundId;
+                      try {
+                        const res = await undoRound(canvasId, roundId);
+                        // 无论成功失败都刷新画布（后端两种结果都会回传当前画布）
                         onCanvasUpdate(res.canvas);
-                        // 显示提示
-                        const msg = res.message || "已撤回";
+                        if (res.success) {
+                          // 撤回成功：对话面板同步移除该轮及其之后的条目
+                          // （后端已截断历史），并把该条输入放回编辑框供重新编辑
+                          setEntries((prev) => prev.slice(0, i));
+                          restoreEditorContent(entry.content);
+                        } else {
+                          setEntries((prev) => [
+                            ...prev,
+                            {
+                              role: "assistant",
+                              content: `↩️ ${res.message || "这一轮没有可撤回的修改"}`,
+                              timestamp: Date.now(),
+                              error: true,
+                            },
+                          ]);
+                        }
+                      } catch (e) {
                         setEntries((prev) => [
                           ...prev,
-                          { role: "assistant", content: `↩️ ${msg}`, timestamp: Date.now() },
+                          {
+                            role: "assistant",
+                            content: `↩️ 撤回失败：${(e as Error).message}`,
+                            timestamp: Date.now(),
+                            error: true,
+                          },
                         ]);
                       }
                     }}
@@ -1215,7 +1604,7 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
                 )}
                 <div
                   style={{
-                    maxWidth: "86%",
+                    maxWidth: "100%",
                     background: "rgba(99,102,241,0.85)",
                     color: "#fff",
                     padding: "8px 12px",
@@ -1229,133 +1618,141 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
                   {renderUserContent(entry.content)}
                 </div>
               </div>
+              {/* 已发送但当前回合还在执行：事件到达（注入或新一轮开始）后自动清除 */}
+              {entry.queued && (
+                <span style={{ color: "#818cf8", fontSize: 11, paddingRight: 4 }}>
+                  已发送 · 当前步骤结束后交给 Agent
+                </span>
+              )}
             </div>
           ) : (
-            /* Agent 回复：执行计划卡片 + 左对齐气泡 + 工具调用过程 */
+            /* Agent 回复：时间线段按发生顺序渲染（计划/思考/文本/工具自然穿插） */
             <div key={i} style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              {/* 执行计划（规划阶段流式产出，工具执行期间就能看到路线图） */}
-              {entry.plan && (
-                <div
-                  style={{
-                    alignSelf: "flex-start",
-                    maxWidth: "92%",
-                    width: "92%",
-                    background: "rgba(99,102,241,0.08)",
-                    border: "1px dashed rgba(99,102,241,0.45)",
-                    borderRadius: 8,
-                    padding: "6px 10px",
-                    fontSize: 12.5,
-                    color: "#c7d2fe",
-                  }}
-                >
-                  <div style={{ fontWeight: 600, marginBottom: 2 }}>📋 执行计划</div>
-                  <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
-                    {entry.plan}
-                  </ReactMarkdown>
-                </div>
-              )}
-
-              {/* 深度思考过程（执行阶段保留思考，实时流式可见；正文开始自动折叠，可点击回看） */}
-              {entry.reasoning && (
-                <div
-                  style={{
-                    alignSelf: "flex-start",
-                    maxWidth: "92%",
-                    width: "92%",
-                    background: "rgba(255,255,255,0.03)",
-                    border: "1px solid rgba(255,255,255,0.08)",
-                    borderRadius: 8,
-                    fontSize: 12,
-                    color: "#8b8b9a",
-                    overflow: "hidden",
-                  }}
-                >
-                  <div
-                    onClick={() =>
-                      setEntries((prev) =>
-                        prev.map((e2, j) =>
-                          j === i ? { ...e2, reasoningOpen: !e2.reasoningOpen } : e2
-                        )
-                      )
+              {entry.segments
+                ? entry.segments.map((seg, j) => {
+                    if (seg.kind === "plan") {
+                      /* 执行计划（规划阶段流式产出，工具执行期间就能看到路线图） */
+                      return (
+                        <div
+                          key={j}
+                          style={{
+                            alignSelf: "flex-start",
+                            maxWidth: "92%",
+                            width: "92%",
+                            background: "rgba(99,102,241,0.08)",
+                            border: "1px dashed rgba(99,102,241,0.45)",
+                            borderRadius: 8,
+                            padding: "6px 10px",
+                            fontSize: 12.5,
+                            color: "#c7d2fe",
+                          }}
+                        >
+                          <div style={{ fontWeight: 600, marginBottom: 2 }}>📋 执行计划</div>
+                          <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+                            {seg.text}
+                          </ReactMarkdown>
+                        </div>
+                      );
                     }
-                    style={{
-                      padding: "5px 10px",
-                      cursor: "pointer",
-                      userSelect: "none",
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 6,
-                    }}
-                  >
-                    <span>🧠</span>
-                    <span>
-                      {entry.content ? "已深度思考（点击回看）" : "正在思考…"}
-                    </span>
-                    <span style={{ marginLeft: "auto", fontSize: 10 }}>
-                      {entry.reasoningOpen ? "▼" : "▶"}
-                    </span>
-                  </div>
-                  {entry.reasoningOpen && (
-                    <div
-                      style={{
-                        padding: "0 10px 6px",
-                        borderTop: "1px solid rgba(255,255,255,0.06)",
-                        paddingTop: 5,
-                        maxHeight: 200,
-                        overflowY: "auto",
-                        whiteSpace: "pre-wrap",
-                        wordBreak: "break-word",
-                        lineHeight: 1.55,
-                      }}
-                    >
-                      {entry.reasoning}
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {entry.content && (
-                <div
-                  style={{
-                    alignSelf: "flex-start",
-                    maxWidth: "92%",
-                    background: "rgba(255,255,255,0.07)",
-                    color: entry.error ? "#f87171" : entry.stopped ? "#fbbf24" : "#e8e8f0",
-                    padding: "8px 12px",
-                    borderRadius: "12px 12px 12px 2px",
-                    fontSize: 14,
-                    lineHeight: 1.6,
-                    wordBreak: "break-word",
-                  }}
-                >
-                  <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
-                    {entry.content}
-                  </ReactMarkdown>
-                </div>
-              )}
-
-              {/* 工具调用步骤（仅本轮对话展示） */}
-              {entry.steps && entry.steps.some((s) => s.type === "tool_call") && (
-                <div
-                  style={{
-                    alignSelf: "flex-start",
-                    maxWidth: "92%",
-                    width: "92%",
-                    background: "rgba(0,0,0,0.25)",
-                    border: "1px solid rgba(255,255,255,0.06)",
-                    borderRadius: 8,
-                    padding: "6px 10px",
-                    display: "flex",
-                    flexDirection: "column",
-                    gap: 4,
-                  }}
-                >
-                  {entry.steps
-                    .filter((s) => s.type === "tool_call")
-                    .map((s, j) => (
+                    if (seg.kind === "reasoning") {
+                      /* 深度思考过程（实时流式可见；正文开始自动折叠，可点击回看） */
+                      return (
+                        <div
+                          key={j}
+                          style={{
+                            alignSelf: "flex-start",
+                            maxWidth: "92%",
+                            width: "92%",
+                            background: "rgba(255,255,255,0.03)",
+                            border: "1px solid rgba(255,255,255,0.08)",
+                            borderRadius: 8,
+                            fontSize: 12,
+                            color: "#8b8b9a",
+                            overflow: "hidden",
+                          }}
+                        >
+                          <div
+                            onClick={() =>
+                              setEntries((prev) =>
+                                prev.map((e2, j2) => {
+                                  if (j2 !== i || !e2.segments) return e2;
+                                  const segs = [...e2.segments];
+                                  const target = segs[j];
+                                  if (target?.kind !== "reasoning") return e2;
+                                  segs[j] = { ...target, open: !target.open };
+                                  return { ...e2, segments: segs };
+                                })
+                              )
+                            }
+                            style={{
+                              padding: "5px 10px",
+                              cursor: "pointer",
+                              userSelect: "none",
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 6,
+                            }}
+                          >
+                            <span>🧠</span>
+                            <span>{seg.open ? "正在思考…" : "已深度思考（点击回看）"}</span>
+                            <span style={{ marginLeft: "auto", fontSize: 10 }}>
+                              {seg.open ? "▼" : "▶"}
+                            </span>
+                          </div>
+                          {seg.open && (
+                            <div
+                              style={{
+                                padding: "0 10px 6px",
+                                borderTop: "1px solid rgba(255,255,255,0.06)",
+                                paddingTop: 5,
+                                maxHeight: 200,
+                                overflowY: "auto",
+                                whiteSpace: "pre-wrap",
+                                wordBreak: "break-word",
+                                lineHeight: 1.55,
+                              }}
+                            >
+                              {seg.text}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    }
+                    if (seg.kind === "text") {
+                      if (!seg.text) return null;
+                      return (
+                        <div
+                          key={j}
+                          style={{
+                            alignSelf: "flex-start",
+                            maxWidth: "92%",
+                            background: "rgba(255,255,255,0.07)",
+                            color: entry.error ? "#f87171" : entry.stopped ? "#fbbf24" : "#e8e8f0",
+                            padding: "8px 12px",
+                            borderRadius: "12px 12px 12px 2px",
+                            fontSize: 14,
+                            lineHeight: 1.6,
+                            wordBreak: "break-word",
+                          }}
+                        >
+                          <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+                            {seg.text}
+                          </ReactMarkdown>
+                        </div>
+                      );
+                    }
+                    /* 工具调用卡片：按发生顺序穿插在文本流中 */
+                    return (
                       <div
                         key={j}
                         style={{
+                          alignSelf: "flex-start",
+                          maxWidth: "92%",
+                          width: "92%",
+                          background: "rgba(0,0,0,0.25)",
+                          border: "1px solid rgba(255,255,255,0.06)",
+                          borderRadius: 8,
+                          padding: "6px 10px",
                           display: "flex",
                           alignItems: "baseline",
                           gap: 8,
@@ -1364,7 +1761,7 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
                       >
                         <span
                           style={{
-                            background: s.pending
+                            background: seg.pending
                               ? "rgba(99,102,241,0.35)"
                               : "rgba(99,102,241,0.2)",
                             color: "#a5b4fc",
@@ -1374,28 +1771,47 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
                             flexShrink: 0,
                           }}
                         >
-                          {TOOL_LABELS[s.tool || ""] || s.tool}
+                          {TOOL_LABELS[seg.tool || ""] || seg.tool}
                         </span>
                         <span
                           style={{
-                            color: s.pending
+                            color: seg.pending
                               ? "#818cf8"
-                              : s.success === false
+                              : seg.success === false
                                 ? "#f87171"
                                 : "#888",
                             overflow: "hidden",
                             textOverflow: "ellipsis",
                             whiteSpace: "nowrap",
-                            animation: s.pending ? "chatblink 1.2s infinite" : undefined,
+                            animation: seg.pending ? "chatblink 1.2s infinite" : undefined,
                           }}
-                          title={s.result || ""}
+                          title={seg.result || ""}
                         >
-                          {s.pending ? "执行中..." : (s.result || "")}
+                          {seg.pending ? "执行中..." : seg.result || ""}
                         </span>
                       </div>
-                    ))}
-                </div>
-              )}
+                    );
+                  })
+                : /* 无时间线段的历史/提示消息：纯文本气泡 */
+                  entry.content && (
+                    <div
+                      style={{
+                        alignSelf: "flex-start",
+                        maxWidth: "92%",
+                        background: "rgba(255,255,255,0.07)",
+                        color: entry.error ? "#f87171" : entry.stopped ? "#fbbf24" : "#e8e8f0",
+                        padding: "8px 12px",
+                        borderRadius: "12px 12px 12px 2px",
+                        fontSize: 14,
+                        lineHeight: 1.6,
+                        wordBreak: "break-word",
+                      }}
+                    >
+                      <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+                        {entry.content}
+                      </ReactMarkdown>
+                    </div>
+                  )}
 
               {/* 人在回路：Agent 询问用户 */}
               {entry.askUser && (
@@ -1492,10 +1908,14 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
           <div
             ref={editorRef}
             className="chat-editor"
-            contentEditable={!!canvasId && !sending}
+            contentEditable={!!canvasId}
             suppressContentEditableWarning
             data-placeholder={
-              canvasId ? "输入指令，@ 引用图片，Enter 发送" : "画布加载中..."
+              canvasId
+                ? sending
+                  ? "Agent 执行中，可直接输入并发送"
+                  : "输入指令，@ 引用图片，Enter 发送"
+                : "画布加载中..."
             }
             onCompositionStart={() => { composingRef.current = true; closeMentionMenu(); }}
             onCompositionEnd={() => { composingRef.current = false; syncEditorState(); updateMentionMenu(); }}
@@ -1602,11 +2022,29 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
             boxSizing: "border-box",
             whiteSpace: "pre-wrap",
             wordBreak: "break-word",
-            opacity: !canvasId || sending ? 0.55 : 1,
+            opacity: !canvasId ? 0.55 : 1,
             }}
           />
         </div>
-        {sending ? (
+        {/* 执行中也可发送：消息在当前步骤结束后交给 Agent，按钮始终可用 */}
+        <button
+          onClick={handleSend}
+          disabled={!hasContent || !canvasId}
+          style={{
+            background: !hasContent || !canvasId ? "rgba(99,102,241,0.35)" : "rgba(99,102,241,0.95)",
+            border: "none",
+            color: "#fff",
+            borderRadius: 10,
+            padding: "10px 16px",
+            fontSize: 14,
+            cursor: !hasContent || !canvasId ? "default" : "pointer",
+            flexShrink: 0,
+          }}
+          title={sending ? "Agent 执行中，消息将在当前步骤结束后交给 Agent" : "发送"}
+        >
+          发送
+        </button>
+        {sending && (
           /* 执行中可随时中断：后端在下一个操作边界停止，done(stopped) 事件到达后复位 */
           <button
             onClick={handleStop}
@@ -1623,23 +2061,6 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
             title="停止当前正在执行的 Agent 任务"
           >
             停止
-          </button>
-        ) : (
-          <button
-            onClick={handleSend}
-            disabled={!hasContent || !canvasId}
-            style={{
-              background: !hasContent || !canvasId ? "rgba(99,102,241,0.35)" : "rgba(99,102,241,0.95)",
-              border: "none",
-              color: "#fff",
-              borderRadius: 10,
-              padding: "10px 16px",
-              fontSize: 14,
-              cursor: !hasContent || !canvasId ? "default" : "pointer",
-              flexShrink: 0,
-            }}
-          >
-            发送
           </button>
         )}
       </div>
