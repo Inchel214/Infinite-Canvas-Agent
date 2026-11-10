@@ -65,6 +65,32 @@ const RESOLUTIONS = ["1K", "2K", "4K"] as const;
 const EXPERIENCE_USAGE_KEY = "ica:experienceUsage";
 const EXPERIENCE_USAGE_EVENT = "ica:experienceUsageChanged";
 
+// 画布背景色预设：提供不同明暗底色，便于透明/暗色图片在不同对比下查看
+const BG_PRESETS = [
+  { label: "深蓝", value: "#1a1a2e" },
+  { label: "深灰", value: "#22222e" },
+  { label: "纯黑", value: "#0a0a0f" },
+  { label: "中灰", value: "#6b6b73" },
+  { label: "浅灰", value: "#d4d4d8" },
+  { label: "纯白", value: "#f5f5f7" },
+] as const;
+const DEFAULT_BG = BG_PRESETS[0].value;
+const BG_STORAGE_KEY = "ica:canvasBg";
+
+function hexToRgb(hex: string): { r: number; g: number; b: number } {
+  const h = (hex || "#000000").replace("#", "");
+  const n = h.length === 3 ? h.split("").map((c) => c + c).join("") : h;
+  const num = parseInt(n.padEnd(6, "0").slice(0, 6), 16);
+  return { r: (num >> 16) & 255, g: (num >> 8) & 255, b: num & 255 };
+}
+
+// 相对亮度（WCAG），>0.5 视为浅色背景，网格点/图标需用深色
+function isLightBg(hex: string): boolean {
+  const { r, g, b } = hexToRgb(hex);
+  const toLin = (c: number) => (c <= 10 ? c / 3294 : Math.pow((c / 269 + 0.0514), 2.4));
+  return 0.2126 * toLin(r) + 0.7152 * toLin(g) + 0.0722 * toLin(b) > 0.5;
+}
+
 function readExperienceUsage(): Record<string, number> {
   try {
     const parsed = JSON.parse(localStorage.getItem(EXPERIENCE_USAGE_KEY) ?? "{}");
@@ -538,6 +564,27 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   const sizeStorageKey = `ica:display-sizes:${canvasId}`;
   const [localStatusMsg, setLocalStatusMsg] = useState<string | null>(null);
   const [showHelp, setShowHelp] = useState(false);
+
+  // 画布背景色偏好：持久化到 localStorage，便于透明/暗色图片切换底色查看
+  const [bgColor, setBgColor] = useState<string>(() => {
+    try {
+      return localStorage.getItem(BG_STORAGE_KEY) || DEFAULT_BG;
+    } catch {
+      return DEFAULT_BG;
+    }
+  });
+  const [showBgPicker, setShowBgPicker] = useState(false);
+  const changeBgColor = useCallback((color: string) => {
+    setBgColor(color);
+    try {
+      localStorage.setItem(BG_STORAGE_KEY, color);
+    } catch {
+      /* 隐私模式等写入失败时忽略 */
+    }
+  }, []);
+  const bgIsLight = isLightBg(bgColor);
+  const gridDotColor = bgIsLight ? "rgba(0,0,0,0.08)" : "rgba(255,255,255,0.08)";
+  const iconColor = bgIsLight ? "#1a1a2e" : "#e5e7eb";
   
   // 快捷键 Hook：提供快捷键配置和帮助面板支持
   // 注意：实际快捷键逻辑仍保留在原有 useEffect 中（与画布状态紧密耦合）
@@ -2234,7 +2281,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         position: "fixed",
         inset: 0,
         overflow: "hidden",
-        background: "#1a1a2e",
+        background: bgColor,
         cursor: connecting
           ? "crosshair"
           : marquee
@@ -2305,7 +2352,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         style={{
           position: "absolute",
           inset: 0,
-          backgroundImage: `radial-gradient(circle, rgba(255,255,255,0.08) 1px, transparent 1px)`,
+          backgroundImage: `radial-gradient(circle, ${gridDotColor} 1px, transparent 1px)`,
           backgroundSize: `${40 * zoom}px ${40 * zoom}px`,
           backgroundPosition: `${pan.x}px ${pan.y}px`,
           pointerEvents: "none",
@@ -3048,6 +3095,162 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       >
         <span style={{ fontSize: 16, fontWeight: 700, lineHeight: 1 }}>?</span>
       </button>
+
+      {/* 画布背景色选择按钮：按钮本身用当前底色，叠加调色板图标（图标色随底色明暗反转） */}
+      <button
+        type="button"
+        className="ica-fitview-btn"
+        title="画布背景色：切换底色便于查看透明/暗色图片"
+        style={{
+          position: "absolute",
+          bottom: 16,
+          left: 176,
+          background: bgColor,
+          border: `1px solid ${bgIsLight ? "rgba(0,0,0,0.35)" : "rgba(255,255,255,0.35)"}`,
+        }}
+        onMouseDown={(e) => e.stopPropagation()}
+        onClick={(e) => {
+          e.stopPropagation();
+          setShowBgPicker((prev) => !prev);
+        }}
+      >
+        <svg
+          width="18"
+          height="18"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke={iconColor}
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        >
+          <circle cx="13.5" cy="6.5" r="1.5" fill={iconColor} />
+          <circle cx="17.5" cy="10.5" r="1.5" fill={iconColor} />
+          <circle cx="8.5" cy="7.5" r="1.5" fill={iconColor} />
+          <circle cx="6.5" cy="12.5" r="1.5" fill={iconColor} />
+          <path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.93 0 1.5-.73 1.5-1.6 0-.43-.17-.82-.44-1.11-.26-.28-.43-.65-.43-1.04 0-.83.67-1.5 1.5-1.5H16c3.31 0 6-2.69 6-6 0-4.97-4.48-9-10-9Z" />
+        </svg>
+      </button>
+
+      {/* 背景色选择面板 */}
+      {showBgPicker && (
+        <>
+          <div
+            style={{ position: "fixed", inset: 0, zIndex: 599 }}
+            onMouseDown={(e) => {
+              e.stopPropagation();
+              setShowBgPicker(false);
+            }}
+          />
+          <div
+            style={{
+              position: "absolute",
+              bottom: 56,
+              left: 16,
+              zIndex: 600,
+              background: "rgba(20,20,40,0.98)",
+              border: "1px solid rgba(255,255,255,0.12)",
+              borderRadius: 10,
+              padding: 12,
+              boxShadow: "0 8px 32px rgba(0,0,0,0.5)",
+              backdropFilter: "blur(8px)",
+              width: 200,
+            }}
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <div
+              style={{
+                fontSize: 12,
+                color: "rgba(255,255,255,0.6)",
+                marginBottom: 8,
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+              }}
+            >
+              <span>画布背景色</span>
+              <button
+                type="button"
+                title="恢复默认"
+                onClick={() => changeBgColor(DEFAULT_BG)}
+                style={{
+                  background: "transparent",
+                  border: "none",
+                  color: "rgba(255,255,255,0.45)",
+                  cursor: "pointer",
+                  fontSize: 11,
+                  padding: 0,
+                }}
+              >
+                默认
+              </button>
+            </div>
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(3, 1fr)",
+                gap: 8,
+                marginBottom: 10,
+              }}
+            >
+              {BG_PRESETS.map((p) => (
+                <button
+                  key={p.value}
+                  type="button"
+                  title={p.label}
+                  onClick={() => changeBgColor(p.value)}
+                  style={{
+                    height: 28,
+                    borderRadius: 6,
+                    background: p.value,
+                    border:
+                      bgColor.toLowerCase() === p.value.toLowerCase()
+                        ? "2px solid #a78bfa"
+                        : "1px solid rgba(255,255,255,0.18)",
+                    cursor: "pointer",
+                    padding: 0,
+                    position: "relative",
+                  }}
+                />
+              ))}
+            </div>
+            <label
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                fontSize: 12,
+                color: "rgba(255,255,255,0.7)",
+                cursor: "pointer",
+              }}
+            >
+              <span>自定义</span>
+              <input
+                type="color"
+                value={bgColor}
+                onChange={(e) => changeBgColor(e.target.value)}
+                style={{
+                  width: 28,
+                  height: 22,
+                  padding: 0,
+                  border: "none",
+                  background: "transparent",
+                  cursor: "pointer",
+                }}
+              />
+              <span
+                style={{
+                  fontFamily: "Consolas, monospace",
+                  fontSize: 11,
+                  color: "rgba(255,255,255,0.45)",
+                }}
+              >
+                {bgColor}
+              </span>
+            </label>
+          </div>
+        </>
+      )}
 
       {/* 快捷键帮助面板（增强版，支持自定义） */}
       {showHelp && (
