@@ -860,17 +860,18 @@ class ReActAgent:
             if not image_url:
                 continue
             
-            # 本地图片 URL 转为 data URL（base64）
+            # 本地图片 URL 转为压缩后的 data URL（base64）
+            # 使用压缩版本避免 413 请求过大（DeepSeek 等 API 有大小限制）
             if image_url.startswith("http://127.0.0.1:8000/images/"):
                 try:
-                    from app.image.files import local_url_to_data_url
-                    data_url = local_url_to_data_url(image_url)
+                    from app.image.files import local_url_to_compressed_data_url
+                    data_url = local_url_to_compressed_data_url(image_url, max_size=1024, quality=80)
                     content_parts.append({
                         "type": "image_url",
                         "image_url": {"url": data_url}
                     })
                     logger.debug(
-                        "[Vision] 添加引用图片 node_id=%s (本地URL→data URL)",
+                        "[Vision] 添加引用图片 node_id=%s (本地URL→压缩data URL)",
                         ref.get("node_id"),
                     )
                 except Exception as e:

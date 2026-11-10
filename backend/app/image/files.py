@@ -104,6 +104,45 @@ def local_url_to_data_url(url: str) -> str:
     return f"data:{_mime_from_rel(rel)};base64,{base64.b64encode(content).decode('ascii')}"
 
 
+def local_url_to_compressed_data_url(url: str, max_size: int = 1024, quality: int = 85) -> str:
+    """本地图片 URL → 压缩后的 data URL（供 Vision API 使用，避免 413 请求过大）。
+    
+    Args:
+        url: 本地图片 URL
+        max_size: 最大边长（像素），默认 1024
+        quality: JPEG 压缩质量（1-100），默认 85
+    
+    Returns:
+        压缩后的 data URL
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        logger.warning("PIL 未安装，无法压缩图片，使用原图")
+        return local_url_to_data_url(url)
+    
+    rel = _rel_from_url(url)
+    img_path = IMAGES_DIR / rel
+    img = Image.open(img_path)
+    
+    # 等比缩放
+    w, h = img.size
+    if max(w, h) > max_size:
+        scale = max_size / max(w, h)
+        new_w, new_h = int(w * scale), int(h * scale)
+        img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        logger.debug("[Vision] 图片压缩 %dx%d → %dx%d", w, h, new_w, new_h)
+    
+    # 转为 RGB（如果有 alpha 通道）并输出 JPEG
+    if img.mode in ("RGBA", "P"):
+        img = img.convert("RGB")
+    
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/jpeg;base64,{b64}"
+
+
 def to_sendable_ref(url: str) -> str:
     """归一化参考图：data URL 原样；本地托管 URL → data URL；远端 http URL 原样"""
     if url.startswith("data:"):
