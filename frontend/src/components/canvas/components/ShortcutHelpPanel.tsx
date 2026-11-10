@@ -122,8 +122,12 @@ export function ShortcutHelpPanel({
 
   const selectedBinding = (() => {
     if (!recordingAction) return undefined;
-    if (recordingScope === "canvas") return (bindings as Record<string, ShortcutBinding>)[recordingAction];
-    if (recordingScope === "editor") return (editorBindings as Record<string, ShortcutBinding>)[recordingAction];
+    if (recordingScope === "canvas") {
+      return (bindings as unknown as Record<string, ShortcutBinding>)[recordingAction];
+    }
+    if (recordingScope === "editor") {
+      return (editorBindings as unknown as Record<string, ShortcutBinding>)[recordingAction];
+    }
     return undefined;
   })();
 

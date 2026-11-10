@@ -26,7 +26,7 @@ export function recordExperienceUsage(ids?: string[]) {
   }
 }
 
-// 删除参考图时让图片提及继续指向原图；槽位交换会显式跳过这一步。
+// 删除参考图时让图片提及继续指向原图；槽位替换会显式跳过这一步。
 export function remapImageMentions(prompt: string, oldRefIds: string[], newRefIds: string[]): string {
   return prompt
     .replace(IMAGE_MENTION_RE, (mention, rawIndex: string) => {
@@ -39,9 +39,11 @@ export function remapImageMentions(prompt: string, oldRefIds: string[], newRefId
     .replace(/[ \t]+\n/g, "\n");
 }
 
-export function swapReferences(refIds: string[], fromIndex: number, toIndex: number): string[] {
-  if (fromIndex === toIndex || fromIndex < 0 || toIndex < 0) return refIds;
-  const next = [...refIds];
-  [next[fromIndex], next[toIndex]] = [next[toIndex], next[fromIndex]];
+export function replaceReferenceSlot(refIds: string[], draggedId: string, targetId: string): string[] {
+  if (draggedId === targetId || !refIds.includes(draggedId) || !refIds.includes(targetId)) return refIds;
+  const next = refIds.filter((refId) => refId !== draggedId);
+  const targetIndex = next.indexOf(targetId);
+  if (targetIndex < 0) return refIds;
+  next[targetIndex] = draggedId;
   return next;
 }

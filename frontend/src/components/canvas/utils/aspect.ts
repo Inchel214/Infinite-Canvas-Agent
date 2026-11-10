@@ -1,6 +1,6 @@
 // 宽高比相关计算函数
 
-import { ASPECT_RATIOS, RESOLUTIONS } from "../constants";
+import { ASPECT_RATIOS } from "../constants";
 
 // 从 ratioKey 解析宽高比（预设或 "W:H" 自定义格式）
 export function parseRatio(ratioKey: string): { w: number; h: number } {

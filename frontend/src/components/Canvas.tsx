@@ -4,11 +4,10 @@ import { createPortal } from "react-dom";
 import { ImageCollectionCards, ImageCollectionDialog } from "./ImageCollections";
 import { useImageCollections } from "./useImageCollections";
 import type { CanvasState, CanvasNode } from "../types/canvas";
-import { generateImageStream, updateNodePosition, uploadImageNode, cloneNode, undoCanvas, redoCanvas, listExperiences, revealImageFile, type ExperienceMeta } from "../api/agent";
+import { generateImageStream, updateNodePosition, uploadImageNode, undoCanvas, redoCanvas, listExperiences, revealImageFile, type ExperienceMeta } from "../api/agent";
 // 重构后的快捷键模块
 import { ShortcutHelpPanel } from "./canvas/components/ShortcutHelpPanel";
 import { useCanvasShortcuts } from "./canvas/hooks/useCanvasShortcuts";
-import { DEFAULT_SHORTCUTS } from "./canvas/constants";
 import { matchesShortcut } from "./canvas/state/canvasShortcuts";
 
 // 右键菜单可触发的操作类型（experienceIds：风格库多选的风格，直连生图时后端确定性拼接）
@@ -92,7 +91,7 @@ function recordExperienceUsage(ids?: string[]) {
 
 const IMAGE_MENTION_RE = /@图片(\d+)/g;
 
-// 删除参考图时让图片提及继续指向原图；槽位交换会显式跳过这一步。
+// 删除参考图时让图片提及继续指向原图；槽位替换会显式跳过这一步。
 function remapImageMentions(prompt: string, oldRefIds: string[], newRefIds: string[]): string {
   return prompt
     .replace(IMAGE_MENTION_RE, (mention, rawIndex: string) => {
@@ -105,10 +104,14 @@ function remapImageMentions(prompt: string, oldRefIds: string[], newRefIds: stri
     .replace(/[ \t]+\n/g, "\n");
 }
 
-function swapReferences(refIds: string[], fromIndex: number, toIndex: number): string[] {
-  if (fromIndex === toIndex || fromIndex < 0 || toIndex < 0) return refIds;
-  const next = [...refIds];
-  [next[fromIndex], next[toIndex]] = [next[toIndex], next[fromIndex]];
+// 拖图到另一个参考图槽位时，用拖入图替换目标槽位，并移除原槽位。
+// 编号属于槽位而不是图片实体，因此调用方必须保留 @图片N 文本。
+function replaceReferenceSlot(refIds: string[], draggedId: string, targetId: string): string[] {
+  if (draggedId === targetId || !refIds.includes(draggedId) || !refIds.includes(targetId)) return refIds;
+  const next = refIds.filter((refId) => refId !== draggedId);
+  const targetIndex = next.indexOf(targetId);
+  if (targetIndex < 0) return refIds;
+  next[targetIndex] = draggedId;
   return next;
 }
 
@@ -659,8 +662,6 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     generatingIdsRef.current = generatingIds;
   }, [generatingIds]);
   const containerSeqRef = useRef(0);
-  // 画布内复制/粘贴的剪贴板（存节点副本，Ctrl+V 粘贴到画布）
-  const clipboardRef = useRef<CanvasNode[] | null>(null);
 
   const marqueeStartRef = useRef<{ x: number; y: number } | null>(null);
   // 平移 rAF 合帧数据
@@ -686,6 +687,46 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   const managedCollection = collections.views.find((group) => group.id === managedCollectionId);
   const displayBounds = useMemo(() => [...collections.visibleNodes, ...collections.views.filter((group) => group.collapsed)], [collections.visibleNodes, collections.views]);
   const connectionBounds = (node: CanvasNode): BBox => collections.collapsedByNode.get(node.id) ?? node;
+
+  // 键盘快捷键和右键菜单共用同一套系统剪贴板逻辑。
+  // 节点的生成参数复用与系统图片剪贴板分离，避免内部缓存抢占后续粘贴。
+  const copySelectedImagesToSystemClipboard = useCallback(async () => {
+    const copies = [...selectedIds]
+      .map((id) => nodes.find((n) => n.id === id))
+      .filter((n): n is CanvasNode => !!n && !!n.image_url);
+    if (copies.length === 0) return;
+
+    const showMsg = (message: string) => {
+      setLocalStatusMsg(message);
+      window.setTimeout(() => setLocalStatusMsg(null), 2600);
+    };
+
+    if (!window.isSecureContext || !navigator.clipboard?.write || typeof ClipboardItem === "undefined") {
+      showMsg("当前浏览器不支持复制图片到系统剪贴板");
+      return;
+    }
+
+    showMsg("正在复制图片...");
+    try {
+      // 先把 Promise 交给 ClipboardItem，再立即 write，保留快捷键/菜单点击的用户激活。
+      const pngPromise = fetchImageBlob(copies[0].image_url!).then(convertImageBlobToPng);
+      await navigator.clipboard.write([
+        new ClipboardItem({ "image/png": pngPromise }),
+      ]);
+      showMsg(
+        copies.length > 1
+          ? `已复制第 1 张图片（共选中 ${copies.length} 张）`
+          : "图片已复制，可粘贴到微信、飞书或 PS",
+      );
+    } catch (error) {
+      const reason = error instanceof DOMException && error.name === "NotAllowedError"
+        ? "浏览器未授予剪贴板权限，请保持页面在前台后重试"
+        : error instanceof Error
+          ? error.message
+          : "未知错误";
+      showMsg(`系统剪贴板写入失败：${reason}`);
+    }
+  }, [selectedIds, nodes]);
 
   // 坐标写回确认前保留乐观位置，避免其他任务的快照把正在拖动的节点还原。
   // 整理与撤销显式清空覆盖；普通回显只清除已确认或已删除的节点。
@@ -730,6 +771,13 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       // 输入框聚焦时不拦截快捷键（保留正常打字/复制文本）
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+
+      // macOS 的 Control+C 不触发原生 copy；仍兼容用户的 Ctrl+C 用法。
+      if (e.ctrlKey && !e.metaKey && e.key.toLowerCase() === "c" && nodes.some((node) => selectedIds.has(node.id) && !!node.image_url)) {
+        e.preventDefault();
+        void copySelectedImagesToSystemClipboard();
+        return;
+      }
 
       // 空格键：切换平移模式
       if (matchesShortcut(e, shortcuts.bindings.togglePan)) {
@@ -784,73 +832,36 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         setMenu(null);
         return;
       }
-      
-      // 复制（使用自定义配置）
-      if (matchesShortcut(e, shortcuts.bindings.copy) && selectedIds.size >= 1) {
-        const ids = [...selectedIds];
-        const copies = ids
-          .map((id) => nodes.find((n) => n.id === id))
-          .filter((n): n is CanvasNode => !!n && !!n.image_url);
-        if (copies.length > 0) {
-          e.preventDefault();
-          clipboardRef.current = copies;
-          setLocalStatusMsg(`已复制 ${copies.length} 张图片，Ctrl+V 粘贴到画布`);
-          setTimeout(() => setLocalStatusMsg(null), 2200);
-        }
-      }
-      
-      // 粘贴（使用自定义配置）
-      if (matchesShortcut(e, shortcuts.bindings.paste) && clipboardRef.current) {
-        const target = e.target as HTMLElement;
-        if (target.tagName === "INPUT" || target.tagName === "TEXTAREA") return;
+      // 自定义复制键仍写入系统剪贴板；默认 Cmd/Ctrl+C 由原生 copy 事件处理。
+      if (matchesShortcut(e, shortcuts.bindings.copy) && selectedIds.size > 0
+          && e.key.toLowerCase() !== "c") {
         e.preventDefault();
-        const container = containerRef.current;
-        if (container) {
-          const rect = container.getBoundingClientRect();
-          // 世界坐标 = 视图中心
-          const cx = (rect.width / 2 - panRef.current.x) / zoomRef.current;
-          const cy = (rect.height / 2 - panRef.current.y) / zoomRef.current;
-          // 克隆节点：复制完整属性（含提示词 content、来源 source_ids）
-          (async () => {
-            let ox = 0, oy = 0;
-            let okCount = 0;
-            let failCount = 0;
-            for (const src of clipboardRef.current!) {
-              try {
-                const res = await cloneNode(canvasId!, {
-                  image_url: src.image_url!,
-                  x: cx + ox,
-                  y: cy + oy,
-                  width: src.width,
-                  height: src.height,
-                  content: src.content ?? "",
-                  source_ids: src.source_ids ?? [],
-                });
-                if (res.success) {
-                  onCanvasUpdate?.(res.canvas);
-                  okCount++;
-                } else {
-                  failCount++;
-                }
-                ox += src.width * 0.3;
-                oy += src.height * 0.3;
-              } catch {
-                failCount++;
-              }
-            }
-            if (failCount === 0) {
-              setLocalStatusMsg(`已粘贴 ${okCount} 张图片`);
-            } else {
-              setLocalStatusMsg(`粘贴 ${okCount} 张成功，${failCount} 张失败（请检查后端）`);
-            }
-            setTimeout(() => setLocalStatusMsg(null), 2200);
-          })();
-        }
+        void copySelectedImagesToSystemClipboard();
       }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [selectedIds, nodes, onAction, canvasId, onCanvasUpdate, setLocalStatusMsg, shortcuts.bindings]);
+  }, [selectedIds, nodes, onAction, canvasId, onCanvasUpdate, copySelectedImagesToSystemClipboard, shortcuts.bindings]);
+
+  // 使用浏览器原生 copy 事件接管 Cmd/Ctrl+C，避免快捷键先被浏览器或容器层拦截。
+  // 输入控件中仍保留普通的文本复制行为。
+  useEffect(() => {
+    const handler = (event: ClipboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target && (
+        target.tagName === "INPUT"
+        || target.tagName === "TEXTAREA"
+        || target.isContentEditable
+      )) return;
+      if (selectedIds.size === 0) return;
+      if (!nodes.some((node) => selectedIds.has(node.id) && !!node.image_url)) return;
+
+      event.preventDefault();
+      void copySelectedImagesToSystemClipboard();
+    };
+    document.addEventListener("copy", handler);
+    return () => document.removeEventListener("copy", handler);
+  }, [selectedIds, nodes, copySelectedImagesToSystemClipboard]);
 
   // 空格键抬起：清除平移模式（使用自定义配置）
   useEffect(() => {
@@ -1001,8 +1012,6 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   // Ctrl+V 粘贴图片（输入框聚焦时让位给正常文本粘贴）
   useEffect(() => {
     const handler = (e: ClipboardEvent) => {
-      // 画布内复制优先：如果 clipboardRef 有内容，让 keydown 处理，跳过系统剪贴板
-      if (clipboardRef.current) return;
       const items = e.clipboardData?.items;
       if (!items) return;
       const t = e.target as HTMLElement | null;
@@ -1248,7 +1257,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         markZoomGesture();
         // 以双指中心为锚点缩放 + 叠加平移偏移
         const worldX = (mx - touchPan.x) / z;
-        const worldY = (my - touchPan.y) / z;
+        const worldY = (mmy - touchPan.y) / z;
         setPan({ x: mx - worldX * newZoom + pdx, y: mmy - worldY * newZoom + pdy });
         setZoom(newZoom);
       });
@@ -1803,6 +1812,57 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     setMenu(null);
   }, [onAction, selectedIds]);
 
+  // 复用一张已生成图的“配方”：保留原提示词、尺寸和来源参考图，
+  // 直接生成一个可编辑容器，用户可替换参考图或小改提示词后再生成。
+  const handleDuplicateAsEditable = useCallback(() => {
+    if (selectedIds.size !== 1) return;
+    const node = nodes.find((item) => item.id === [...selectedIds][0]);
+    if (!node?.image_url) return;
+
+    const sourceNodes = (node.source_ids ?? [])
+      .map((sourceId) => {
+        const direct = nodes.find((item) => item.id === sourceId);
+        if (direct) return direct;
+        const match = sourceId.match(/^#(\d+)$/);
+        return match
+          ? nodes.find((item) => item.index === Number(match[1]))
+          : undefined;
+      })
+      .filter((item): item is CanvasNode => !!item?.image_url);
+    const refIds = sourceNodes.length > 0
+      ? sourceNodes.map((item) => item.id)
+      : [node.id];
+
+    containerSeqRef.current += 1;
+    const id = `pending-${Date.now()}-${containerSeqRef.current}`;
+    const next: PendingContainer = {
+      id,
+      x: Math.round(node.x + node.width + 48 / zoom),
+      y: Math.round(node.y),
+      w: CONTAINER_BASE_W,
+      h: CONTAINER_BASE_H,
+      aspect: closestPresetAspectKey(node.width, node.height),
+      resolution,
+      prompt: node.content && node.content !== "本地图片" ? node.content : "",
+      refIds,
+    };
+    setContainers((prev) => [...prev, next]);
+    activeContainerIdRef.current = id;
+    setMenu(null);
+    setLocalStatusMsg("已复用生成设置，可替换参考图或修改提示词");
+    window.setTimeout(() => setLocalStatusMsg(null), 2600);
+
+    // 节点只保存显示尺寸；用图片真实长边恢复原分辨率档位。
+    const image = new Image();
+    image.onload = () => {
+      const longEdge = Math.max(image.naturalWidth, image.naturalHeight);
+      if (longEdge > 0) {
+        updateContainer(id, { resolution: closestResolutionKey(longEdge) });
+      }
+    };
+    image.src = node.image_url;
+  }, [selectedIds, nodes, zoom, resolution, updateContainer]);
+
   // 更新节点内容（文本卡双击编辑后保存）
   const handleUpdateNodeContent = useCallback(
     (nodeId: string, content: string) => {
@@ -1812,43 +1872,11 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     [onAction]
   );
 
-  // 同时复制到系统剪贴板与画布内部剪贴板：外部应用可直接粘贴，
-  // 画布内仍保留原节点信息，Ctrl+V 时能维持尺寸、提示词和谱系。
+  // 菜单和快捷键始终写入同一个系统图片剪贴板。
   const handleCopyImage = useCallback(async () => {
-    const copies = [...selectedIds]
-      .map((id) => nodes.find((n) => n.id === id))
-      .filter((n): n is CanvasNode => !!n && !!n.image_url);
     setMenu(null);
-    if (copies.length === 0) return;
-    clipboardRef.current = copies;
-
-    const showMsg = (message: string) => {
-      setLocalStatusMsg(message);
-      window.setTimeout(() => setLocalStatusMsg(null), 2600);
-    };
-
-    if (!window.isSecureContext || !navigator.clipboard?.write || typeof ClipboardItem === "undefined") {
-      showMsg("已复制到画布；当前浏览器不支持复制图片到系统剪贴板");
-      return;
-    }
-
-    showMsg("正在复制图片...");
-    try {
-      // 先把 Promise 交给 ClipboardItem，再立即调用 write，保留菜单点击带来的用户激活。
-      const pngPromise = fetchImageBlob(copies[0].image_url!).then(convertImageBlobToPng);
-      await navigator.clipboard.write([
-        new ClipboardItem({ "image/png": pngPromise }),
-      ]);
-      showMsg("图片已复制，可粘贴到微信、飞书或 PS");
-    } catch (error) {
-      const reason = error instanceof DOMException && error.name === "NotAllowedError"
-        ? "浏览器未授予剪贴板权限，请保持页面在前台后重试"
-        : error instanceof Error
-          ? error.message
-          : "未知错误";
-      showMsg(`已复制到画布；系统剪贴板写入失败：${reason}`);
-    }
-  }, [selectedIds, nodes]);
+    await copySelectedImagesToSystemClipboard();
+  }, [copySelectedImagesToSystemClipboard]);
 
   // 另存为：优先用 File System Access API（弹「保存到…」对话框，可选桌面等任意文件夹），
   // 不支持/失败时回退普通下载。两个关键点：
@@ -2682,6 +2710,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
           onMenuAction={handleMenuAction}
           onExecute={handleExecute}
           onDelete={handleDelete}
+          onDuplicateEditable={handleDuplicateAsEditable}
           onCopyImage={handleCopyImage}
           onSaveImage={handleSaveImage}
           onRevealImage={handleRevealImage}
@@ -3421,6 +3450,7 @@ const ContextMenu = ({
   onMenuAction,
   onExecute,
   onDelete,
+  onDuplicateEditable,
   onCopyImage,
   onSaveImage,
   onRevealImage,
@@ -3449,6 +3479,7 @@ const ContextMenu = ({
   onMenuAction: (mode: "compose" | "edit") => void;
   onExecute: () => void;
   onDelete: () => void;
+  onDuplicateEditable: () => void;
   onCopyImage: () => void;
   onSaveImage: () => void;
   onRevealImage: () => void;
@@ -3466,7 +3497,7 @@ const ContextMenu = ({
   const dragStart = useRef<{ mx: number; my: number; left: number; top: number } | null>(null);
   const baseLeft = Math.min(x, window.innerWidth - MENU_W - 8);
   const baseTop = Math.min(y, window.innerHeight - (mode === "menu"
-    ? (selectedCount === 1 && selectedNodeContent ? 320 : 200)
+    ? (selectedCount === 1 && selectedNodeContent ? 360 : 240)
     : 435));
   const left = dragOffset ? Math.max(0, Math.min(baseLeft + dragOffset.dx, window.innerWidth - MENU_W - 8)) : baseLeft;
   const top = dragOffset ? Math.max(0, Math.min(baseTop + dragOffset.dy, window.innerHeight - 40)) : baseTop;
@@ -3672,6 +3703,10 @@ const ContextMenu = ({
               <div style={itemStyle} onMouseEnter={hoverBg} onMouseLeave={hoverOut} onClick={() => onMenuAction("edit")}>
                 <span>🪄 修改图片</span>
                 <span style={{ fontSize: 11, color: "rgba(255,255,255,0.35)" }}>指令 / 变体 / 局部</span>
+              </div>
+              <div style={itemStyle} onMouseEnter={hoverBg} onMouseLeave={hoverOut} onClick={onDuplicateEditable}>
+                <span>📦 复用为可编辑节点</span>
+                <span style={{ fontSize: 11, color: "rgba(255,255,255,0.35)" }}>改参考图/提示词</span>
               </div>
               <div style={itemStyle} onMouseEnter={hoverBg} onMouseLeave={hoverOut} onClick={onCopyImage}>
                 <span>📋 复制图片</span>
@@ -4044,6 +4079,13 @@ const EditPanel = ({
   const finishReferenceDrag = (e: React.PointerEvent<HTMLElement>) => {
     const drag = referenceDragRef.current;
     if (!drag || drag.pointerId !== e.pointerId) return;
+    const hitId = document
+      .elementFromPoint(e.clientX, e.clientY)
+      ?.closest<HTMLElement>("[data-edit-reference-id]")
+      ?.dataset.editReferenceId;
+    if (hitId && hitId !== drag.refId) {
+      onRefIdsChange(replaceReferenceSlot(drag.order, drag.refId, hitId), true);
+    }
     if (e.currentTarget.hasPointerCapture(e.pointerId)) {
       e.currentTarget.releasePointerCapture(e.pointerId);
     }
@@ -4119,7 +4161,7 @@ const EditPanel = ({
         </button>
       </div>
 
-      {/* 编号属于槽位；拖动时交换两个槽位里的图片，@图片N 文本保持不变。 */}
+      {/* 编号属于槽位；拖动时用拖入图替换目标槽位，@图片N 文本保持不变。 */}
       <div
         style={{
           margin: "2px 6px 6px",
@@ -4154,21 +4196,10 @@ const EditPanel = ({
                   if (!drag || drag.pointerId !== e.pointerId) return;
                   e.preventDefault();
                   setDragGhost((current) => current ? { ...current, x: e.clientX, y: e.clientY } : current);
-                  const hit = document
-                    .elementFromPoint(e.clientX, e.clientY)
-                    ?.closest<HTMLElement>("[data-edit-reference-id]");
-                  const hitId = hit?.dataset.editReferenceId;
-                  if (!hitId || hitId === drag.refId) return;
-                  const fromIndex = drag.order.indexOf(drag.refId);
-                  const toIndex = drag.order.indexOf(hitId);
-                  if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) return;
-                  const nextOrder = swapReferences(drag.order, fromIndex, toIndex);
-                  drag.order = nextOrder;
-                  onRefIdsChange(nextOrder, true);
                 }}
                 onPointerUp={finishReferenceDrag}
                 onPointerCancel={finishReferenceDrag}
-                title="拖动与另一张参考图交换"
+                title="拖到另一张参考图上替换该槽位"
                 style={{
                   position: "relative",
                   width: 42,
@@ -5409,7 +5440,16 @@ function PendingContainerNode({
   );
 
   const finishReferenceDrag = (e: React.PointerEvent<HTMLElement>) => {
-    if (!dragRef.current || dragRef.current.pointerId !== e.pointerId) return;
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== e.pointerId) return;
+    const hitId = document
+      .elementFromPoint(e.clientX, e.clientY)
+      ?.closest<HTMLElement>("[data-reference-id]")
+      ?.dataset.referenceId;
+    if (hitId && hitId !== drag.refId) {
+      const nextOrder = replaceReferenceSlot(drag.order, drag.refId, hitId);
+      applyReferenceOrder(drag.order, nextOrder, container.prompt, true);
+    }
     if (e.currentTarget.hasPointerCapture(e.pointerId)) {
       e.currentTarget.releasePointerCapture(e.pointerId);
     }
@@ -5521,7 +5561,7 @@ function PendingContainerNode({
           flexDirection: "column",
           padding: 10,
           boxSizing: "border-box",
-          overflowY: "auto",
+          overflowY: "hidden",
           overflowX: "hidden",
           background: isGenerating
             ? "rgba(167,139,250,0.12)"
@@ -5538,6 +5578,15 @@ function PendingContainerNode({
               ? "0 0 24px rgba(196,181,253,0.55)"
               : "0 4px 20px rgba(0,0,0,0.3)",
           backdropFilter: "blur(2px)",
+        }}
+      >
+      <div
+        style={{
+          flex: 1,
+          minHeight: 0,
+          overflowY: "auto",
+          overflowX: "hidden",
+          paddingRight: 2,
         }}
       >
       {/* 标题栏（拖动手柄） */}
@@ -5617,17 +5666,6 @@ function PendingContainerNode({
                 setDragGhost((current) =>
                   current ? { ...current, x: e.clientX, y: e.clientY } : current,
                 );
-                const hit = document
-                  .elementFromPoint(e.clientX, e.clientY)
-                  ?.closest<HTMLElement>("[data-reference-id]");
-                const hitId = hit?.dataset.referenceId;
-                if (!hitId || hitId === drag.refId) return;
-                const fromIndex = drag.order.indexOf(drag.refId);
-                const toIndex = drag.order.indexOf(hitId);
-                if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) return;
-                const nextOrder = swapReferences(drag.order, fromIndex, toIndex);
-                applyReferenceOrder(drag.order, nextOrder, container.prompt, true);
-                drag.order = nextOrder;
               }}
               onPointerUp={finishReferenceDrag}
               onPointerCancel={finishReferenceDrag}
@@ -5641,7 +5679,7 @@ function PendingContainerNode({
                 transition: "transform 120ms ease, opacity 120ms ease",
                 userSelect: "none",
               }}
-              title="拖动与另一张参考图交换"
+              title="拖到另一张参考图上替换该槽位"
             >
               <img
                 src={n.image_url}
@@ -5824,6 +5862,7 @@ function PendingContainerNode({
       {container.error && (
         <div style={{ color: "#f87171", fontSize: 11, marginTop: 5 }}>{container.error}</div>
       )}
+      </div>
 
       {/* 生成按钮 */}
       <button
@@ -5832,8 +5871,7 @@ function PendingContainerNode({
         style={{
           width: "100%",
           marginTop: 9,
-          position: "sticky",
-          bottom: 0,
+          flexShrink: 0,
           zIndex: 2,
           padding: "8px 0",
           background: isGenerating ? "rgba(167,139,250,0.4)" : "#a78bfa",
@@ -5954,12 +5992,12 @@ function PendingContainerNode({
 }
 
 function QuantitySelect({ value, onChange }: { value: number; onChange: (count: number) => void }) {
-  return <div style={{ marginTop: 8 }}>
+  return <div style={{ marginTop: 8, flexShrink: 0 }}>
     <div style={{ fontSize: 11, color: "rgba(255,255,255,0.62)", marginBottom: 5 }}>生成数量</div>
     <div style={{ display: "flex", gap: 4 }}>
       {[1, 2, 3, 4].map((count) => <button type="button" key={count} aria-pressed={value === count}
         onClick={() => onChange(count)} style={{ flex: 1, padding: "5px 0", border: 0, borderRadius: 5,
-          background: value === count ? "#6366f1" : "rgba(255,255,255,.08)", color: "#eee", fontSize: 11, cursor: "pointer" }}>
+          background: value === count ? "#a28bf3" : "rgba(255,255,255,.08)", color: value === count ? "#1a1a2e" : "#eee", fontSize: 11, cursor: "pointer" }}>
         {count} 张
       </button>)}
     </div>

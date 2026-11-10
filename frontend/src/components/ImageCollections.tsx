@@ -9,7 +9,7 @@ const buttonStyle: CSSProperties = { border: "1px solid rgba(196,181,253,.25)", 
 export function ImageCollectionCards({ groups, zoom, update, onManage }: {
   zoom: number;
   groups: ImageCollectionView[];
-  update: (id: string, patch: { collapsed: boolean }) => void;
+  update: (id: string, patch: { collapsed?: boolean; x?: number; y?: number }) => void;
   onManage: (id: string) => void;
 }) {
   return <>{groups.map((group) => <ImageCollectionCard key={`${group.id}:${group.coverId}`} group={group} zoom={zoom} update={update} onManage={onManage} />)}</>;
@@ -18,10 +18,12 @@ export function ImageCollectionCards({ groups, zoom, update, onManage }: {
 function ImageCollectionCard({ group, zoom, update, onManage }: {
   zoom: number;
   group: ImageCollectionView;
-  update: (id: string, patch: { collapsed: boolean }) => void;
+  update: (id: string, patch: { collapsed?: boolean; x?: number; y?: number }) => void;
   onManage: (id: string) => void;
 }) {
   const [activeId, setActiveId] = useState(group.cover.id);
+  const moving = useRef<{ pointerId: number; clientX: number; clientY: number; x: number; y: number } | null>(null);
+  const [position, setPosition] = useState<{ x: number; y: number } | null>(null);
   const activeIndex = Math.max(0, group.members.findIndex((node) => node.id === activeId));
   const active = group.members[activeIndex];
   const stageRef = useRef<HTMLDivElement>(null);
@@ -60,7 +62,7 @@ function ImageCollectionCard({ group, zoom, update, onManage }: {
   return <section data-collection-id={group.id} aria-label={`${group.name}，${group.members.length} 张图片`}
     onMouseDown={(event) => event.stopPropagation()}
     onContextMenu={(event) => { event.preventDefault(); event.stopPropagation(); onManage(group.id); }}
-    style={{ position: "absolute", left: group.x, top: group.collapsed ? group.y : group.y - 58,
+    style={{ position: "absolute", left: group.collapsed ? position?.x ?? group.x : group.x, top: group.collapsed ? position?.y ?? group.y : group.y - 58,
       width: group.width, boxSizing: "border-box", borderRadius: 12,
       background: group.collapsed ? "transparent" : "#25253d", padding: 10,
       animation: "ica-img-in .18s ease-out both", zIndex: 2 }}>
@@ -95,7 +97,7 @@ function ImageCollectionCard({ group, zoom, update, onManage }: {
       }}
       onPointerCancel={() => { gesture.current = null; setDrag({ x: 0, y: 0 }); }}
       onLostPointerCapture={() => { gesture.current = null; setDrag({ x: 0, y: 0 }); }}
-      style={{ position: "relative", height: 220, touchAction: "none", cursor: "grab", userSelect: "none", outlineOffset: 5 }}>
+      style={{ position: "relative", height: group.height - 66, touchAction: "none", cursor: "grab", userSelect: "none", outlineOffset: 5 }}>
       <style>{`
         .collection-swap-card { transition: transform 600ms cubic-bezier(.22,1,.36,1), opacity 350ms ease; }
         @media (prefers-reduced-motion: reduce) { .collection-swap-card { transition: none; } }
@@ -130,8 +132,31 @@ function ImageCollectionCard({ group, zoom, update, onManage }: {
         {activeIndex + 1} / {group.members.length} · #{active.index ?? active.id.slice(0, 8)}
       </span>
     </div>}
-    <div style={{ display: "flex", alignItems: "center", gap: 7, marginTop: group.collapsed ? 17 : 0, width: 260, transform: `scale(${labelScale})`, transformOrigin: "top left" }}>
-      <span title={group.name} style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13, color: "#f1efff" }}>{group.name}</span>
+    <div style={{ display: "flex", alignItems: "center", gap: 7, marginTop: group.collapsed ? 17 : 0, width: Math.max(260, (group.width - 20) / labelScale), transform: `scale(${labelScale})`, transformOrigin: "top left" }}>
+      <span title={group.collapsed ? `${group.name} · 拖动名称可移动图片组` : group.name}
+        role={group.collapsed ? "button" : undefined} aria-label={group.collapsed ? `移动图片组 ${group.name}` : undefined}
+        onPointerDown={(event) => {
+          if (!group.collapsed || event.button !== 0) return;
+          event.preventDefault(); event.stopPropagation();
+          event.currentTarget.setPointerCapture(event.pointerId);
+          moving.current = { pointerId: event.pointerId, clientX: event.clientX, clientY: event.clientY, x: group.x, y: group.y };
+        }}
+        onPointerMove={(event) => {
+          const start = moving.current;
+          if (!start || start.pointerId !== event.pointerId) return;
+          const next = { x: start.x + (event.clientX - start.clientX) / zoom, y: start.y + (event.clientY - start.clientY) / zoom };
+          setPosition(next); update(group.id, next);
+        }}
+        onPointerUp={(event) => {
+          if (moving.current?.pointerId !== event.pointerId) return;
+          const start = moving.current;
+          update(group.id, { x: start.x + (event.clientX - start.clientX) / zoom, y: start.y + (event.clientY - start.clientY) / zoom });
+          moving.current = null; setPosition(null);
+          if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+        }}
+        onPointerCancel={() => { moving.current = null; setPosition(null); }}
+        onLostPointerCapture={() => { moving.current = null; setPosition(null); }}
+        style={{ cursor: group.collapsed ? "grab" : undefined, touchAction: "none", userSelect: "none", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13, color: "#f1efff" }}>{group.name}</span>
       <button type="button" style={buttonStyle} onClick={() => update(group.id, { collapsed: !group.collapsed })}>{group.collapsed ? `展开 ${group.members.length}` : "收起"}</button>
       <button type="button" style={buttonStyle} onClick={() => onManage(group.id)}>管理</button>
     </div>

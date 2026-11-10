@@ -31,6 +31,7 @@ export async function createCanvas(name?: string): Promise<string> {
 
 export async function getCanvas(canvasId: string): Promise<CanvasState> {
   const res = await fetch(`${API_BASE}/canvas/${canvasId}`);
+  if (!res.ok) throw new Error(`画布加载失败：${res.status}`);
   return res.json();
 }
 

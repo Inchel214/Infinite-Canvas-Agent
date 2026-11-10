@@ -43,8 +43,14 @@ export function loadShortcutStore(): ShortcutStore {
     const parsed = JSON.parse(raw) as Record<string, unknown>;
     const isLegacy = !("canvas" in parsed) && !("editor" in parsed);
     return {
-      canvas: mergeGroup(defaults.canvas as BindingMap, isLegacy ? parsed : parsed.canvas) as ShortcutConfig,
-      editor: mergeGroup(defaults.editor as BindingMap, isLegacy ? undefined : parsed.editor) as EditorShortcutConfig,
+      canvas: mergeGroup(
+        defaults.canvas as unknown as BindingMap,
+        isLegacy ? parsed : parsed.canvas,
+      ) as unknown as ShortcutConfig,
+      editor: mergeGroup(
+        defaults.editor as unknown as BindingMap,
+        isLegacy ? undefined : parsed.editor,
+      ) as unknown as EditorShortcutConfig,
     };
   } catch {
     return defaults;
