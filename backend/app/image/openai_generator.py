@@ -156,6 +156,29 @@ def _mime_to_ext(mime: str) -> str:
     }.get(mime, "png")
 
 
+def _to_alpha_mask(mask_content: bytes, target_size: tuple[int, int] | None) -> bytes:
+    """把内部约定的『黑底白图』蒙版转换为 OpenAI 要求的 alpha 蒙版。
+
+    OpenAI /images/edits 的 mask 语义：PNG 中 alpha=0（全透明）的像素才会被编辑，
+    且蒙版尺寸必须与原图一致。内部约定是白色=要修改，因此：
+    白色(255) → alpha 0（透明，编辑）；黑色(0) → alpha 255（不透明，保留）。
+    羽化灰度会映射为半透明，实现软边缘。
+    """
+    import io
+
+    from PIL import Image
+
+    gray = Image.open(io.BytesIO(mask_content)).convert("L")
+    if target_size and gray.size != target_size:
+        gray = gray.resize(target_size, Image.LANCZOS)
+    alpha = gray.point(lambda v: 255 - v)
+    rgba = Image.new("RGBA", gray.size, (0, 0, 0, 255))
+    rgba.putalpha(alpha)
+    buf = io.BytesIO()
+    rgba.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 class OpenAIImageGenerator(BaseImageGenerator):
     """OpenAI 风格图片生成器（非流式）"""
 
@@ -358,7 +381,8 @@ class OpenAIImageGenerator(BaseImageGenerator):
         """调用 OpenAI inpainting API（局部编辑）。
 
         使用 /images/edits 端点，传入 image + mask + prompt。
-        mask 为 base64 data URL，白色区域为要修改的部分。
+        mask 为内部约定的 base64 data URL（黑底白图，白色=要修改），
+        上传前转换为 OpenAI 要求的 alpha 蒙版（透明=要修改）并与原图尺寸对齐。
         """
         import time as _time
         _t0 = _time.monotonic()
@@ -373,11 +397,20 @@ class OpenAIImageGenerator(BaseImageGenerator):
         image_content, image_mime = _fetch_image(image_url)
         image_ext = _mime_to_ext(image_mime)
 
-        # 获取蒙版（必须是 PNG）
+        # 获取蒙版并转换为 OpenAI alpha 语义（透明=要修改），尺寸对齐原图
         mask_content, mask_mime = _fetch_image(mask)
         if mask_mime != "image/png":
-            # 蒙版必须是 PNG，如果不是，需要转换
-            logger.warning("[OpenAI] 蒙版格式 %s 非 PNG，尝试直接使用", mask_mime)
+            logger.warning("[OpenAI] 蒙版格式 %s 非 PNG，仍会转换后使用", mask_mime)
+        try:
+            import io
+
+            from PIL import Image
+
+            with Image.open(io.BytesIO(image_content)) as im:
+                image_size = im.size
+            mask_content = _to_alpha_mask(mask_content, image_size)
+        except Exception as exc:
+            logger.warning("[OpenAI] 蒙版 alpha 转换失败，按原样上传: %s", exc)
 
         files = [
             ("image", (f"image.{image_ext}", image_content, image_mime)),
