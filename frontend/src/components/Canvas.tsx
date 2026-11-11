@@ -9,6 +9,7 @@ import { generateImageStream, updateNodePosition, uploadImageNode, undoCanvas, r
 import { ShortcutHelpPanel } from "./canvas/components/ShortcutHelpPanel";
 import { useCanvasShortcuts } from "./canvas/hooks/useCanvasShortcuts";
 import { matchesShortcut } from "./canvas/state/canvasShortcuts";
+import { swapReferenceSlots } from "./canvas/utils/references";
 
 // 右键菜单可触发的操作类型（experienceIds：风格库多选的风格，直连生图时后端确定性拼接）
 export type CanvasAction =
@@ -65,31 +66,9 @@ const RESOLUTIONS = ["1K", "2K", "4K"] as const;
 const EXPERIENCE_USAGE_KEY = "ica:experienceUsage";
 const EXPERIENCE_USAGE_EVENT = "ica:experienceUsageChanged";
 
-// 画布背景色预设：提供不同明暗底色，便于透明/暗色图片在不同对比下查看
-const BG_PRESETS = [
-  { label: "深蓝", value: "#1a1a2e" },
-  { label: "深灰", value: "#22222e" },
-  { label: "纯黑", value: "#0a0a0f" },
-  { label: "中灰", value: "#6b6b73" },
-  { label: "浅灰", value: "#d4d4d8" },
-  { label: "纯白", value: "#f5f5f7" },
-] as const;
-const DEFAULT_BG = BG_PRESETS[0].value;
+const DARK_BG = "#1a1a2e";
+const LIGHT_BG = "#f5f5f7";
 const BG_STORAGE_KEY = "ica:canvasBg";
-
-function hexToRgb(hex: string): { r: number; g: number; b: number } {
-  const h = (hex || "#000000").replace("#", "");
-  const n = h.length === 3 ? h.split("").map((c) => c + c).join("") : h;
-  const num = parseInt(n.padEnd(6, "0").slice(0, 6), 16);
-  return { r: (num >> 16) & 255, g: (num >> 8) & 255, b: num & 255 };
-}
-
-// 相对亮度（WCAG），>0.5 视为浅色背景，网格点/图标需用深色
-function isLightBg(hex: string): boolean {
-  const { r, g, b } = hexToRgb(hex);
-  const toLin = (c: number) => (c <= 10 ? c / 3294 : Math.pow((c / 269 + 0.0514), 2.4));
-  return 0.2126 * toLin(r) + 0.7152 * toLin(g) + 0.0722 * toLin(b) > 0.5;
-}
 
 function readExperienceUsage(): Record<string, number> {
   try {
@@ -117,7 +96,7 @@ function recordExperienceUsage(ids?: string[]) {
 
 const IMAGE_MENTION_RE = /@图片(\d+)/g;
 
-// 删除参考图时让图片提及继续指向原图；槽位替换会显式跳过这一步。
+// 删除参考图时让图片提及继续指向原图；槽位交换会显式跳过这一步。
 function remapImageMentions(prompt: string, oldRefIds: string[], newRefIds: string[]): string {
   return prompt
     .replace(IMAGE_MENTION_RE, (mention, rawIndex: string) => {
@@ -128,17 +107,6 @@ function remapImageMentions(prompt: string, oldRefIds: string[], newRefIds: stri
     })
     .replace(/[ \t]{2,}/g, " ")
     .replace(/[ \t]+\n/g, "\n");
-}
-
-// 拖图到另一个参考图槽位时，用拖入图替换目标槽位，并移除原槽位。
-// 编号属于槽位而不是图片实体，因此调用方必须保留 @图片N 文本。
-function replaceReferenceSlot(refIds: string[], draggedId: string, targetId: string): string[] {
-  if (draggedId === targetId || !refIds.includes(draggedId) || !refIds.includes(targetId)) return refIds;
-  const next = refIds.filter((refId) => refId !== draggedId);
-  const targetIndex = next.indexOf(targetId);
-  if (targetIndex < 0) return refIds;
-  next[targetIndex] = draggedId;
-  return next;
 }
 
 // 按节点当前宽高比找最接近的预设或返回自定义比例（编辑图片时默认继承原图比例）
@@ -565,15 +533,14 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   const [localStatusMsg, setLocalStatusMsg] = useState<string | null>(null);
   const [showHelp, setShowHelp] = useState(false);
 
-  // 画布背景色偏好：持久化到 localStorage，便于透明/暗色图片切换底色查看
+  // 画布只保留明/暗两档，避免颜色选择器打断画布操作。
   const [bgColor, setBgColor] = useState<string>(() => {
     try {
-      return localStorage.getItem(BG_STORAGE_KEY) || DEFAULT_BG;
+      return localStorage.getItem(BG_STORAGE_KEY) === LIGHT_BG ? LIGHT_BG : DARK_BG;
     } catch {
-      return DEFAULT_BG;
+      return DARK_BG;
     }
   });
-  const [showBgPicker, setShowBgPicker] = useState(false);
   const changeBgColor = useCallback((color: string) => {
     setBgColor(color);
     try {
@@ -582,9 +549,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       /* 隐私模式等写入失败时忽略 */
     }
   }, []);
-  const bgIsLight = isLightBg(bgColor);
+  const bgIsLight = bgColor === LIGHT_BG;
   const gridDotColor = bgIsLight ? "rgba(0,0,0,0.08)" : "rgba(255,255,255,0.08)";
-  const iconColor = bgIsLight ? "#1a1a2e" : "#e5e7eb";
   
   // 快捷键 Hook：提供快捷键配置和帮助面板支持
   // 注意：实际快捷键逻辑仍保留在原有 useEffect 中（与画布状态紧密耦合）
@@ -730,6 +696,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   }), [rawNodes, localOverrides, sizeOverrides]);
 
   const collections = useImageCollections(canvasId, nodes);
+  const [collectionDropTargetId, setCollectionDropTargetId] = useState<string | null>(null);
   const [managedCollectionId, setManagedCollectionId] = useState<string | null>(null);
   const managedCollection = collections.views.find((group) => group.id === managedCollectionId);
   const displayBounds = useMemo(() => [...collections.visibleNodes, ...collections.views.filter((group) => group.collapsed)], [collections.visibleNodes, collections.views]);
@@ -1404,6 +1371,10 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       const mouseY = e.clientY - rect.top;
       const worldX = (mouseX - pan.x) / zoom;
       const worldY = (mouseY - pan.y) / zoom;
+      const dropTarget = collections.views.find((group) => group.collapsed && !group.memberIds.includes(draggingNode)
+        && worldX >= group.x && worldX <= group.x + group.width
+        && worldY >= group.y && worldY <= group.y + group.height);
+      setCollectionDropTargetId(dropTarget?.id ?? null);
       const groupOrigins = dragGroupOriginsRef.current;
       const groupStart = dragGroupStartRef.current;
 
@@ -1449,7 +1420,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         });
       });
     }
-  }, [connecting, draggingContainer, draggingNode, isPanning, pan, zoom, dragOffset, screenToWorld]);
+  }, [connecting, draggingContainer, draggingNode, isPanning, pan, zoom, dragOffset, screenToWorld, collections.views]);
 
   const handleMouseUp = useCallback((e: React.MouseEvent) => {
     // 连线结束：编辑态按钳制后的屏幕矩形命中；生成态按世界卡片的实际屏幕投影命中。
@@ -1562,6 +1533,13 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         }
         dragGroupOriginsRef.current = null;
         dragGroupStartRef.current = null;
+        if (!groupOrigins && collectionDropTargetId && collections.add(collectionDropTargetId, draggingNode)) {
+          const targetName = collections.views.find((group) => group.id === collectionDropTargetId)?.name ?? "收纳组";
+          setSelectedIds(new Set());
+          setMenu(null);
+          setLocalStatusMsg(`已加入「${targetName}」`);
+          window.setTimeout(() => setLocalStatusMsg(null), 2200);
+        }
       } else {
         // click（位移 < 4px）：处理选择
         const nodeId = draggingNode;
@@ -1581,6 +1559,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         }
       }
       setDraggingNode(null);
+      setCollectionDropTargetId(null);
       dragStartPosRef.current = null;
       return;
     }
@@ -1595,7 +1574,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       backgroundDownRef.current = null;
       setIsPanning(false);
     }
-  }, [collections.visibleNodes, marquee, draggingNode, localOverrides, onNodeMoved, onNodesMoved, isPanning, pan, zoom, connecting, containers, generatingIds, updateContainer, screenToWorld, draggingContainer, createContainer, menu, getContainerPlacement, editPanel, editPanelRect]);
+  }, [collections, collectionDropTargetId, marquee, draggingNode, localOverrides, onNodeMoved, onNodesMoved, isPanning, pan, zoom, connecting, containers, generatingIds, updateContainer, screenToWorld, draggingContainer, createContainer, menu, getContainerPlacement, editPanel, editPanelRect]);
 
   // 图片节点拖拽开始（记录起点用于 click/drag 判定）
   const handleNodeMouseDown = useCallback((e: React.MouseEvent, node: CanvasNode) => {
@@ -2567,7 +2546,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
           />
         ))}
 
-        <ImageCollectionCards zoom={zoom} groups={collections.views} update={(id, patch) => {
+        <ImageCollectionCards zoom={zoom} groups={collections.views} dropTargetId={collectionDropTargetId} update={(id, patch) => {
           collections.update(id, patch);
           if (patch.collapsed) {
             const members = new Set(collections.views.find((group) => group.id === id)?.memberIds);
@@ -3096,161 +3075,29 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         <span style={{ fontSize: 16, fontWeight: 700, lineHeight: 1 }}>?</span>
       </button>
 
-      {/* 画布背景色选择按钮：按钮本身用当前底色，叠加调色板图标（图标色随底色明暗反转） */}
+      {/* 明暗画布切换：图标表达当前模式，点击直接切换，不再打开二级面板。 */}
       <button
         type="button"
         className="ica-fitview-btn"
-        title="画布背景色：切换底色便于查看透明/暗色图片"
+        aria-label={bgIsLight ? "切换为暗色画布" : "切换为亮色画布"}
+        title={bgIsLight ? "亮色画布 · 点击切换为暗色" : "暗色画布 · 点击切换为亮色"}
         style={{
           position: "absolute",
           bottom: 16,
           left: 176,
           background: bgColor,
           border: `1px solid ${bgIsLight ? "rgba(0,0,0,0.35)" : "rgba(255,255,255,0.35)"}`,
+          color: bgIsLight ? "#d97706" : "#e0e7ff",
         }}
         onMouseDown={(e) => e.stopPropagation()}
         onClick={(e) => {
           e.stopPropagation();
-          setShowBgPicker((prev) => !prev);
+          changeBgColor(bgIsLight ? DARK_BG : LIGHT_BG);
         }}
       >
-        <svg
-          width="18"
-          height="18"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke={iconColor}
-          strokeWidth="2"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        >
-          <circle cx="13.5" cy="6.5" r="1.5" fill={iconColor} />
-          <circle cx="17.5" cy="10.5" r="1.5" fill={iconColor} />
-          <circle cx="8.5" cy="7.5" r="1.5" fill={iconColor} />
-          <circle cx="6.5" cy="12.5" r="1.5" fill={iconColor} />
-          <path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.93 0 1.5-.73 1.5-1.6 0-.43-.17-.82-.44-1.11-.26-.28-.43-.65-.43-1.04 0-.83.67-1.5 1.5-1.5H16c3.31 0 6-2.69 6-6 0-4.97-4.48-9-10-9Z" />
-        </svg>
+        {bgIsLight ? <span aria-hidden="true" style={{ fontSize: 17, lineHeight: 1 }}>☀</span>
+          : <span aria-hidden="true" style={{ fontSize: 17, lineHeight: 1 }}>☾</span>}
       </button>
-
-      {/* 背景色选择面板 */}
-      {showBgPicker && (
-        <>
-          <div
-            style={{ position: "fixed", inset: 0, zIndex: 599 }}
-            onMouseDown={(e) => {
-              e.stopPropagation();
-              setShowBgPicker(false);
-            }}
-          />
-          <div
-            style={{
-              position: "absolute",
-              bottom: 56,
-              left: 16,
-              zIndex: 600,
-              background: "rgba(20,20,40,0.98)",
-              border: "1px solid rgba(255,255,255,0.12)",
-              borderRadius: 10,
-              padding: 12,
-              boxShadow: "0 8px 32px rgba(0,0,0,0.5)",
-              backdropFilter: "blur(8px)",
-              width: 200,
-            }}
-            onMouseDown={(e) => e.stopPropagation()}
-          >
-            <div
-              style={{
-                fontSize: 12,
-                color: "rgba(255,255,255,0.6)",
-                marginBottom: 8,
-                display: "flex",
-                justifyContent: "space-between",
-                alignItems: "center",
-              }}
-            >
-              <span>画布背景色</span>
-              <button
-                type="button"
-                title="恢复默认"
-                onClick={() => changeBgColor(DEFAULT_BG)}
-                style={{
-                  background: "transparent",
-                  border: "none",
-                  color: "rgba(255,255,255,0.45)",
-                  cursor: "pointer",
-                  fontSize: 11,
-                  padding: 0,
-                }}
-              >
-                默认
-              </button>
-            </div>
-            <div
-              style={{
-                display: "grid",
-                gridTemplateColumns: "repeat(3, 1fr)",
-                gap: 8,
-                marginBottom: 10,
-              }}
-            >
-              {BG_PRESETS.map((p) => (
-                <button
-                  key={p.value}
-                  type="button"
-                  title={p.label}
-                  onClick={() => changeBgColor(p.value)}
-                  style={{
-                    height: 28,
-                    borderRadius: 6,
-                    background: p.value,
-                    border:
-                      bgColor.toLowerCase() === p.value.toLowerCase()
-                        ? "2px solid #a78bfa"
-                        : "1px solid rgba(255,255,255,0.18)",
-                    cursor: "pointer",
-                    padding: 0,
-                    position: "relative",
-                  }}
-                />
-              ))}
-            </div>
-            <label
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 8,
-                fontSize: 12,
-                color: "rgba(255,255,255,0.7)",
-                cursor: "pointer",
-              }}
-            >
-              <span>自定义</span>
-              <input
-                type="color"
-                value={bgColor}
-                onChange={(e) => changeBgColor(e.target.value)}
-                style={{
-                  width: 28,
-                  height: 22,
-                  padding: 0,
-                  border: "none",
-                  background: "transparent",
-                  cursor: "pointer",
-                }}
-              />
-              <span
-                style={{
-                  fontFamily: "Consolas, monospace",
-                  fontSize: 11,
-                  color: "rgba(255,255,255,0.45)",
-                }}
-              >
-                {bgColor}
-              </span>
-            </label>
-          </div>
-        </>
-      )}
 
       {/* 快捷键帮助面板（增强版，支持自定义） */}
       {showHelp && (
@@ -4155,6 +4002,8 @@ const EditPanel = ({
   const [sourcePromptExpanded, setSourcePromptExpanded] = useState(false);
   const [sourcePromptCopied, setSourcePromptCopied] = useState(false);
   const [draggingRefId, setDraggingRefId] = useState<string | null>(null);
+  const [referenceDropTargetId, setReferenceDropTargetId] = useState<string | null>(null);
+  const [replacementNotice, setReplacementNotice] = useState<string | null>(null);
   const [dragGhost, setDragGhost] = useState<{ imageUrl: string; x: number; y: number } | null>(null);
   const referenceDragRef = useRef<{ pointerId: number; refId: string; order: string[] } | null>(null);
   const left = Math.min(x, window.innerWidth - panelW - 8);
@@ -4287,13 +4136,18 @@ const EditPanel = ({
       ?.closest<HTMLElement>("[data-edit-reference-id]")
       ?.dataset.editReferenceId;
     if (hitId && hitId !== drag.refId) {
-      onRefIdsChange(replaceReferenceSlot(drag.order, drag.refId, hitId), true);
+      const sourceIndex = drag.order.indexOf(drag.refId);
+      const targetIndex = drag.order.indexOf(hitId);
+      onRefIdsChange(swapReferenceSlots(drag.order, drag.refId, hitId), true);
+      setReplacementNotice(`已交换 图片${sourceIndex + 1} 与 图片${targetIndex + 1}`);
+      window.setTimeout(() => setReplacementNotice(null), 1800);
     }
     if (e.currentTarget.hasPointerCapture(e.pointerId)) {
       e.currentTarget.releasePointerCapture(e.pointerId);
     }
     referenceDragRef.current = null;
     setDraggingRefId(null);
+    setReferenceDropTargetId(null);
     setDragGhost(null);
   };
 
@@ -4364,7 +4218,7 @@ const EditPanel = ({
         </button>
       </div>
 
-      {/* 编号属于槽位；拖动时用拖入图替换目标槽位，@图片N 文本保持不变。 */}
+      {/* 编号属于槽位；拖动时交换两个槽位里的图片，@图片N 文本保持不变。 */}
       <div
         style={{
           margin: "2px 6px 6px",
@@ -4374,9 +4228,16 @@ const EditPanel = ({
           border: "1px dashed rgba(167,139,250,0.34)",
         }}
       >
+        <div role="status" aria-live="polite" style={{ minHeight: 16, margin: "0 0 6px", color: referenceDropTargetId ? "#ddd6fe" : replacementNotice ? "#86efac" : "rgba(255,255,255,.5)", fontSize: 10.5, lineHeight: "16px" }}>
+          {referenceDropTargetId
+            ? `松开交换 图片${refNodes.findIndex((ref) => ref.id === draggingRefId) + 1} 与 图片${refNodes.findIndex((ref) => ref.id === referenceDropTargetId) + 1}`
+            : replacementNotice ?? "拖动一张参考图到另一槽位即可交换"}
+        </div>
         <div style={{ display: "flex", gap: 8, alignItems: "flex-start", flexWrap: "wrap" }}>
           {refNodes.map((node, index) => {
             const isBase = index === 0;
+            const isDropTarget = referenceDropTargetId === node.id;
+            const isDraggingReference = draggingRefId === node.id;
             return (
               <div
                 key={node.id}
@@ -4392,24 +4253,31 @@ const EditPanel = ({
                     order: refNodes.map((ref) => ref.id),
                   };
                   setDraggingRefId(node.id);
+                  setReferenceDropTargetId(null);
+                  setReplacementNotice(null);
                   setDragGhost({ imageUrl: node.image_url ?? "", x: e.clientX, y: e.clientY });
                 }}
                 onPointerMove={(e) => {
                   const drag = referenceDragRef.current;
                   if (!drag || drag.pointerId !== e.pointerId) return;
                   e.preventDefault();
+                  const hitId = document.elementFromPoint(e.clientX, e.clientY)
+                    ?.closest<HTMLElement>("[data-edit-reference-id]")?.dataset.editReferenceId;
+                  setReferenceDropTargetId(hitId && hitId !== drag.refId ? hitId : null);
                   setDragGhost((current) => current ? { ...current, x: e.clientX, y: e.clientY } : current);
                 }}
                 onPointerUp={finishReferenceDrag}
                 onPointerCancel={finishReferenceDrag}
-                title="拖到另一张参考图上替换该槽位"
+                title="拖到另一张参考图上交换槽位"
                 style={{
                   position: "relative",
                   width: 42,
                   paddingBottom: 11,
                   touchAction: "none",
-                  cursor: draggingRefId === node.id ? "grabbing" : "grab",
-                  opacity: draggingRefId === node.id ? 0.28 : 1,
+                  cursor: isDraggingReference ? "grabbing" : "grab",
+                  opacity: isDraggingReference ? 0.28 : 1,
+                  transform: isDropTarget ? "translateY(-3px) scale(1.08)" : "none",
+                  transition: "transform .14s ease, opacity .14s ease",
                   userSelect: "none",
                 }}
               >
@@ -4423,11 +4291,16 @@ const EditPanel = ({
                     display: "block",
                     objectFit: "cover",
                     borderRadius: 7,
-                    border: isBase
-                      ? "1.5px solid rgba(196,181,253,0.95)"
-                      : "1px solid rgba(167,139,250,0.62)",
+                    border: isDropTarget
+                      ? "2px solid #a78bfa"
+                      : isBase
+                        ? "1.5px solid rgba(196,181,253,0.95)"
+                        : "1px solid rgba(167,139,250,0.62)",
+                    boxShadow: isDropTarget ? "0 0 0 4px rgba(167,139,250,.22), 0 8px 18px rgba(0,0,0,.45)" : undefined,
                   }}
                 />
+                {isDropTarget && <span style={{ position: "absolute", inset: 0, height: 42, display: "grid", placeItems: "center", borderRadius: 7,
+                  background: "rgba(76,29,149,.68)", color: "white", fontSize: 9, fontWeight: 700, pointerEvents: "none" }}>交换</span>}
                 <span
                   style={{
                     position: "absolute",
@@ -5618,6 +5491,7 @@ function PendingContainerNode({
   // Pointer Events 同时覆盖鼠标和触屏。拖动过程中以本地快照连续换位，避免 React
   // 状态异步更新导致快速跨过多个缩略图时顺序跳回。
   const [draggingRefId, setDraggingRefId] = useState<string | null>(null);
+  const [referenceDropTargetId, setReferenceDropTargetId] = useState<string | null>(null);
   const [dragGhost, setDragGhost] = useState<{ imageUrl: string; x: number; y: number } | null>(null);
   const dragRef = useRef<{
     pointerId: number;
@@ -5650,7 +5524,7 @@ function PendingContainerNode({
       ?.closest<HTMLElement>("[data-reference-id]")
       ?.dataset.referenceId;
     if (hitId && hitId !== drag.refId) {
-      const nextOrder = replaceReferenceSlot(drag.order, drag.refId, hitId);
+      const nextOrder = swapReferenceSlots(drag.order, drag.refId, hitId);
       applyReferenceOrder(drag.order, nextOrder, container.prompt, true);
     }
     if (e.currentTarget.hasPointerCapture(e.pointerId)) {
@@ -5658,6 +5532,7 @@ function PendingContainerNode({
     }
     dragRef.current = null;
     setDraggingRefId(null);
+    setReferenceDropTargetId(null);
     setDragGhost(null);
   };
 
@@ -5860,12 +5735,16 @@ function PendingContainerNode({
                   order: [...container.refIds],
                 };
                 setDraggingRefId(n.id);
+                setReferenceDropTargetId(null);
                 setDragGhost({ imageUrl: n.image_url ?? "", x: e.clientX, y: e.clientY });
               }}
               onPointerMove={(e) => {
                 const drag = dragRef.current;
                 if (!drag || drag.pointerId !== e.pointerId) return;
                 e.preventDefault();
+                const hitId = document.elementFromPoint(e.clientX, e.clientY)
+                  ?.closest<HTMLElement>("[data-reference-id]")?.dataset.referenceId;
+                setReferenceDropTargetId(hitId && hitId !== drag.refId ? hitId : null);
                 setDragGhost((current) =>
                   current ? { ...current, x: e.clientX, y: e.clientY } : current,
                 );
@@ -5879,10 +5758,11 @@ function PendingContainerNode({
                 touchAction: "none",
                 cursor: draggingRefId === n.id ? "grabbing" : "grab",
                 opacity: draggingRefId === n.id ? 0.3 : 1,
+                transform: referenceDropTargetId === n.id ? "translateY(-3px) scale(1.08)" : "none",
                 transition: "transform 120ms ease, opacity 120ms ease",
                 userSelect: "none",
               }}
-              title="拖到另一张参考图上替换该槽位"
+              title="拖到另一张参考图上交换槽位"
             >
               <img
                 src={n.image_url}
@@ -5893,10 +5773,13 @@ function PendingContainerNode({
                   height: 40,
                   objectFit: "cover",
                   borderRadius: 8,
-                  border: "1px solid rgba(167,139,250,0.75)",
+                  border: referenceDropTargetId === n.id ? "2px solid #c4b5fd" : "1px solid rgba(167,139,250,0.75)",
+                  boxShadow: referenceDropTargetId === n.id ? "0 0 0 4px rgba(167,139,250,.28), 0 8px 20px rgba(0,0,0,.48)" : undefined,
                   display: "block",
                 }}
               />
+              {referenceDropTargetId === n.id && <span style={{ position: "absolute", inset: 0, height: 40, display: "grid", placeItems: "center",
+                borderRadius: 8, background: "rgba(76,29,149,.72)", color: "white", fontSize: 9, fontWeight: 700, pointerEvents: "none", zIndex: 2 }}>交换</span>}
               <span
                 style={{
                   position: "absolute",

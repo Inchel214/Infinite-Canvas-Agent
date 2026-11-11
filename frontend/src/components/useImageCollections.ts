@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import type { CanvasNode } from "../types/canvas";
 
-export type Collection = { id: string; name: string; memberIds: string[]; coverId: string; collapsed: boolean; x?: number; y?: number };
-export type ImageCollectionView = Collection & { members: CanvasNode[]; cover: CanvasNode; x: number; y: number; width: number; height: number };
+export type Collection = { id: string; name: string; memberIds: string[]; coverId: string; collapsed: boolean; x?: number; y?: number; scale?: number };
+export type ImageCollectionView = Collection & { members: CanvasNode[]; cover: CanvasNode; x: number; y: number; width: number; height: number; scale: number };
 
 // Collections are presentation metadata: original nodes, coordinates and references remain intact.
 export function useImageCollections(canvasId: string | null, nodes: CanvasNode[]) {
@@ -18,6 +18,7 @@ export function useImageCollections(canvasId: string | null, nodes: CanvasNode[]
         memberIds.forEach((id: string) => used.add(id));
         return memberIds.length ? [{ id: item.id, name: item.name.slice(0, 80), memberIds,
           ...(Number.isFinite(item.x) && Number.isFinite(item.y) ? { x: item.x, y: item.y } : {}),
+          ...(Number.isFinite(item.scale) ? { scale: Math.max(.4, Math.min(3, item.scale)) } : {}),
           coverId: memberIds.includes(item.coverId) ? item.coverId : memberIds[0], collapsed: item.collapsed !== false }] : [];
       });
     } catch { return []; }
@@ -39,12 +40,21 @@ export function useImageCollections(canvasId: string | null, nodes: CanvasNode[]
     if (!members.length) return [];
     const cover = members.find((node) => node.id === collection.coverId) ?? members[0];
     // Canvas nodes already include the user's local display-size overrides.
-    const averageWidth = members.reduce((sum, node) => sum + (Number.isFinite(node.width) && node.width > 0 ? node.width : 216), 0) / members.length;
-    const averageHeight = members.reduce((sum, node) => sum + (Number.isFinite(node.height) && node.height > 0 ? node.height : 220), 0) / members.length;
+    const largest = members.reduce((best, node) => {
+      const width = Number.isFinite(node.width) && node.width > 0 ? node.width : 216;
+      const height = Number.isFinite(node.height) && node.height > 0 ? node.height : 220;
+      const bestWidth = Number.isFinite(best.width) && best.width > 0 ? best.width : 216;
+      const bestHeight = Number.isFinite(best.height) && best.height > 0 ? best.height : 220;
+      return width * height > bestWidth * bestHeight ? node : best;
+    }, members[0]);
+    const largestWidth = Number.isFinite(largest.width) && largest.width > 0 ? largest.width : 216;
+    const largestHeight = Number.isFinite(largest.height) && largest.height > 0 ? largest.height : 220;
+    const scale = Number.isFinite(collection.scale) ? Math.max(.4, Math.min(3, collection.scale!)) : 1;
     return [{ ...collection, members, cover,
       x: collection.collapsed && collection.x != null ? collection.x : Math.min(...members.map((node) => node.x)),
       y: collection.collapsed && collection.y != null ? collection.y : Math.min(...members.map((node) => node.y)),
-      width: averageWidth + 64, height: collection.collapsed ? averageHeight + 66 : 48 }];
+      scale,
+      width: largestWidth * scale + 64, height: collection.collapsed ? largestHeight * scale + 66 : 48 }];
   }), [collections, nodes]);
   const collapsedByNode = new Map<string, ImageCollectionView>();
   views.filter((group) => group.collapsed).forEach((group) => group.members.forEach((node) => collapsedByNode.set(node.id, group)));
@@ -66,6 +76,16 @@ export function useImageCollections(canvasId: string | null, nodes: CanvasNode[]
     const memberIds = group.memberIds.filter((nodeId) => nodeId !== memberId);
     return { ...group, memberIds, coverId: group.coverId === memberId ? memberIds[0] ?? "" : group.coverId };
   }).filter((group) => group.memberIds.length));
+  const add = (id: string, memberId: string) => {
+    const node = nodes.find((item) => item.id === memberId);
+    if (!node || node.type !== "image" || !node.image_url) return false;
+    setCollections((previous) => previous
+      .map((group) => group.id === id
+        ? { ...group, memberIds: group.memberIds.includes(memberId) ? group.memberIds : [...group.memberIds, memberId] }
+        : { ...group, memberIds: group.memberIds.filter((nodeId) => nodeId !== memberId), coverId: group.coverId === memberId ? group.memberIds.find((nodeId) => nodeId !== memberId) ?? "" : group.coverId })
+      .filter((group) => group.memberIds.length));
+    return true;
+  };
   const dissolve = (id: string) => setCollections((previous) => previous.filter((group) => group.id !== id));
-  return { views, visibleNodes, collapsedByNode, update, create, remove, dissolve, saveError };
+  return { views, visibleNodes, collapsedByNode, update, create, add, remove, dissolve, saveError };
 }

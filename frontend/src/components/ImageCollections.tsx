@@ -6,19 +6,21 @@ import type { ImageCollectionView } from "./useImageCollections";
 const buttonStyle: CSSProperties = { border: "1px solid rgba(196,181,253,.25)", borderRadius: 6,
   background: "rgba(167,139,250,.1)", color: "#e5e7eb", padding: "6px 10px", cursor: "pointer", fontSize: 12 };
 
-export function ImageCollectionCards({ groups, zoom, update, onManage }: {
+export function ImageCollectionCards({ groups, zoom, dropTargetId, update, onManage }: {
   zoom: number;
   groups: ImageCollectionView[];
-  update: (id: string, patch: { collapsed?: boolean; x?: number; y?: number }) => void;
+  dropTargetId?: string | null;
+  update: (id: string, patch: { collapsed?: boolean; x?: number; y?: number; scale?: number }) => void;
   onManage: (id: string) => void;
 }) {
-  return <>{groups.map((group) => <ImageCollectionCard key={`${group.id}:${group.coverId}`} group={group} zoom={zoom} update={update} onManage={onManage} />)}</>;
+  return <>{groups.map((group) => <ImageCollectionCard key={`${group.id}:${group.coverId}`} group={group} zoom={zoom} isDropTarget={dropTargetId === group.id} update={update} onManage={onManage} />)}</>;
 }
 
-function ImageCollectionCard({ group, zoom, update, onManage }: {
+function ImageCollectionCard({ group, zoom, isDropTarget, update, onManage }: {
   zoom: number;
   group: ImageCollectionView;
-  update: (id: string, patch: { collapsed?: boolean; x?: number; y?: number }) => void;
+  isDropTarget: boolean;
+  update: (id: string, patch: { collapsed?: boolean; x?: number; y?: number; scale?: number }) => void;
   onManage: (id: string) => void;
 }) {
   const [activeId, setActiveId] = useState(group.cover.id);
@@ -29,6 +31,13 @@ function ImageCollectionCard({ group, zoom, update, onManage }: {
   const stageRef = useRef<HTMLDivElement>(null);
   const gesture = useRef<{ pointerId: number; x: number; y: number } | null>(null);
   const [drag, setDrag] = useState({ x: 0, y: 0 });
+  const resizing = useRef<{ pointerId: number; clientX: number; clientY: number; scale: number; nextScale: number } | null>(null);
+  const [scalePreview, setScalePreview] = useState<number | null>(null);
+  const effectiveScale = scalePreview ?? group.scale;
+  const baseWidth = (group.width - 64) / group.scale;
+  const baseHeight = (group.height - 66) / group.scale;
+  const renderedWidth = group.collapsed ? baseWidth * effectiveScale + 64 : group.width;
+  const renderedHeight = group.collapsed ? baseHeight * effectiveScale + 66 : group.height;
   const labelScale = Math.max(1, 1 / Math.max(zoom, 0.05));
   const step = useCallback((direction: number) => setActiveId((previous) => {
     const index = Math.max(0, group.members.findIndex((node) => node.id === previous));
@@ -63,9 +72,17 @@ function ImageCollectionCard({ group, zoom, update, onManage }: {
     onMouseDown={(event) => event.stopPropagation()}
     onContextMenu={(event) => { event.preventDefault(); event.stopPropagation(); onManage(group.id); }}
     style={{ position: "absolute", left: group.collapsed ? position?.x ?? group.x : group.x, top: group.collapsed ? position?.y ?? group.y : group.y - 58,
-      width: group.width, boxSizing: "border-box", borderRadius: 12,
+      width: renderedWidth, boxSizing: "border-box", borderRadius: 12,
       background: group.collapsed ? "transparent" : "#25253d", padding: 10,
-      animation: "ica-img-in .18s ease-out both", zIndex: 2 }}>
+      outline: isDropTarget ? `${Math.max(2, 3 / Math.max(zoom, .05))}px solid #a78bfa` : "none",
+      outlineOffset: isDropTarget ? 8 : 0,
+      filter: isDropTarget ? "drop-shadow(0 0 18px rgba(167,139,250,.72))" : undefined,
+      transition: "outline-color .14s ease, filter .14s ease, width .12s ease, height .12s ease",
+      animation: "ica-img-in .18s ease-out both", zIndex: isDropTarget ? 6 : 2 }}>
+    {isDropTarget && <div role="status" style={{ position: "absolute", left: "50%", top: -18, transform: `translate(-50%, -100%) scale(${labelScale})`, transformOrigin: "center bottom",
+      borderRadius: 8, padding: "5px 9px", background: "#7c3aed", color: "white", fontSize: 12, fontWeight: 650, whiteSpace: "nowrap", pointerEvents: "none", boxShadow: "0 6px 20px #0007" }}>
+      松开加入「{group.name}」
+    </div>}
     {group.collapsed && <div ref={stageRef} role="region" aria-label="图片组轮播" tabIndex={0}
       title="点击、左右拖动、横向滚动或点击箭头切换"
       onKeyDown={(event) => {
@@ -97,7 +114,7 @@ function ImageCollectionCard({ group, zoom, update, onManage }: {
       }}
       onPointerCancel={() => { gesture.current = null; setDrag({ x: 0, y: 0 }); }}
       onLostPointerCapture={() => { gesture.current = null; setDrag({ x: 0, y: 0 }); }}
-      style={{ position: "relative", height: group.height - 66, touchAction: "none", cursor: "grab", userSelect: "none", outlineOffset: 5 }}>
+      style={{ position: "relative", height: renderedHeight - 66, touchAction: "none", cursor: "grab", userSelect: "none", outlineOffset: 5 }}>
       <style>{`
         .collection-swap-card { transition: transform 600ms cubic-bezier(.22,1,.36,1), opacity 350ms ease; }
         @media (prefers-reduced-motion: reduce) { .collection-swap-card { transition: none; } }
@@ -132,7 +149,7 @@ function ImageCollectionCard({ group, zoom, update, onManage }: {
         {activeIndex + 1} / {group.members.length} · #{active.index ?? active.id.slice(0, 8)}
       </span>
     </div>}
-    <div style={{ display: "flex", alignItems: "center", gap: 7, marginTop: group.collapsed ? 17 : 0, width: Math.max(260, (group.width - 20) / labelScale), transform: `scale(${labelScale})`, transformOrigin: "top left" }}>
+    <div style={{ display: "flex", alignItems: "center", gap: 7, marginTop: group.collapsed ? 17 : 0, width: "max-content", maxWidth: Math.max(260, (renderedWidth - 20) / labelScale), transform: `scale(${labelScale})`, transformOrigin: "top left" }}>
       <span title={group.collapsed ? `${group.name} · 拖动名称可移动图片组` : group.name}
         role={group.collapsed ? "button" : undefined} aria-label={group.collapsed ? `移动图片组 ${group.name}` : undefined}
         onPointerDown={(event) => {
@@ -156,10 +173,34 @@ function ImageCollectionCard({ group, zoom, update, onManage }: {
         }}
         onPointerCancel={() => { moving.current = null; setPosition(null); }}
         onLostPointerCapture={() => { moving.current = null; setPosition(null); }}
-        style={{ cursor: group.collapsed ? "grab" : undefined, touchAction: "none", userSelect: "none", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13, color: "#f1efff" }}>{group.name}</span>
+        style={{ cursor: group.collapsed ? "grab" : undefined, touchAction: "none", userSelect: "none", maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13, color: "#f1efff" }}>{group.name}</span>
       <button type="button" style={buttonStyle} onClick={() => update(group.id, { collapsed: !group.collapsed })}>{group.collapsed ? `展开 ${group.members.length}` : "收起"}</button>
       <button type="button" style={buttonStyle} onClick={() => onManage(group.id)}>管理</button>
     </div>
+    {group.collapsed && <div title="拖动缩放收纳组" role="button" aria-label="缩放收纳组"
+      onPointerDown={(event) => {
+        if (event.button !== 0) return;
+        event.preventDefault(); event.stopPropagation();
+        event.currentTarget.setPointerCapture(event.pointerId);
+        resizing.current = { pointerId: event.pointerId, clientX: event.clientX, clientY: event.clientY, scale: group.scale, nextScale: group.scale };
+      }}
+      onPointerMove={(event) => {
+        const start = resizing.current;
+        if (!start || start.pointerId !== event.pointerId) return;
+        const diagonal = Math.max(1, Math.hypot(baseWidth, baseHeight));
+        const delta = ((event.clientX - start.clientX) * baseWidth + (event.clientY - start.clientY) * baseHeight) / (Math.max(zoom, .05) * diagonal * diagonal);
+        start.nextScale = Math.max(.4, Math.min(3, start.scale + delta));
+        setScalePreview(start.nextScale);
+      }}
+      onPointerUp={(event) => {
+        if (resizing.current?.pointerId !== event.pointerId) return;
+        const nextScale = resizing.current.nextScale;
+        resizing.current = null; setScalePreview(null); update(group.id, { scale: nextScale });
+        if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+      }}
+      onPointerCancel={() => { resizing.current = null; setScalePreview(null); }}
+      style={{ position: "absolute", right: -6, bottom: 42, width: 15, height: 15, borderRadius: 4, background: "#a78bfa", border: "2px solid white",
+        boxShadow: "0 3px 10px #0008", cursor: "nwse-resize", touchAction: "none", zIndex: 8 }} />}
   </section>;
 }
 
