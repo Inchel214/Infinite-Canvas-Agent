@@ -69,6 +69,31 @@ const EXPERIENCE_USAGE_EVENT = "ica:experienceUsageChanged";
 const DARK_BG = "#1a1a2e";
 const LIGHT_BG = "#f5f5f7";
 const BG_STORAGE_KEY = "ica:canvasBg";
+const CHAT_PANEL_SELECTOR = '[data-role="chat-panel"]';
+
+/**
+ * Agent 面板里的输入焦点和文字选区应优先使用浏览器原生复制。
+ * 画布会全局接管 copy 事件，因此不能只排除 input/textarea：消息正文是普通元素。
+ */
+function shouldPreserveNativeCopy(target: EventTarget | null): boolean {
+  const targetElement = target instanceof Element ? target : null;
+  if (targetElement && (
+    targetElement.tagName === "INPUT"
+    || targetElement.tagName === "TEXTAREA"
+    || (targetElement as HTMLElement).isContentEditable
+  )) return true;
+
+  const chatPanel = document.querySelector(CHAT_PANEL_SELECTOR);
+  if (!chatPanel) return false;
+  if (targetElement && chatPanel.contains(targetElement)) return true;
+
+  const activeElement = document.activeElement;
+  if (activeElement && chatPanel.contains(activeElement)) return true;
+
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed || selection.rangeCount === 0) return false;
+  return chatPanel.contains(selection.getRangeAt(0).commonAncestorContainer);
+}
 
 function readExperienceUsage(): Record<string, number> {
   try {
@@ -782,9 +807,15 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         setConnecting(null);
         return;
       }
-      // 输入框聚焦时不拦截快捷键（保留正常打字/复制文本）
-      const t = e.target as HTMLElement | null;
-      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+      // 输入控件或 Agent 面板文字处于复制上下文时，优先复制文字。
+      // macOS 上真正的 Control+C 不会触发原生 copy，因此显式触发一次；Cmd+C 仍交给浏览器。
+      if (shouldPreserveNativeCopy(e.target)) {
+        if (e.ctrlKey && !e.metaKey && e.key.toLowerCase() === "c") {
+          e.preventDefault();
+          document.execCommand("copy");
+        }
+        return;
+      }
 
       // macOS 的 Control+C 不触发原生 copy；仍兼容用户的 Ctrl+C 用法。
       if (e.ctrlKey && !e.metaKey && e.key.toLowerCase() === "c" && nodes.some((node) => selectedIds.has(node.id) && !!node.image_url)) {
@@ -858,15 +889,10 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   }, [selectedIds, nodes, onAction, canvasId, onCanvasUpdate, copySelectedImagesToSystemClipboard, shortcuts.bindings]);
 
   // 使用浏览器原生 copy 事件接管 Cmd/Ctrl+C，避免快捷键先被浏览器或容器层拦截。
-  // 输入控件中仍保留普通的文本复制行为。
+  // 输入控件与 Agent 面板中的文字选区仍保留普通的文本复制行为。
   useEffect(() => {
     const handler = (event: ClipboardEvent) => {
-      const target = event.target as HTMLElement | null;
-      if (target && (
-        target.tagName === "INPUT"
-        || target.tagName === "TEXTAREA"
-        || target.isContentEditable
-      )) return;
+      if (shouldPreserveNativeCopy(event.target)) return;
       if (selectedIds.size === 0) return;
       if (!nodes.some((node) => selectedIds.has(node.id) && !!node.image_url)) return;
 
