@@ -77,7 +77,22 @@ class ProviderManager:
     @property
     def profiles(self) -> ProfileHistory:
         """已保存配置历史（与 settings.json 同目录，成功保存后自动归档，便于换回原 Key）"""
-        return ProfileHistory(ProfileStore(self._store.path.parent / "settings_profiles.json"))
+        history = ProfileHistory(
+            ProfileStore(self._store.path.parent / "settings_profiles.json")
+        )
+        # 历史为空时先把当前已保存的配置归档一份，用户无需再点一次保存就能看到
+        if history.is_empty() and self._has_archiveable(self.settings):
+            history.record(self.settings)
+        return history
+
+    @staticmethod
+    def _has_archiveable(settings: AppSettings) -> bool:
+        llm = settings.llm
+        image = settings.image
+        return bool(
+            (llm.provider not in ("", "mock") and llm.api_key)
+            or (image.source != "openart" and image.provider not in ("", "mock") and image.api_key)
+        )
 
     # ---------- 对外接口 ----------
 

@@ -36,6 +36,9 @@ class ProfileHistory:
         return {kind: [self._public(e) for e in self._data.get(kind, [])]
                 for kind in ("llm", "image")}
 
+    def is_empty(self) -> bool:
+        return not self._data.get("llm") and not self._data.get("image")
+
     def record(self, settings: AppSettings) -> None:
         """配置保存成功后归档（未设置 / Mock / OpenArt 不归档）"""
         llm = settings.llm
