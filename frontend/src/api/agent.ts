@@ -762,6 +762,14 @@ export async function getProviders(): Promise<{
   return res.json();
 }
 
+// 本机局域网 IPv4 列表（"手机/平板扫码访问"面板用来生成地址与二维码）
+export async function getLanIps(): Promise<string[]> {
+  const res = await fetch(`${API_BASE}/network/ips`);
+  if (!res.ok) throw new Error(`${res.status}`);
+  const data = await res.json();
+  return Array.isArray(data.ips) ? data.ips : [];
+}
+
 export async function testSettings(
   payload: SettingsPayload
 ): Promise<{ llm: TestResult; image: TestResult }> {

@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useCallback, useState, useMemo, memo } from "react";
 import { MaskEditor } from "./MaskEditor";
+import { AccessPanel } from "./AccessPanel";
 import { createPortal } from "react-dom";
 import { ImageCollectionCards, ImageCollectionDialog } from "./ImageCollections";
 import { useImageCollections } from "./useImageCollections";
@@ -567,6 +568,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     window.setTimeout(() => setLocalStatusMsg(null), ms);
   }, []);
   const [showHelp, setShowHelp] = useState(false);
+  // 手机/平板扫码访问面板
+  const [showAccess, setShowAccess] = useState(false);
 
   // 画布只保留明/暗两档，避免颜色选择器打断画布操作。
   const [bgColor, setBgColor] = useState<string>(() => {
@@ -3284,6 +3287,36 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         {bgIsLight ? <span aria-hidden="true" style={{ fontSize: 17, lineHeight: 1 }}>☀</span>
           : <span aria-hidden="true" style={{ fontSize: 17, lineHeight: 1 }}>☾</span>}
       </button>
+
+      {/* 手机/平板扫码访问：免去用户自己查本机 IP */}
+      <button
+        type="button"
+        className="ica-fitview-btn"
+        title="在手机/平板上打开：显示局域网地址与二维码"
+        aria-label="在手机或平板上打开"
+        style={{ position: "absolute", bottom: 16, left: 216 }}
+        onMouseDown={(e) => e.stopPropagation()}
+        onClick={(e) => {
+          e.stopPropagation();
+          setShowAccess(true);
+        }}
+      >
+        <svg
+          width="18"
+          height="18"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        >
+          <rect x="7" y="2" width="10" height="20" rx="2" />
+          <line x1="11" y1="18" x2="13" y2="18" />
+        </svg>
+      </button>
+
+      {showAccess && <AccessPanel onClose={() => setShowAccess(false)} />}
 
       {/* 快捷键帮助面板（增强版，支持自定义） */}
       {showHelp && (

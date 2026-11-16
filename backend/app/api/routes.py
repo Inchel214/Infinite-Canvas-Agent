@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import socket
 import subprocess
 import sys
 import threading
@@ -1366,6 +1367,33 @@ def delete_settings_profile(kind: str, profile_id: str):
 @router.get("/providers", summary="获取内置服务商预设列表")
 def get_providers():
     return {"providers": PROVIDER_PRESETS}
+
+
+@router.get("/network/ips", summary="获取本机局域网 IPv4 列表")
+def get_network_ips():
+    """枚举本机可用的局域网 IPv4，供前端生成"手机/平板扫码访问"二维码。
+
+    两条来源互补：UDP 探测默认出口网卡地址 + 主机名解析（多网卡时更全）；
+    只保留可被局域网其他设备访问的地址，过滤回环与自动私有地址（169.254）。
+    """
+    ips: set[str] = set()
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            # 不真正发包，只让内核选出默认出口网卡对应的地址（离线时可能失败）
+            probe.connect(("8.8.8.8", 80))
+            ips.add(probe.getsockname()[0])
+    except OSError:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ips.add(info[4][0])
+    except OSError:
+        pass
+    usable = sorted(
+        ip for ip in ips
+        if not ip.startswith("127.") and not ip.startswith("169.254.")
+    )
+    return {"ips": usable}
 
 
 def _err_snippet(resp: requests.Response) -> str:
