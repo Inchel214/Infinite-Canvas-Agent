@@ -8,9 +8,9 @@ import type {
   ChatResponse,
   RunRecord,
 } from "../types/canvas";
+import { API_BASE } from "./base";
 
-// 后端 API 地址：优先读 Vite 环境变量，开发时回退到本地默认
-const API_BASE = (import.meta.env.VITE_API_BASE as string) || "http://127.0.0.1:8000/api";
+// 后端 API 地址见 ./base（按当前页面 host 推导，局域网设备访问时自动指向同一台机器）
 
 // 直接执行类操作（不走 Agent）的响应
 export interface DirectResponse {
@@ -552,13 +552,20 @@ export async function undoRound(canvasId: string, roundId: string): Promise<Dire
   return res.json();
 }
 
-// 自动整理：网格对齐所有图片
-export async function arrangeCanvas(canvasId: string): Promise<DirectResponse> {
+// 自动整理：soft=轻整理（只消重叠保位置）/ semantic=语义分区（按连线/分组收块）
+export async function arrangeCanvas(
+  canvasId: string,
+  mode: "soft" | "semantic" = "semantic",
+  excludeIds: string[] = []
+): Promise<DirectResponse> {
   const res = await fetch(`${API_BASE}/canvas/${canvasId}/arrange`, {
     method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode, exclude_ids: excludeIds }),
   });
   if (!res.ok) {
-    throw new Error(`${res.status}`);
+    const err = await res.json().catch(() => ({ detail: `${res.status}` }));
+    throw new Error(err.detail || `${res.status}`);
   }
   return res.json();
 }

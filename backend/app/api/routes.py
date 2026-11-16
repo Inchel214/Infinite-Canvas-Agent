@@ -684,15 +684,24 @@ def mark_canvas_seen(canvas_id: str):
     return {"success": True}
 
 
-@router.post("/canvas/{canvas_id}/arrange", summary="自动整理画布（网格对齐所有图片）")
-def arrange_canvas(canvas_id: str):
+class ArrangeRequest(BaseModel):
+    # soft=轻整理（只消重叠保位置）；semantic=语义分区（按连线/分组收块）
+    mode: Literal["soft", "semantic"] = "semantic"
+    # 保持不动的节点（如折叠图片组内的成员），避免整理把它们从收纳组里挪走
+    exclude_ids: List[str] = []
+
+
+@router.post("/canvas/{canvas_id}/arrange", summary="自动整理画布（轻整理 / 语义分区）")
+def arrange_canvas(canvas_id: str, req: ArrangeRequest | None = None):
     from app.tools.layout import arrange_canvas as do_arrange
 
     try:
         state = deps.store.get_canvas(canvas_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
-    positions = do_arrange(state)
+    mode = (req.mode if req else "semantic") or "semantic"
+    exclude_ids = req.exclude_ids if req else []
+    positions = do_arrange(state, mode=mode, exclude_ids=exclude_ids)
     if not positions:
         return {"success": True, "message": "画布为空，无需整理", "canvas": state.to_dict()}
     for nid, (x, y) in positions.items():
@@ -702,7 +711,12 @@ def arrange_canvas(canvas_id: str):
             node.y = y
     state.version += 1
     deps.store.save_canvas(state)  # save 会推入 undo 栈，整理可撤销
-    return {"success": True, "message": f"已整理 {len(positions)} 个节点", "canvas": state.to_dict()}
+    label = "轻整理" if mode == "soft" else "语义分区整理"
+    return {
+        "success": True,
+        "message": f"{label}完成，共调整 {len(positions)} 个节点",
+        "canvas": state.to_dict(),
+    }
 
 
 @router.post("/canvas/{canvas_id}/generate", summary="文生图（直接执行，不走 Agent）")

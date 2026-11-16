@@ -13,6 +13,7 @@ import base64
 import io
 import logging
 import os
+import re
 import uuid
 from pathlib import Path
 
@@ -31,8 +32,18 @@ def _images_dir() -> Path:
 
 IMAGES_DIR = _images_dir()
 
-# 对外访问基础地址（与前端 API_BASE 保持一致，可改端口后用环境变量覆盖）
-PUBLIC_BASE = os.getenv("CANVAS_PUBLIC_BASE", "http://127.0.0.1:8000").rstrip("/")
+# 对外访问基础地址：默认留空 → 图片 URL 存相对路径 /images/...，
+# 同一份画布在 PC（localhost）和平板（局域网 IP）上都能正确显示。
+# 需要绝对地址时用 CANVAS_PUBLIC_BASE 覆盖。
+PUBLIC_BASE = os.getenv("CANVAS_PUBLIC_BASE", "").rstrip("/")
+
+# 历史数据里的本机绝对图片地址（旧版前端写死了 127.0.0.1:8000）
+_LOCAL_IMAGE_URL_RE = re.compile(
+    r"^https?://(?:127\.0\.0\.1|localhost|0\.0\.0\.0"
+    r"|10\.\d{1,3}\.\d{1,3}\.\d{1,3}"
+    r"|192\.168\.\d{1,3}\.\d{1,3}"
+    r"|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})(?::\d+)?/images/"
+)
 
 _EXT = {
     "image/png": "png",
@@ -60,31 +71,33 @@ def save_data_image(data_url: str, canvas_id: str = "") -> str:
     return f"{PUBLIC_BASE}/images/{rel}"
 
 
+def _local_prefixes() -> tuple[str, ...]:
+    prefixes = ["/images/"]
+    if PUBLIC_BASE:
+        prefixes.append(f"{PUBLIC_BASE}/images/")
+    return tuple(prefixes)
+
+
 def is_local_image_url(url: str) -> bool:
-    """是否为本服务托管的图片 URL（本地地址 + /images/ 前缀）"""
-    for prefix in (
-        f"{PUBLIC_BASE}/images/",
-        "http://127.0.0.1/images/",
-        "http://localhost/images/",
-    ):
-        if url.startswith(prefix):
-            return True
-    return False
+    """是否为本服务托管的图片 URL（相对 /images/ 或本机绝对地址）"""
+    if url.startswith(_local_prefixes()):
+        return True
+    return bool(_LOCAL_IMAGE_URL_RE.match(url))
 
 
 def _rel_from_url(url: str) -> str:
     """本地图片 URL → images 目录下的相对路径（{canvas_id}/{name} 或旧平铺 {name}）"""
-    # 取 /images/ 之后的部分：兼容带端口与不带端口的本地地址
-    for prefix in (
-        f"{PUBLIC_BASE}/images/",
-        "http://127.0.0.1/images/",
-        "http://localhost/images/",
-    ):
+    rel = ""
+    for prefix in _local_prefixes():
         if url.startswith(prefix):
             rel = url[len(prefix):]
             break
     else:
-        rel = url.rsplit("/images/", 1)[-1]
+        matched = _LOCAL_IMAGE_URL_RE.match(url)
+        if matched:
+            rel = url[matched.end():]
+        else:
+            rel = url.rsplit("/images/", 1)[-1]
     # 安全校验：只允许一段或两段（目录/文件名），禁止穿越
     parts = rel.split("/")
     if not rel or "\\" in rel or any(p in ("", ".", "..") for p in parts) or len(parts) > 2:
@@ -208,6 +221,30 @@ def normalize_state_image_sizes(
             node.width = width
             node.height = height
             changed += 1
+    return changed
+
+
+def relativize_state_images(state: CanvasState) -> int:
+    """把历史遗留的本机绝对图片地址改写为相对路径（幂等），返回改写数量。
+
+    旧版把图片 URL 存成 http://127.0.0.1:8000/images/...，同一份画布在
+    平板/手机上打开时会加载失败；改成相对路径后由前端当前页面同源代理加载。
+    """
+    changed = 0
+    for node in state.nodes.values():
+        url = node.image_url
+        if not url or url.startswith("/images/"):
+            continue
+        for prefix in _local_prefixes():
+            if prefix != "/images/" and url.startswith(prefix):
+                node.image_url = "/images/" + url[len(prefix):]
+                changed += 1
+                break
+        else:
+            matched = _LOCAL_IMAGE_URL_RE.match(url)
+            if matched:
+                node.image_url = "/images/" + url[matched.end():]
+                changed += 1
     return changed
 
 

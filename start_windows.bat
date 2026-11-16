@@ -135,6 +135,7 @@ echo 已跳过，使用演示模式
 :KEY_DONE
 
 REM ===== 7. 启动服务（一个窗口两个页签）=====
+REM 监听 0.0.0.0：本机用 localhost 访问，同一局域网的平板/手机用本机 IP 访问
 echo.
 echo 启动服务中...
 set "BACKEND_DIR=%~dp0backend"
@@ -143,13 +144,13 @@ set "FRONTEND_DIR=%~dp0frontend"
 where wt >nul 2>nul
 if %errorlevel%==0 (
     REM Windows Terminal 可用：一个窗口，两个页签
-    wt --title "InfiniteCanvas-后端" --startingDirectory "%BACKEND_DIR%" -- cmd /k "%BACKEND_DIR%\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000"
+    wt --title "InfiniteCanvas-后端" --startingDirectory "%BACKEND_DIR%" -- cmd /k "%BACKEND_DIR%\.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000"
     timeout /t 1 /nobreak >nul
     wt new-tab --title "InfiniteCanvas-前端" --startingDirectory "%FRONTEND_DIR%" -- cmd /k "cd /d %FRONTEND_DIR% && npm run dev"
 ) else (
     echo [提示] Windows Terminal 未安装，使用传统双窗口模式
     cd /d "%BACKEND_DIR%"
-    start "InfiniteCanvas-后端" cmd /k ".venv\Scripts\python -m uvicorn app.main:app --host 127.0.0.1 --port 8000"
+    start "InfiniteCanvas-后端" cmd /k ".venv\Scripts\python -m uvicorn app.main:app --host 0.0.0.0 --port 8000"
     cd /d "%FRONTEND_DIR%"
     start "InfiniteCanvas-前端" cmd /k "npm run dev"
 )
@@ -167,6 +168,19 @@ echo ==========================================
 echo.
 echo   前端页面:  http://localhost:5173
 echo   后端接口:  http://127.0.0.1:8000
+REM 取本机局域网 IPv4，供平板/手机在同一 WiFi 下访问
+set "LANIP="
+set "LANIP_FILE=%TEMP%\ica_lan_ip.txt"
+powershell -NoProfile -Command "Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } | Select-Object -First 1 -ExpandProperty IPAddress" > "%LANIP_FILE%" 2>nul
+if exist "%LANIP_FILE%" set /p LANIP=<"%LANIP_FILE%"
+if defined LANIP (
+    echo.
+    echo   局域网访问（平板/手机连同一 WiFi）:  http://%LANIP%:5173
+    echo   如果平板打不开：检查 Windows 防火墙是否放行 5173/8000 端口
+) else (
+    echo.
+    echo   [提示] 未取到局域网 IP，平板访问需手动查看本机 IP（ipconfig）
+)
 echo.
 echo   停止服务：关闭"InfiniteCanvas-后端"和"InfiniteCanvas-前端"两个窗口
 echo   下次使用：直接双击本脚本即可（会自动跳过已完成的安装步骤）

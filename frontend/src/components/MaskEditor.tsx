@@ -1,7 +1,7 @@
 /**
  * 蒙版编辑器组件：用于局部编辑（Inpainting）
  * 用户在原图上标记要修改的区域（画笔/橡皮/套索/矩形/魔棒），输入修改描述
- * mask 导出为黑底白色 PNG（API 要求白=要修改的区域），支持边缘羽化
+ * mask 导出为黑底白色 PNG（API 要求白=要修改的区域，硬边二值）
  *
  * 架构：双 canvas 分层
  *   - logicMaskRef（离屏，白色实心笔画）= 真相源，用于导出/撤销/边缘检测
@@ -96,8 +96,6 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
   const [recordingAction, setRecordingAction] = useState<keyof EditorShortcutConfig | null>(null);
   const [brushSize, setBrushSize] = useState(30);
   const [wandTol, setWandTol] = useState(32);
-  const [feather, setFeather] = useState(0);
-  const [showFeatherHelp, setShowFeatherHelp] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("overlay");
   const [isLoading, setIsLoading] = useState(true);
   const [prompt, setPrompt] = useState(initialPrompt ?? "");
@@ -775,7 +773,7 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
     }
   };
 
-  // ===== 导出 mask（黑底白色 PNG，支持羽化） =====
+  // ===== 导出 mask（黑底白色 PNG，硬边二值） =====
   const exportMask = (): string => {
     const mask = logicMaskRef.current;
     if (!mask) return "";
@@ -789,10 +787,8 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
     ctx.fillStyle = "#000000";
     ctx.fillRect(0, 0, width, height);
 
-    // 羽化：缩放到世界尺寸时同步做高斯模糊（0 = 硬边二值）
-    ctx.filter = feather > 0 ? `blur(${feather}px)` : "none";
+    // 注意：生图接口只认"改 / 不改"，蒙版必须是硬边二值图，不做羽化处理
     ctx.drawImage(mask, 0, 0, width, height);
-    ctx.filter = "none";
 
     return exportCanvas.toDataURL("image/png");
   };
@@ -1408,59 +1404,6 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
             <div style={{ fontSize: 10, color: "#555", marginTop: 3 }}>
               {formatShortcut(shortcutBindings.confirm)} 确认 · {formatShortcut(shortcutBindings.help)} 快捷键提示
             </div>
-          </div>
-
-          {/* 羽化 */}
-          <div>
-            <div style={{ fontSize: 11, color: "rgba(255,255,255,0.62)", marginBottom: 5, display: "flex", alignItems: "center", gap: 6 }}>
-              <span>边缘羽化：{feather === 0 ? "关闭（硬边）" : `${feather}px`}</span>
-              <button
-                onClick={() => setShowFeatherHelp((v) => !v)}
-                title="羽化说明"
-                style={{
-                  width: 14,
-                  height: 14,
-                  borderRadius: "50%",
-                  border: "1px solid rgba(167,139,250,0.6)",
-                  background: showFeatherHelp ? "rgba(167,139,250,0.35)" : "transparent",
-                  color: "#a78bfa",
-                  fontSize: 10,
-                  lineHeight: 1,
-                  cursor: "pointer",
-                  padding: 0,
-                  flexShrink: 0,
-                }}
-              >
-                ?
-              </button>
-            </div>
-            <input
-              type="range" min="0" max="20" value={feather}
-              onChange={(e) => setFeather(Number(e.target.value))}
-              style={{ width: "100%" }}
-            />
-            {showFeatherHelp && (
-              <div
-                style={{
-                  marginTop: 6,
-                  padding: "8px 10px",
-                  background: "rgba(167,139,250,0.08)",
-                  border: "1px solid rgba(167,139,250,0.25)",
-                  borderRadius: 6,
-                  fontSize: 11,
-                  lineHeight: 1.75,
-                  color: "rgba(255,255,255,0.72)",
-                }}
-              >
-                <div>羽化 = 蒙版边缘的渐变过渡宽度（单位：原图像素），不是给图片加模糊。</div>
-                <div style={{ marginTop: 4 }}>
-                  注意：多数生图接口会把蒙版二值化，灰阶过渡可能被丢弃，实际表现更接近「边界外扩 / 内缩」。
-                </div>
-                <div style={{ marginTop: 4, color: "#a78bfa" }}>
-                  建议：换色 / 换物体用 0–5；云、烟、光晕、头发用 10–20。
-                </div>
-              </div>
-            )}
           </div>
 
           {/* 宽高比 */}

@@ -32,3 +32,13 @@ body,
   scrollbar-width: thin;
   scrollbar-color: rgba(255, 255, 255, 0.22) transparent;
 }
+
+/* 触屏设备：输入框字号不小于 16px，避免 iOS Safari 聚焦时自动放大页面。
+   组件多用行内 fontSize，故需要 !important 才能覆盖。 */
+@media (pointer: coarse) {
+  input,
+  textarea,
+  select {
+    font-size: 16px !important;
+  }
+}

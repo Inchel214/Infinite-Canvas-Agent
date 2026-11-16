@@ -167,10 +167,12 @@ async def delete_nodes(canvas_id: str, node_ids: list[str]) -> dict:
 
 
 @mcp.tool()
-async def arrange_canvas(canvas_id: str) -> dict:
-    """自动整理画布：按连线层级 DAG 分层布局（根节点在顶、派生向下，纵向族谱）。
+async def arrange_canvas(canvas_id: str, mode: str = "semantic") -> dict:
+    """自动整理画布。
+    mode=semantic（默认）：按连线/分组把图收成区块，块内网格、块间留白，块留在原处；
+    mode=soft：只消除重叠与过密，尽量保留原有位置。
     初稿卡片全部放完后调用一次即可获得整齐布局。"""
-    data = await _call("POST", f"/canvas/{canvas_id}/arrange")
+    data = await _call("POST", f"/canvas/{canvas_id}/arrange", json_body={"mode": mode})
     return {"success": data.get("success"), "message": data.get("message")}
 
 

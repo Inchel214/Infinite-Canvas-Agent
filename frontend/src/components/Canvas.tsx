@@ -20,7 +20,7 @@ export type CanvasAction =
   | { type: "edit"; nodeId: string; prompt: string; size: string; x?: number; y?: number; experienceIds?: string[]; mask?: string }
   | { type: "generate"; prompt: string; size: string; x: number; y: number; experienceIds?: string[] }
   | { type: "delete"; nodeIds: string[] }
-  | { type: "arrange" }
+  | { type: "arrange"; mode: "soft" | "semantic"; excludeIds?: string[] }
   | { type: "update"; updates: Array<{ nodeId: string; content?: string; x?: number; y?: number; width?: number; height?: number }> };
 
 // 待生成图片容器（右键空白创建，接收连线作为参考图）
@@ -71,6 +71,10 @@ const DARK_BG = "#1a1a2e";
 const LIGHT_BG = "#f5f5f7";
 const BG_STORAGE_KEY = "ica:canvasBg";
 const CHAT_PANEL_SELECTOR = '[data-role="chat-panel"]';
+
+// 画布拖拽统一走 PointerEvent（鼠标/触屏同一套逻辑）；
+// 子组件回调仍可能传 MouseEvent，故通用处理器接受两者的并集。
+type CanvasPointerEvent = React.MouseEvent | React.PointerEvent;
 
 /**
  * Agent 面板里的输入焦点和文字选区应优先使用浏览器原生复制。
@@ -701,6 +705,14 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   // 平移 rAF 合帧数据
   const panRafData = useRef<{ raf: number | null; dx: number; dy: number }>({ raf: null, dx: 0, dy: 0 });
   const dragStartPosRef = useRef<{ x: number; y: number } | null>(null);
+  // 触屏长按 = 右键：定时器在按住不动 500ms 后打开操作菜单
+  const longPressRef = useRef<{ timer: number; x: number; y: number } | null>(null);
+  const cancelLongPress = useCallback(() => {
+    if (longPressRef.current) {
+      window.clearTimeout(longPressRef.current.timer);
+      longPressRef.current = null;
+    }
+  }, []);
   const backgroundDownRef = useRef<{ x: number; y: number } | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   // 空格键按下时切换为平移模式（避免破坏现有 Shift 框选习惯）
@@ -722,6 +734,26 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   const managedCollection = collections.views.find((group) => group.id === managedCollectionId);
   const displayBounds = useMemo(() => [...collections.visibleNodes, ...collections.views.filter((group) => group.collapsed)], [collections.visibleNodes, collections.views]);
   const connectionBounds = (node: CanvasNode): BBox => collections.collapsedByNode.get(node.id) ?? node;
+
+  // 自动整理菜单：轻整理（最小位移） / 语义分区（按连线与分组收块）
+  const [arrangeMenuOpen, setArrangeMenuOpen] = useState(false);
+  const performArrange = async (mode: "soft" | "semantic") => {
+    if (!onAction) return;
+    setArrangeMenuOpen(false);
+    setLocalOverrides({});
+    // 折叠图片组里的成员保持原位，避免整理后从收纳组里"跑"出去
+    const excludeIds = [...collections.collapsedByNode.keys()];
+    const ok = await onAction({ type: "arrange", mode, excludeIds });
+    // 轻整理刻意保持视角；语义分区收块后适配一次全图
+    if (ok !== false && mode === "semantic") pendingFitRef.current = true;
+  };
+
+  useEffect(() => {
+    if (!arrangeMenuOpen) return;
+    const close = () => setArrangeMenuOpen(false);
+    document.addEventListener("mousedown", close);
+    return () => document.removeEventListener("mousedown", close);
+  }, [arrangeMenuOpen]);
 
   // 键盘快捷键和右键菜单共用同一套系统剪贴板逻辑。
   // 节点的生成参数复用与系统图片剪贴板分离，避免内部缓存抢占后续粘贴。
@@ -1257,6 +1289,14 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     const onTouchStart = (e: TouchEvent) => {
       if (e.touches.length !== 2) return;
       e.preventDefault();
+      // 双指手势优先：清掉单指已开始的框选/拖拽/长按，避免松手时误选中
+      cancelLongPress();
+      marqueeStartRef.current = null;
+      setMarquee(null);
+      setDraggingNode(null);
+      dragStartPosRef.current = null;
+      dragGroupOriginsRef.current = null;
+      dragGroupStartRef.current = null;
       const [a, b] = [e.touches[0], e.touches[1]];
       const dx = b.clientX - a.clientX;
       const dy = b.clientY - a.clientY;
@@ -1319,8 +1359,10 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     };
   }, []);
 
-  // 背景鼠标按下：直接拖=框选，Shift/空格/中键拖=平移
-  const handleMouseDown = useCallback((e: React.MouseEvent) => {
+  // 背景指针按下（鼠标/触控统一）：直接拖=框选，Shift/空格/中键拖=平移
+  const handlePointerDown = useCallback((e: React.PointerEvent) => {
+    // 双指手势的第二根手指不参与框选/平移（交给触摸手势处理）
+    if (e.pointerType === "touch" && !e.isPrimary) return;
     // 中键拖动 = 平移（任意位置）
     if (e.button === 1) {
       e.preventDefault();
@@ -1357,7 +1399,10 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     }
   }, [pan]);
 
-  const handleMouseMove = useCallback((e: React.MouseEvent) => {
+  const handlePointerMove = useCallback((e: React.PointerEvent) => {
+    // 触屏长按判定：手指移动超过阈值视为拖拽，取消长按菜单
+    const lp = longPressRef.current;
+    if (lp && Math.abs(e.clientX - lp.x) + Math.abs(e.clientY - lp.y) > 8) cancelLongPress();
     if (connecting) {
       // 连线拖动中：更新鼠标位置
       setConnecting((prev) => (prev ? { ...prev, x: e.clientX, y: e.clientY } : null));
@@ -1442,9 +1487,10 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         });
       });
     }
-  }, [connecting, draggingContainer, draggingNode, isPanning, pan, zoom, dragOffset, screenToWorld, collections.views, setContainers, generatingIdsRef, generatingPositionsRef]);
+  }, [connecting, draggingContainer, draggingNode, isPanning, pan, zoom, dragOffset, screenToWorld, collections.views, setContainers, generatingIdsRef, generatingPositionsRef, cancelLongPress]);
 
-  const handleMouseUp = useCallback((e: React.MouseEvent) => {
+  const handlePointerUp = useCallback((e: CanvasPointerEvent) => {
+    cancelLongPress();
     // 连线结束：编辑态按钳制后的屏幕矩形命中；生成态按世界卡片的实际屏幕投影命中。
     if (connecting) {
       const w = screenToWorld(e.clientX, e.clientY);
@@ -1596,13 +1642,33 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       backgroundDownRef.current = null;
       setIsPanning(false);
     }
-  }, [collections, collectionDropTargetId, marquee, draggingNode, localOverrides, onNodeMoved, onNodesMoved, isPanning, pan, zoom, connecting, containers, generatingIds, updateContainer, screenToWorld, draggingContainer, createContainer, menu, getContainerPlacement, editPanel, editPanelRect]);
+  }, [collections, collectionDropTargetId, marquee, draggingNode, localOverrides, onNodeMoved, onNodesMoved, isPanning, pan, zoom, connecting, containers, generatingIds, updateContainer, screenToWorld, draggingContainer, createContainer, menu, getContainerPlacement, editPanel, editPanelRect, cancelLongPress]);
 
   // 图片节点拖拽开始（记录起点用于 click/drag 判定）
-  const handleNodeMouseDown = useCallback((e: React.MouseEvent, node: CanvasNode) => {
+  const handleNodePointerDown = useCallback((e: React.PointerEvent, node: CanvasNode) => {
     if (e.button !== 0) return;
     e.stopPropagation();
     e.preventDefault();
+
+    // 触屏长按 = 右键：按住不动 500ms 打开该图的操作菜单
+    if (e.pointerType !== "mouse") {
+      cancelLongPress();
+      const px = e.clientX;
+      const py = e.clientY;
+      const nodeId = node.id;
+      const timer = window.setTimeout(() => {
+        longPressRef.current = null;
+        setSelectedIds(new Set([nodeId]));
+        setPromptInput("");
+        setMenu({ x: px, y: py, mode: "menu" });
+        // 结束拖拽态，避免松手时再按 click 逻辑改写选择
+        setDraggingNode(null);
+        dragStartPosRef.current = null;
+        dragGroupOriginsRef.current = null;
+        dragGroupStartRef.current = null;
+      }, 500);
+      longPressRef.current = { timer, x: px, y: py };
+    }
 
     // 点击图片节点：容器不再是"激活"状态（Esc 不再关闭它）
     activeContainerIdRef.current = null;
@@ -1633,7 +1699,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       dragGroupStartRef.current = null;
     }
     setDraggingNode(node.id);
-  }, [pan, zoom, selectedIds, nodes]);
+  }, [pan, zoom, selectedIds, nodes, cancelLongPress]);
 
   // 图片右键：选中（若未选中）并打开普通菜单
   // 编辑框若已打开则保持不变，右键其它图片正常弹出普通菜单（两者并存）
@@ -2285,10 +2351,11 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     <div
       ref={containerRef}
       data-role="canvas-root"
-      onMouseDown={handleMouseDown}
-      onMouseMove={handleMouseMove}
-      onMouseUp={handleMouseUp}
-      onMouseLeave={handleMouseUp}
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerUp}
+      onPointerCancel={handlePointerUp}
+      onPointerLeave={handlePointerUp}
       onContextMenu={handleBackgroundContextMenu}
       onDragOver={(e) => {
         e.preventDefault(); // 允许放置（否则浏览器直接打开图片文件）
@@ -2328,6 +2395,14 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     >
       {/* 全局动画 keyframes：图片与浮层入场 */}
       <style>{`
+        /* 触屏：画布接管手势（单指拖拽/框选、双指缩放），禁止浏览器滚动把指针事件取消 */
+        [data-role="canvas-root"] { touch-action: none; }
+        /* 输入类控件恢复原生行为，保证框内文字可滚动、可正常选择 */
+        [data-role="canvas-root"] textarea,
+        [data-role="canvas-root"] input,
+        [data-role="canvas-root"] select { touch-action: auto; }
+        /* 长按图片不弹出系统菜单，改为画布自己的长按操作菜单 */
+        [data-role="canvas-root"] img { -webkit-touch-callout: none; }
         @keyframes ica-img-in {
           from { opacity: 0; transform: scale(0.92); }
           to   { opacity: 1; transform: scale(1); }
@@ -2558,7 +2633,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
             isSelected={selectedIds.has(node.id)}
             showPorts={hoveredNode === node.id || (connecting?.fromId === node.id)}
             onPortMouseDown={(e, portIdx) => handlePortMouseDown(e, node, portIdx)}
-            onMouseDown={(e) => handleNodeMouseDown(e, node)}
+            onPointerDown={(e) => handleNodePointerDown(e, node)}
             onMouseEnter={() => setHoveredNode(node.id)}
             onMouseLeave={() => setHoveredNode(null)}
             onContextMenu={(e) => handleNodeContextMenu(e, node)}
@@ -2893,7 +2968,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
           onClose={() => setEditPanel(null)}
           onMove={(nx, ny) => setEditPanel((p) => (p ? { ...p, x: nx, y: ny } : p))}
           onRect={setEditPanelRect}
-          onConnectionMouseUp={connecting ? handleMouseUp : undefined}
+          onConnectionMouseUp={connecting ? handlePointerUp : undefined}
         />,
         document.body,
       )}
@@ -3079,38 +3154,97 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         </svg>
       </button>
 
-      {/* 自动整理按钮：网格对齐所有图片（后端重排，可撤销） */}
-      <button
-        type="button"
-        className="ica-fitview-btn"
-        title="自动整理：按连线层级排列（根图在左，派生图向右展开，可撤销）"
+      {/* 自动整理：轻整理 / 语义分区（后端重排，可撤销） */}
+      <div
         style={{ position: "absolute", bottom: 16, left: 96 }}
         onMouseDown={(e) => e.stopPropagation()}
-        onClick={async (e) => {
-          e.stopPropagation();
-          if (!onAction) return;
-          setLocalOverrides({});
-          const ok = await onAction({ type: "arrange" });
-          // 置位待执行标志：等新画布状态渲染出最新节点坐标后再 fit（见 pendingFitRef effect）
-          if (ok !== false) pendingFitRef.current = true;
-        }}
       >
-        <svg
-          width="18"
-          height="18"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2"
-          strokeLinecap="round"
-          strokeLinejoin="round"
+        <button
+          type="button"
+          className="ica-fitview-btn"
+          title="自动整理：可选轻整理（只消重叠、保留位置）或语义分区（按连线/分组收块）"
+          onClick={(e) => {
+            e.stopPropagation();
+            setArrangeMenuOpen((v) => !v);
+          }}
         >
-          <rect x="3" y="3" width="7" height="7" />
-          <rect x="14" y="3" width="7" height="7" />
-          <rect x="3" y="14" width="7" height="7" />
-          <rect x="14" y="14" width="7" height="7" />
-        </svg>
-      </button>
+          <svg
+            width="18"
+            height="18"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <rect x="3" y="3" width="7" height="7" />
+            <rect x="14" y="3" width="7" height="7" />
+            <rect x="3" y="14" width="7" height="7" />
+            <rect x="14" y="14" width="7" height="7" />
+          </svg>
+        </button>
+        {arrangeMenuOpen && (
+          <div
+            style={{
+              position: "absolute",
+              bottom: 44,
+              left: 0,
+              width: 232,
+              background: "#25253d",
+              border: "1px solid rgba(255,255,255,0.16)",
+              borderRadius: 10,
+              boxShadow: "0 10px 30px rgba(0,0,0,0.5)",
+              padding: 6,
+              zIndex: 900,
+            }}
+          >
+            <button
+              type="button"
+              onClick={() => performArrange("soft")}
+              style={{
+                display: "block",
+                width: "100%",
+                textAlign: "left",
+                background: "rgba(167,139,250,0.14)",
+                border: "1px solid rgba(167,139,250,0.3)",
+                borderRadius: 7,
+                color: "#eee",
+                padding: "7px 9px",
+                fontSize: 12,
+                cursor: "pointer",
+              }}
+            >
+              <div style={{ fontWeight: 600 }}>轻整理</div>
+              <div style={{ color: "#a9a4c9", fontSize: 11, marginTop: 2 }}>
+                只消除重叠与过密，保留原有位置和视角
+              </div>
+            </button>
+            <button
+              type="button"
+              onClick={() => performArrange("semantic")}
+              style={{
+                display: "block",
+                width: "100%",
+                textAlign: "left",
+                marginTop: 5,
+                background: "rgba(255,255,255,0.05)",
+                border: "1px solid rgba(255,255,255,0.1)",
+                borderRadius: 7,
+                color: "#eee",
+                padding: "7px 9px",
+                fontSize: 12,
+                cursor: "pointer",
+              }}
+            >
+              <div style={{ fontWeight: 600 }}>语义分区</div>
+              <div style={{ color: "#a9a4c9", fontSize: 11, marginTop: 2 }}>
+                相连/同组的图收成一排网格，区块留在原处
+              </div>
+            </button>
+          </div>
+        )}
+      </div>
 
       {/* 快捷键帮助按钮 */}
       <button
@@ -4718,7 +4852,7 @@ const ImageNode = memo(function ImageNode({
   isSelected,
   showPorts,
   onPortMouseDown,
-  onMouseDown,
+  onPointerDown,
   onMouseEnter,
   onMouseLeave,
   onContextMenu,
@@ -4733,7 +4867,7 @@ const ImageNode = memo(function ImageNode({
   isSelected: boolean;
   showPorts: boolean;
   onPortMouseDown: (e: React.MouseEvent, portIdx: number) => void;
-  onMouseDown: (e: React.MouseEvent) => void;
+  onPointerDown: (e: React.PointerEvent) => void;
   onMouseEnter: () => void;
   onMouseLeave: () => void;
   onContextMenu: (e: React.MouseEvent) => void;
@@ -4768,7 +4902,7 @@ const ImageNode = memo(function ImageNode({
           // 入场动画：淡入 + 轻微缩放，仅首次挂载播放一次
           animation: "ica-img-in 0.35s cubic-bezier(0.22, 1, 0.36, 1) both",
         }}
-        onMouseDown={onMouseDown}
+        onPointerDown={onPointerDown}
         onMouseEnter={onMouseEnter}
         onMouseLeave={onMouseLeave}
         onContextMenu={onContextMenu}
@@ -4979,7 +5113,7 @@ const ImageNode = memo(function ImageNode({
           overflow: "visible",
           transition: isDragging ? "none" : "box-shadow 0.2s, outline 0.2s",
         }}
-        onMouseDown={onMouseDown}
+        onPointerDown={onPointerDown}
         onMouseEnter={onMouseEnter}
         onMouseLeave={onMouseLeave}
         onContextMenu={onContextMenu}

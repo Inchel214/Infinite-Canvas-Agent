@@ -247,7 +247,7 @@ class VolcEngineImageGenerator(BaseImageGenerator):
         for u in image_urls:
             if u.startswith("data:image/"):
                 refs.append(u)
-            elif u.startswith("http"):
+            elif u.startswith("http") or u.startswith("/images/"):
                 refs.append(to_sendable_ref(u))
         return refs
 
@@ -500,8 +500,8 @@ class VolcEngineImageGenerator(BaseImageGenerator):
         import time as _time
         _t0 = _time.monotonic()
 
-        # 把原图转为可发送格式
-        image_ref = to_sendable_ref(image_url) if image_url.startswith("http") else image_url
+        # 把原图转为可发送格式（相对 /images/ 地址也要转成内联 data URL）
+        image_ref = to_sendable_ref(image_url)
 
         # Ark 没有 mask 入参（传了会被静默忽略），区域只能用归一化 <bbox> 坐标告诉模型
         tags = _mask_to_bbox_tags(mask)

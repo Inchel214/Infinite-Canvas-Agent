@@ -2,7 +2,7 @@
 // 机制：内存队列缓冲 → 定时 / 页面隐藏时经 sendBeacon（fetch keepalive 兜底）批量上报。
 // 上报失败静默丢弃（错误处理路径里绝不能再抛错，避免递归）；后端与自身日志合流写入 backend/data/logs/app.log。
 
-const API_BASE = "http://127.0.0.1:8000/api";
+import { API_BASE } from "../api/base";
 
 type Level = "info" | "warn" | "error";
 

@@ -10,7 +10,7 @@ export type CanvasAction =
   | { type: "edit"; nodeId: string; prompt: string; size: string; x?: number; y?: number; experienceIds?: string[]; mask?: string }
   | { type: "generate"; prompt: string; size: string; x: number; y: number; experienceIds?: string[] }
   | { type: "delete"; nodeIds: string[] }
-  | { type: "arrange" }
+  | { type: "arrange"; mode: "soft" | "semantic"; excludeIds?: string[] }
   | { type: "update"; updates: Array<{ nodeId: string; content?: string; x?: number; y?: number; width?: number; height?: number }> };
 
 // 待生成图片容器（右键空白创建，接收连线作为参考图）

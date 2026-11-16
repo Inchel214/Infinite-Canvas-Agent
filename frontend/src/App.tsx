@@ -329,7 +329,7 @@ function App() {
         return res.success;
       } else if (action.type === "arrange") {
         setStatusMsg("正在整理画布...");
-        const res = await arrangeCanvas(canvasId);
+        const res = await arrangeCanvas(canvasId, action.mode, action.excludeIds);
         applyCanvasState(res.canvas);
         setStatusMsg(res.message);
         return res.success;

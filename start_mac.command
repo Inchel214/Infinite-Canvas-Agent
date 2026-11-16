@@ -160,7 +160,7 @@ tell application "Terminal"
     set alreadyOpen to (count of windows)
 
     -- 第一个页签：后端
-    do script "cd '${PROJECT_DIR}/backend' && source .venv/bin/activate && python -m uvicorn app.main:app --host 127.0.0.1 --port 8000"
+    do script "cd '${PROJECT_DIR}/backend' && source .venv/bin/activate && python -m uvicorn app.main:app --host 0.0.0.0 --port 8000"
 
     -- 第二个页签：前端
     tell application "System Events" to keystroke "t" using {command down}
@@ -195,6 +195,12 @@ ok "=========================================="
 echo ""
 echo "  前端页面:  http://localhost:5173"
 echo "  后端接口:  http://127.0.0.1:8000"
+LANIP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)"
+if [[ -n "$LANIP" ]]; then
+  echo "  局域网访问（平板/手机连同一 WiFi）:  http://${LANIP}:5173"
+else
+  echo "  [提示] 未取到局域网 IP，平板访问需手动查看本机 IP（ifconfig）"
+fi
 echo "  浏览器:    保持当前页签，刷新即可继续使用"
 echo ""
 warn "  服务已在 Terminal.app 的一个窗口（两个页签）中运行"

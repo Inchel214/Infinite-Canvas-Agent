@@ -17,6 +17,7 @@ from app.image.files import (
     is_local_image_url,
     materialize_state_images,
     normalize_state_image_sizes,
+    relativize_state_images,
 )
 
 logger = logging.getLogger(__name__)
@@ -288,7 +289,10 @@ class FileStore(InMemoryStore):
             # 优先内存，其次磁盘（懒加载，支持后端重启后恢复）
             if canvas_id in self._canvases:
                 state = self._canvases[canvas_id]
-                if normalize_state_image_sizes(state, self._image_size_cache):
+                changed = normalize_state_image_sizes(state, self._image_size_cache)
+                if relativize_state_images(state):
+                    changed = True
+                if changed:
                     state.version += 1
                     self._write_canvas(state)
                 # 返回深拷贝：调用方修改不影响内存中的"旧状态"，保证 undo 历史正确
@@ -296,7 +300,10 @@ class FileStore(InMemoryStore):
             state = self._load_from_disk(canvas_id)
             if state is None:
                 raise ValueError(f"画布不存在: {canvas_id}")
-            if normalize_state_image_sizes(state, self._image_size_cache):
+            changed = normalize_state_image_sizes(state, self._image_size_cache)
+            if relativize_state_images(state):
+                changed = True
+            if changed:
                 state.version += 1
                 self._write_canvas(state)
             self._canvases[canvas_id] = state

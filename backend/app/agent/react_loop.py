@@ -852,6 +852,8 @@ class ReActAgent:
             return text_content
 
         # 有引用图片，构建多模态消息格式
+        from app.image.files import is_local_image_url
+
         content_parts = [{"type": "text", "text": text_content}]
         
         # 添加引用图片
@@ -862,7 +864,7 @@ class ReActAgent:
             
             # 本地图片 URL 转为压缩后的 data URL（base64）
             # 使用压缩版本避免 413 请求过大（DeepSeek 等 API 有大小限制）
-            if image_url.startswith("http://127.0.0.1:8000/images/"):
+            if is_local_image_url(image_url):
                 try:
                     from app.image.files import local_url_to_compressed_data_url
                     data_url = local_url_to_compressed_data_url(image_url, max_size=1024, quality=80)
