@@ -361,6 +361,7 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
       });
     } else {
       setImage({
+        ...image,
         provider,
         api_key: "",
         base_url: isPreset ? preset?.base_url || "" : "",
@@ -551,6 +552,40 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
         <div style={sectionTitleStyle}>
           🖼️ 图片生成模型
         </div>
+        <label style={labelStyle}>生图来源</label>
+        <select
+          aria-label="生图来源"
+          className="ic-select"
+          style={inputStyle}
+          value={image.source || "api"}
+          onChange={(e) => {
+            setImage({ ...image, source: e.target.value as "api" | "openart" });
+            setTestResult({});
+          }}
+        >
+          <option value="api">原有 API</option>
+          <option value="openart">OpenArt（使用登录账号）</option>
+        </select>
+
+        {image.source === "openart" ? (
+          <>
+            <div style={{ color: "#999", fontSize: 12, marginTop: 8, lineHeight: 1.6 }}>
+              使用本机 OpenArt 登录账号，生图消耗该账号点数。原有 API 配置会保留，可随时切回。
+              <br />
+              按模型默认尺寸生成，画布尺寸选项暂不生效；不支持蒙版局部编辑。
+            </div>
+            <label style={labelStyle}>OpenArt 模型</label>
+            <ModelField
+              value={image.openart_model || "nano-banana-2"}
+              onChange={(v) => setImage({ ...image, openart_model: v })}
+              fetchModels={() => listModels({ kind: "image", provider: "openart", api_key: "", base_url: "" })}
+            />
+            <div style={{ color: "#999", fontSize: 12, marginTop: 6 }}>
+              首次使用请点下方“测试连接”；未登录时运行项目中的 openart-login.command。
+            </div>
+          </>
+        ) : (
+          <>
         <label style={labelStyle}>服务商</label>
         <select
           className="ic-select"
@@ -616,6 +651,8 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
                 />
               </>
             )}
+          </>
+        )}
           </>
         )}
         {testResult.image && (

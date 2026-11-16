@@ -73,6 +73,8 @@ class ImageConfig:
     base_url: str = ""
     model: str = ""                   # 非流式生成（编辑/变体/组合/右键菜单）
     stream_model: str = ""            # 流式生成（图片容器），留空则回退非流式
+    source: str = "api"                # 独立选择来源，保留原有 API 配置
+    openart_model: str = "nano-banana-2"
 
 
 @dataclass

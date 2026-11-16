@@ -10,6 +10,7 @@ venv/
 .trae/
 .vscode/
 .idea/
+.DS_Store
 
 # Backend data (FileStore 持久化画布)
 backend/data/
@@ -21,4 +22,8 @@ backend/_test_node.py
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/
+.npm-cache/
 *.log
+
+# Local OpenArt binary and downloaded generations
+.runtime/

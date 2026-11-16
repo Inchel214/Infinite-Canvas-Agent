@@ -636,6 +636,8 @@ export interface LLMSettings {
 }
 
 export interface ImageSettings {
+  source?: "api" | "openart";
+  openart_model?: string;
   provider: string;
   api_key: string;
   base_url: string;

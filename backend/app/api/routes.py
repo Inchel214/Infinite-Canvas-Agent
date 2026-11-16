@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 import uuid
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 import requests
 from fastapi import APIRouter, HTTPException
@@ -925,19 +925,25 @@ def generate_image_stream(canvas_id: str, req: StreamGenRequest):
 
             # 估算模式：无流式能力（Mock / 回退），前端用估算进度条
             yield _sse({"type": "start", "mode": "estimated"})
-            if req.op == "compose":
-                tool = deps.tool_manager.get("compose_images")
-                result = tool.run(
-                    state, node_ids=req.node_ids or [], prompt=prompt, size=size, x=req.x, y=req.y
-                )
-            elif req.op == "variate":
-                tool = deps.tool_manager.get("variate_image")
-                result = tool.run(
-                    state, node_id=req.node_id or "", prompt=prompt, size=size, x=req.x, y=req.y
-                )
-            else:
-                tool = deps.tool_manager.get("generate_image")
-                result = tool.run(state, prompt=prompt, size=size, x=req.x, y=req.y)
+            try:
+                if req.op == "compose":
+                    tool = deps.tool_manager.get("compose_images")
+                    result = tool.run(
+                        state, node_ids=req.node_ids or [], prompt=prompt, size=size, x=req.x, y=req.y
+                    )
+                elif req.op == "variate":
+                    tool = deps.tool_manager.get("variate_image")
+                    result = tool.run(
+                        state, node_id=req.node_id or "", prompt=prompt, size=size, x=req.x, y=req.y
+                    )
+                else:
+                    tool = deps.tool_manager.get("generate_image")
+                    result = tool.run(state, prompt=prompt, size=size, x=req.x, y=req.y)
+            except Exception as e:
+                if getattr(gen, "is_openart", False):
+                    yield _sse({"type": "done", "success": False, "message": str(e)})
+                    return
+                raise
             final_state = result.state
             generated_node_id = None
             if result.success:
@@ -1162,6 +1168,8 @@ class LLMConfigRequest(BaseModel):
 
 
 class ImageConfigRequest(BaseModel):
+    source: Literal["api", "openart"] = "api"
+    openart_model: str = "nano-banana-2"
     provider: str = ""
     api_key: str = ""
     base_url: str = ""
@@ -1185,6 +1193,8 @@ def _masked_settings() -> dict:
             "model": s.llm.model,
         },
         "image": {
+            "source": s.image.source,
+            "openart_model": s.image.openart_model,
             "provider": s.image.provider,
             "api_key": mask_key(s.image.api_key),
             "base_url": s.image.base_url,
@@ -1210,6 +1220,8 @@ def _parse_settings(req: SettingsRequest) -> AppSettings:
         model=req.llm.model,
     )
     image = ImageConfig(
+        source=req.image.source,
+        openart_model=req.image.openart_model.strip() or "nano-banana-2",
         provider=req.image.provider,
         api_key=req.image.api_key,
         base_url=req.image.base_url,
@@ -1233,7 +1245,7 @@ def _parse_settings(req: SettingsRequest) -> AppSettings:
             )
         if "****" in image.api_key or not image.api_key:
             image.api_key = old.image.api_key if old.image.provider == image.provider else ""
-        if not image.api_key:
+        if not image.api_key and image.source == "api":
             raise HTTPException(status_code=400, detail="图片服务商已选择，请填写 API Key")
         resolve_preset(image, is_image=True)
     else:
@@ -1361,7 +1373,15 @@ def test_settings(req: SettingsRequest):
                 result["llm"] = {"ok": False, "message": f"连接失败: {e}"}
 
     # ---- 图片服务测试 ----
-    if req.image.provider in ("", "mock"):
+    if req.image.source == "openart":
+        from app.image.openart_generator import OpenArtImageGenerator
+
+        try:
+            OpenArtImageGenerator.check_account()
+            result["image"] = {"ok": True, "message": "OpenArt 已登录，连接成功（未消耗生图点数）"}
+        except (ValueError, OSError) as e:
+            result["image"] = {"ok": False, "message": str(e)}
+    elif req.image.provider in ("", "mock"):
         result["image"] = {
             "ok": True,
             "message": "未设置（当前跟随 .env / Mock），无需测试",
@@ -1462,6 +1482,13 @@ def _extract_model_ids(resp: requests.Response) -> list[str]:
 def list_models(req: ModelsQueryRequest):
     if req.kind not in ("llm", "image"):
         raise HTTPException(status_code=400, detail="kind 必须为 llm 或 image")
+    if req.provider == "openart" and req.kind == "image":
+        from app.image.openart_generator import OpenArtImageGenerator
+
+        try:
+            return {"models": OpenArtImageGenerator.list_models(), "source": "api"}
+        except (ValueError, OSError) as e:
+            raise HTTPException(status_code=502, detail=str(e)) from e
     if req.provider in ("", "mock"):
         raise HTTPException(status_code=400, detail="请先选择服务商")
     if req.provider not in PROVIDER_PRESETS:

@@ -110,7 +110,7 @@ class ProviderManager:
     def _conf_status(effective, user_conf) -> dict:
         if effective is None:
             return {"mode": "mock", "provider": "mock", "model": ""}
-        is_user = user_conf.provider not in ("", "mock") and user_conf.api_key
+        is_user = effective.provider == "openart" or (user_conf.provider not in ("", "mock") and user_conf.api_key)
         mode = "user" if is_user else "env"
         return {"mode": mode, "provider": effective.provider, "model": effective.model}
 
@@ -137,6 +137,10 @@ class ProviderManager:
             from app.image.mock_generator import MockImageGenerator
 
             return MockImageGenerator()
+        if conf.provider == "openart":
+            from app.image.openart_generator import OpenArtImageGenerator
+
+            return OpenArtImageGenerator(model=conf.model)
         from app.providers.schema import PROVIDER_PRESETS
 
         api_style = (PROVIDER_PRESETS.get(conf.provider) or {}).get("image_api", "openai")
@@ -164,6 +168,8 @@ class ProviderManager:
         provider 为 ""（未设置）或设置了但缺 key 时回退 .env；显式 "mock" 直接 Mock。
         返回 None 表示降级 Mock。
         """
+        if is_image and conf.source == "openart":
+            return ImageConfig(provider="openart", model=conf.openart_model or "nano-banana-2")
         # 1) 用户显式选择 mock → Mock
         if conf.provider == "mock":
             return None
