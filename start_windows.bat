@@ -10,49 +10,64 @@ echo ==========================================
 echo.
 
 REM ===== 1. 检查 Node.js =====
+REM Vite 8 需要 Node 22+：更早的 20.x 没有 node:util 的 styleText 导出，
+REM 会直接报 "does not provide an export named 'styleText'" 而无法启动
+set "NODEMAJOR="
 where node >nul 2>nul
-if %errorlevel%==0 (
-    echo [OK] Node: & node --version
-) else (
-    echo [缺] 未检测到 Node.js，尝试自动安装...
-    where winget >nul 2>nul
-    if not %errorlevel%==0 goto NEED_NODE
-    winget install --id OpenJS.NodeJS.LTS --silent --accept-source-agreements --accept-package-agreements
-    if not %errorlevel%==0 goto NEED_NODE
-    echo [提示] Node.js 已安装，请关闭本窗口后重新双击运行
-    pause & exit /b 1
-    :NEED_NODE
-    echo.
-    echo 请手动安装 Node.js（LTS 版）后重新双击本脚本：
-    echo   https://nodejs.org/zh-cn/download
-    echo.
-    pause & exit /b 1
-)
+if not %errorlevel%==0 goto NEED_NODE
+for /f "tokens=1 delims=." %%a in ('node -v 2^>nul') do set "NODEMAJOR=%%a"
+if defined NODEMAJOR set "NODEMAJOR=%NODEMAJOR:~1%"
+if not defined NODEMAJOR goto NEED_NODE
+if %NODEMAJOR% GEQ 22 goto NODE_OK
+
+echo [警告] 检测到 Node.js v%NODEMAJOR%.x，Vite 8 需要 Node 22 及以上
+echo         该版本会启动失败：node:util 未导出 styleText
+where winget >nul 2>nul
+if not %errorlevel%==0 goto NEED_NODE
+echo 尝试自动升级 Node.js...
+winget install --id OpenJS.NodeJS.LTS --source winget --silent --accept-source-agreements --accept-package-agreements
+if not %errorlevel%==0 goto NEED_NODE
+echo [提示] Node.js 已升级，请关闭本窗口后重新双击运行
+pause & exit /b 1
+
+:NEED_NODE
+echo.
+echo 请安装 Node.js 22 LTS 或更高版本后重新双击本脚本：
+echo   https://nodejs.org/zh-cn/download
+echo.
+pause & exit /b 1
+:NODE_OK
+echo [OK] Node: & node --version
 
 REM ===== 2. 检查 Python =====
+REM 只接受 3.10-3.12：requirements.txt 里固定的 pydantic-core / Pillow 版本
+REM 没有 3.13+ 的预编译 wheel，用 3.13/3.14 会退化成源码编译（需 Rust + crates.io），
+REM 在受限网络下必然失败（表现为 "maturin failed / failed to load source for ahash"）
 set "PYCMD="
-py -3 -V >nul 2>nul && set "PYCMD=py -3"
-if not defined PYCMD (
-    python -V >nul 2>nul && set "PYCMD=python"
+for %%v in (3.12 3.11 3.10) do (
+    if not defined PYCMD (
+        py -%%v -V >nul 2>nul
+        if not errorlevel 1 set "PYCMD=py -%%v"
+    )
 )
 if defined PYCMD goto PY_OK
 
-echo [缺] 未检测到 Python，尝试自动安装...
+echo [缺] 未检测到兼容的 Python（需要 3.10-3.12），尝试自动安装 Python 3.12...
 where winget >nul 2>nul
 if not %errorlevel%==0 goto NEED_PY
-winget install --id Python.Python.3.12 --silent --accept-source-agreements --accept-package-agreements
+winget install --id Python.Python.3.12 --source winget --silent --accept-source-agreements --accept-package-agreements
 if not %errorlevel%==0 goto NEED_PY
-echo [提示] Python 已安装，请关闭本窗口后重新双击运行
+echo [提示] Python 3.12 已安装，请关闭本窗口后重新双击运行
 pause & exit /b 1
 :NEED_PY
 echo.
-echo 请手动安装 Python 3.10+ 后重新双击本脚本：
-echo   https://www.python.org/downloads/windows/
+echo 请手动安装 Python 3.12 后重新双击本脚本：
+echo   https://www.python.org/downloads/release/python-31210/
 echo （安装时勾选 "Add Python to PATH"）
 echo.
 pause & exit /b 1
 :PY_OK
-echo [OK] Python 就绪
+%PYCMD% -V
 
 REM ===== 3. 清理占用 8000/5173 端口的旧进程（无论之前是 bat 启动还是手动启动）=====
 echo 检查并清理占用 8000/5173 端口的旧进程...
@@ -61,9 +76,21 @@ powershell -NoProfile -Command "foreach ($port in @(8000, 5173)) { $conns = Get-
 REM ===== 4. 后端环境（venv 隔离，不污染系统）=====
 echo 准备后端环境...
 cd /d "%~dp0backend"
-if not exist .venv (
-    echo 首次运行：创建 Python 虚拟环境...
-    %PYCMD% -m venv .venv
+REM 已有 .venv 但可能是旧版 Python 建的（如 3.14）→ 版本不兼容，重建
+set "VENVVER="
+if exist .venv\Scripts\python.exe (
+    for /f "tokens=2 delims= " %%a in ('.venv\Scripts\python.exe -V 2^>nul') do set "VENVVER=%%a"
+)
+if defined VENVVER set "VENVVER=%VENVVER:~0,4%"
+if defined VENVVER (
+    if not "%VENVVER%"=="3.10" if not "%VENVVER%"=="3.11" if not "%VENVVER%"=="3.12" (
+        echo [提示] 现有虚拟环境是 Python %VENVVER%，与固定依赖不兼容，将自动重建...
+        set "VENVVER="
+    )
+)
+if not defined VENVVER (
+    echo 创建 Python 虚拟环境...
+    %PYCMD% -m venv --clear .venv
     if not exist .venv\Scripts\python.exe (
         echo [错误] 虚拟环境创建失败，请检查 Python 安装
         pause & exit /b 1

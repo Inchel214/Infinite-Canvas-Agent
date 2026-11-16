@@ -9,8 +9,9 @@ import os
 
 from app.agent.llm import BaseLLM, MockLLM
 from app.image.base import BaseImageGenerator
+from app.providers.profiles import ProfileHistory
 from app.providers.schema import AppSettings, LLMConfig, ImageConfig, PROVIDER_PRESETS, resolve_preset
-from app.providers.store import SettingsStore
+from app.providers.store import ProfileStore, SettingsStore
 
 
 class GeneratorProxy(BaseImageGenerator):
@@ -73,12 +74,20 @@ class ProviderManager:
         self._llm: BaseLLM
         self._rebuild()
 
+    @property
+    def profiles(self) -> ProfileHistory:
+        """已保存配置历史（与 settings.json 同目录，成功保存后自动归档，便于换回原 Key）"""
+        return ProfileHistory(ProfileStore(self._store.path.parent / "settings_profiles.json"))
+
     # ---------- 对外接口 ----------
 
     def update(self, settings: AppSettings) -> None:
         """保存用户设置并热切换实例"""
+        # 先把即将被覆盖的旧配置归档，避免切换后无法找回原来的 Key
+        self.profiles.record(self.settings)
         self.settings = settings
         self._store.save(settings)
+        self.profiles.record(settings)
         self._rebuild()
 
     def reset(self) -> None:

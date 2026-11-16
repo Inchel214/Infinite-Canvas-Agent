@@ -128,6 +128,93 @@ def _clamp_size(size: str, model: str = "") -> str:
     return size
 
 
+def _mask_to_bbox_tags(mask_data_url: str, max_boxes: int = 4) -> list[str]:
+    """把「黑底白图」蒙版转成 Seedream 需要的归一化 <bbox> 标签（0~999，左上角为原点）。
+
+    Ark 的 images/generations 没有 mask 入参，区域只能用坐标表达。
+    多个不连续涂抹会拆成多个框，避免一个大框把中间没涂的区域也圈进去。
+    """
+    import io
+
+    from PIL import Image
+
+    try:
+        raw = mask_data_url.split(",", 1)[-1]
+        gray = Image.open(io.BytesIO(base64.b64decode(raw))).convert("L")
+    except Exception as exc:
+        logger.warning("[Volc] 蒙版解析失败，退化为整图编辑: %s", exc)
+        return []
+
+    w, h = gray.size
+    if w <= 0 or h <= 0:
+        return []
+
+    # 降采样后做连通域（归一化坐标与原图尺寸无关，映射精度不受影响）
+    scale = min(1.0, 200.0 / max(w, h))
+    gw, gh = max(1, int(w * scale)), max(1, int(h * scale))
+    small = gray.resize((gw, gh), Image.BILINEAR).point(lambda v: 255 if v > 96 else 0)
+    pixels = small.load()
+
+    visited = [[False] * gw for _ in range(gh)]
+    min_area = max(4, int(gw * gh * 0.002))
+    boxes: list[tuple[int, int, int, int, int]] = []
+
+    for sy in range(gh):
+        for sx in range(gw):
+            if visited[sy][sx] or pixels[sx, sy] == 0:
+                continue
+            # 迭代式洪水填充：避免大选区时递归过深
+            stack = [(sx, sy)]
+            visited[sy][sx] = True
+            x0 = x1 = sx
+            y0 = y1 = sy
+            area = 0
+            while stack:
+                cx, cy = stack.pop()
+                area += 1
+                if cx < x0:
+                    x0 = cx
+                elif cx > x1:
+                    x1 = cx
+                if cy < y0:
+                    y0 = cy
+                elif cy > y1:
+                    y1 = cy
+                for nx, ny in ((cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)):
+                    if 0 <= nx < gw and 0 <= ny < gh and not visited[ny][nx] and pixels[nx, ny] > 0:
+                        visited[ny][nx] = True
+                        stack.append((nx, ny))
+            if area >= min_area:
+                boxes.append((x0, y0, x1, y1, area))
+
+    if not boxes:
+        return []
+
+    boxes.sort(key=lambda item: item[4], reverse=True)
+    tags = []
+    for x0, y0, x1, y1, _ in boxes[:max_boxes]:
+        tags.append(
+            "<bbox>{x0} {y0} {x1} {y1}</bbox>".format(
+                x0=round(x0 / gw * 999),
+                y0=round(y0 / gh * 999),
+                x1=round(x1 / gw * 999),
+                y1=round(y1 / gh * 999),
+            )
+        )
+    return tags
+
+
+def _build_inpaint_prompt(prompt: str, tags: list[str]) -> str:
+    """把用户指令与区域坐标组装成模型能理解的编辑指令，并显式约束未框选区域不变。"""
+    if not tags:
+        return prompt
+    return (
+        f"将图1 {'、'.join(tags)} 区域内的内容按以下要求修改：{prompt}。"
+        "其余区域必须完全保持原样，不要修改任何未框选的内容"
+        "（包括未框选的人物、动物、建筑、天空、水面和前景）。"
+    )
+
+
 class VolcEngineImageGenerator(BaseImageGenerator):
     """
     Ark（Seedream）风格图片生成器。
@@ -413,9 +500,12 @@ class VolcEngineImageGenerator(BaseImageGenerator):
         import time as _time
         _t0 = _time.monotonic()
 
-        # 把原图和蒙版都转为可发送格式
+        # 把原图转为可发送格式
         image_ref = to_sendable_ref(image_url) if image_url.startswith("http") else image_url
-        mask_ref = mask  # mask 已经是 data URL
+
+        # Ark 没有 mask 入参（传了会被静默忽略），区域只能用归一化 <bbox> 坐标告诉模型
+        tags = _mask_to_bbox_tags(mask)
+        final_prompt = _build_inpaint_prompt(prompt, tags)
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -423,19 +513,18 @@ class VolcEngineImageGenerator(BaseImageGenerator):
         }
         body: dict = {
             "model": self.model,
-            "prompt": prompt,
+            "prompt": final_prompt,
             "response_format": "url",
             "watermark": False,
             "image": image_ref,
-            "mask": mask_ref,  # inpainting 专用参数
         }
         if size:
             # 未指定 size 时不传，交由模型默认输出
             body["size"] = _clamp_size(size, self.model)
 
         logger.debug(
-            "[Volc] Inpainting 请求 model=%s size=%s prompt=%s",
-            self.model, body.get("size", "auto"), prompt[:80],
+            "[Volc] Inpainting 请求 model=%s size=%s 选区=%s prompt=%s",
+            self.model, body.get("size", "auto"), tags or "无（整图）", final_prompt[:120],
         )
 
         session = requests.Session()

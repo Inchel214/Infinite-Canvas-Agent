@@ -3,23 +3,34 @@ import { createPortal } from "react-dom";
 import type { CanvasNode } from "../types/canvas";
 import type { ImageCollectionView } from "./useImageCollections";
 
-const buttonStyle: CSSProperties = { border: "1px solid rgba(196,181,253,.25)", borderRadius: 6,
-  background: "rgba(167,139,250,.1)", color: "#e5e7eb", padding: "6px 10px", cursor: "pointer", fontSize: 12 };
+// 标签与按钮配色随画布背景切换：亮色画布上不能用浅色文字（会与背景融为一体）
+function buttonStyle(isLight: boolean): CSSProperties {
+  return {
+    border: `1px solid ${isLight ? "rgba(109,90,190,.45)" : "rgba(196,181,253,.25)"}`,
+    borderRadius: 6,
+    background: isLight ? "rgba(167,139,250,.16)" : "rgba(167,139,250,.1)",
+    color: isLight ? "#3b3852" : "#e5e7eb",
+    padding: "6px 10px", cursor: "pointer", fontSize: 12,
+  };
+}
 
-export function ImageCollectionCards({ groups, zoom, dropTargetId, update, onManage }: {
+export function ImageCollectionCards({ groups, zoom, dropTargetId, update, onManage, bgIsLight }: {
   zoom: number;
   groups: ImageCollectionView[];
   dropTargetId?: string | null;
+  // 画布是否为亮色背景（文字/按钮需反色，否则看不清）
+  bgIsLight: boolean;
   update: (id: string, patch: { collapsed?: boolean; x?: number; y?: number; scale?: number }) => void;
   onManage: (id: string) => void;
 }) {
-  return <>{groups.map((group) => <ImageCollectionCard key={`${group.id}:${group.coverId}`} group={group} zoom={zoom} isDropTarget={dropTargetId === group.id} update={update} onManage={onManage} />)}</>;
+  return <>{groups.map((group) => <ImageCollectionCard key={`${group.id}:${group.coverId}`} group={group} zoom={zoom} isDropTarget={dropTargetId === group.id} bgIsLight={bgIsLight} update={update} onManage={onManage} />)}</>;
 }
 
-function ImageCollectionCard({ group, zoom, isDropTarget, update, onManage }: {
+function ImageCollectionCard({ group, zoom, isDropTarget, bgIsLight, update, onManage }: {
   zoom: number;
   group: ImageCollectionView;
   isDropTarget: boolean;
+  bgIsLight: boolean;
   update: (id: string, patch: { collapsed?: boolean; x?: number; y?: number; scale?: number }) => void;
   onManage: (id: string) => void;
 }) {
@@ -65,8 +76,10 @@ function ImageCollectionCard({ group, zoom, isDropTarget, update, onManage }: {
     element.addEventListener("wheel", wheel, { passive: false });
     return () => element.removeEventListener("wheel", wheel);
   }, [step, group.collapsed]);
-  const arrowStyle: CSSProperties = { ...buttonStyle, position: "absolute", top: "45%", zIndex: 5,
-    display: "grid", placeItems: "center", lineHeight: 1, boxSizing: "border-box", width: 30, height: 30, padding: 0, borderRadius: "50%", background: "rgba(22,22,37,.86)", fontSize: 23,
+  const arrowStyle: CSSProperties = { ...buttonStyle(bgIsLight), position: "absolute", top: "45%", zIndex: 5,
+    display: "grid", placeItems: "center", lineHeight: 1, boxSizing: "border-box", width: 30, height: 30, padding: 0, borderRadius: "50%", background: "rgba(22,22,37,.86)",
+    color: "#e5e7eb", // 箭头底色固定为深色圆，文字需始终保持浅色
+    fontSize: 23,
     boxShadow: "0 2px 8px #0005" };
   return <section data-collection-id={group.id} aria-label={`${group.name}，${group.members.length} 张图片`}
     onMouseDown={(event) => event.stopPropagation()}
@@ -173,9 +186,9 @@ function ImageCollectionCard({ group, zoom, isDropTarget, update, onManage }: {
         }}
         onPointerCancel={() => { moving.current = null; setPosition(null); }}
         onLostPointerCapture={() => { moving.current = null; setPosition(null); }}
-        style={{ cursor: group.collapsed ? "grab" : undefined, touchAction: "none", userSelect: "none", maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13, color: "#f1efff" }}>{group.name}</span>
-      <button type="button" style={buttonStyle} onClick={() => update(group.id, { collapsed: !group.collapsed })}>{group.collapsed ? `展开 ${group.members.length}` : "收起"}</button>
-      <button type="button" style={buttonStyle} onClick={() => onManage(group.id)}>管理</button>
+        style={{ cursor: group.collapsed ? "grab" : undefined, touchAction: "none", userSelect: "none", maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13, color: bgIsLight ? "#2b2a3d" : "#f1efff" }}>{group.name}</span>
+      <button type="button" style={buttonStyle(bgIsLight)} onClick={() => update(group.id, { collapsed: !group.collapsed })}>{group.collapsed ? `展开 ${group.members.length}` : "收起"}</button>
+      <button type="button" style={buttonStyle(bgIsLight)} onClick={() => onManage(group.id)}>管理</button>
     </div>
     {group.collapsed && <div title="拖动缩放收纳组" role="button" aria-label="缩放收纳组"
       onPointerDown={(event) => {
@@ -240,7 +253,7 @@ export function ImageCollectionDialog({ group, onClose, onRename, onCover, onRem
         onKeyDown={(event) => { if (event.key === "Enter" && !event.nativeEvent.isComposing && event.nativeEvent.keyCode !== 229) { commitName(); event.currentTarget.blur(); } }}
         style={{ flex: 1, minWidth: 0, fontSize: 19, fontWeight: 600, color: "#f4f1ff", background: "transparent", border: "1px solid #56506b", borderRadius: 6, padding: "8px 10px" }} />
       <span style={{ color: "#b3aec8", whiteSpace: "nowrap" }}>{group.members.length} 张</span>
-      <button className="collection-control" type="button" style={buttonStyle} onClick={() => { commitName(); onClose(); }}>关闭</button>
+      <button className="collection-control" type="button" style={buttonStyle(false)} onClick={() => { commitName(); onClose(); }}>关闭</button>
     </div>
     <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(210px, 1fr))", gap: 16 }}>
       {group.members.map((node) => <article key={node.id} className="collection-member" data-collection-member={node.id}
@@ -254,14 +267,14 @@ export function ImageCollectionDialog({ group, onClose, onRename, onCover, onRem
           {group.cover.id === node.id && <span style={{ color: "#c4b5fd" }}>当前封面</span>}
         </div>
         <div style={{ display: "flex", gap: 7, flexWrap: "wrap" }}>
-          <button className="collection-control" type="button" disabled={group.cover.id === node.id} style={{ ...buttonStyle, opacity: group.cover.id === node.id ? .45 : 1 }} onClick={() => onCover(node.id)}>设为封面</button>
-          <button className="collection-control" type="button" style={buttonStyle} onClick={() => onRemove(node.id)}>移出组</button>
+          <button className="collection-control" type="button" disabled={group.cover.id === node.id} style={{ ...buttonStyle(false), opacity: group.cover.id === node.id ? .45 : 1 }} onClick={() => onCover(node.id)}>设为封面</button>
+          <button className="collection-control" type="button" style={buttonStyle(false)} onClick={() => onRemove(node.id)}>移出组</button>
         </div>
       </article>)}
     </div>
     <footer style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", marginTop: 20, borderTop: "1px solid #444158", paddingTop: 16 }}>
       <span style={{ fontSize: 12, color: "#aaa5bf" }}>移出或解散均保留原图和连线。</span>
-      <button className="collection-control" type="button" style={buttonStyle} onClick={onDissolve}>解散组，保留图片</button>
+      <button className="collection-control" type="button" style={buttonStyle(false)} onClick={onDissolve}>解散组，保留图片</button>
     </footer>
   </dialog>, document.body);
 }

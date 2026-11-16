@@ -355,7 +355,16 @@ def edit_image(canvas_id: str, req: EditRequest):
         kwargs["y"] = req.y
     if req.mask is not None:
         kwargs["mask"] = req.mask  # 蒙版（局部编辑 Inpainting）
-    result = tool.run(state, **kwargs)
+    try:
+        result = tool.run(state, **kwargs)
+    except Exception as e:
+        # 上游异常（网络中断、SSL 握手失败等）直接透传给前端，避免只回报 500
+        logger.warning("[Edit] 局部编辑失败 canvas=%s: %s", canvas_id, e)
+        return {
+            "success": False,
+            "message": f"局部编辑失败：{e}",
+            "canvas": state.to_dict(),
+        }
     if not result.success or not result.state:
         return {
             "success": False,
@@ -1204,6 +1213,21 @@ def _masked_settings() -> dict:
     }
 
 
+def _resolve_placeholder_key(kind: str, provider: str, api_key: str, saved) -> str:
+    """空 / 脱敏占位符（含 ****）→ 已保存历史或当前配置中的真实 Key。
+
+    支持从历史配置回填：切回之前保存过的服务商时，前端只带回显的脱敏串，
+    这里按「服务商 + 脱敏串」反查真实 Key，用户无需重新输入。
+    """
+    if not api_key:
+        return saved.api_key if saved.provider == provider else ""
+    if "****" not in api_key:
+        return api_key
+    return deps.manager.profiles.find_key(kind, provider, api_key) or (
+        saved.api_key if saved.provider == provider else ""
+    )
+
+
 def _parse_settings(req: SettingsRequest) -> AppSettings:
     """请求数据 → AppSettings：校验 provider、补预设默认值、脱敏占位符保留原 key"""
     if req.llm.provider not in PROVIDER_PRESETS and req.llm.provider not in ("", "mock"):
@@ -1229,8 +1253,7 @@ def _parse_settings(req: SettingsRequest) -> AppSettings:
     )
     # key 传回脱敏占位符（含 ****）或留空时保留原值，便于只改模型不动 key
     if llm.provider not in ("", "mock"):
-        if "****" in llm.api_key or not llm.api_key:
-            llm.api_key = old.llm.api_key if old.llm.provider == llm.provider else ""
+        llm.api_key = _resolve_placeholder_key("llm", llm.provider, llm.api_key, old.llm)
         if not llm.api_key:
             raise HTTPException(status_code=400, detail="LLM 服务商已选择，请填写 API Key")
         resolve_preset(llm, is_image=False)
@@ -1242,8 +1265,9 @@ def _parse_settings(req: SettingsRequest) -> AppSettings:
                 status_code=400,
                 detail=f"服务商 {image.provider} 不支持图片生成，请选择其他服务商或 Mock",
             )
-        if "****" in image.api_key or not image.api_key:
-            image.api_key = old.image.api_key if old.image.provider == image.provider else ""
+        image.api_key = _resolve_placeholder_key(
+            "image", image.provider, image.api_key, old.image
+        )
         if not image.api_key and image.source == "api":
             raise HTTPException(status_code=400, detail="图片服务商已选择，请填写 API Key")
         resolve_preset(image, is_image=True)
@@ -1311,6 +1335,20 @@ def delete_settings():
     return {"success": True, "message": "已恢复默认配置", "settings": _masked_settings()}
 
 
+@router.get("/settings/profiles", summary="已保存的配置历史（key 脱敏，可一键回填）")
+def list_settings_profiles():
+    return deps.manager.profiles.list()
+
+
+@router.delete("/settings/profiles/{kind}/{profile_id}", summary="删除某条已保存的配置历史")
+def delete_settings_profile(kind: str, profile_id: str):
+    if kind not in ("llm", "image"):
+        raise HTTPException(status_code=400, detail="kind 必须为 llm 或 image")
+    if not deps.manager.profiles.delete(kind, profile_id):
+        raise HTTPException(status_code=404, detail="配置不存在")
+    return {"success": True, "message": "已删除"}
+
+
 @router.get("/providers", summary="获取内置服务商预设列表")
 def get_providers():
     return {"providers": PROVIDER_PRESETS}
@@ -1340,7 +1378,7 @@ def test_settings(req: SettingsRequest):
         )
         if "****" in llm.api_key or not llm.api_key:
             old = deps.manager.settings
-            llm.api_key = old.llm.api_key if old.llm.provider == llm.provider else ""
+            llm.api_key = _resolve_placeholder_key("llm", llm.provider, llm.api_key, old.llm)
         resolve_preset(llm, is_image=False)
         if not llm.api_key or not llm.base_url:
             result["llm"] = {"ok": False, "message": "请填写 API Key 和 Base URL"}
@@ -1394,7 +1432,7 @@ def test_settings(req: SettingsRequest):
         )
         if "****" in image.api_key or not image.api_key:
             old = deps.manager.settings
-            image.api_key = old.image.api_key if old.image.provider == image.provider else ""
+            image.api_key = _resolve_placeholder_key("image", image.provider, image.api_key, old.image)
         resolve_preset(image, is_image=True)
         if not image.api_key or not image.base_url:
             result["image"] = {"ok": False, "message": "请填写 API Key 和 Base URL"}
@@ -1496,11 +1534,11 @@ def list_models(req: ModelsQueryRequest):
     if req.provider not in PROVIDER_PRESETS:
         raise HTTPException(status_code=400, detail=f"未知的服务商: {req.provider}")
 
-    # key 传回脱敏占位符（含 ****）或留空时，复用已保存的真实 key（服务商未变时）
+    # key 传回脱敏占位符（含 ****）或留空时，复用已保存的真实 key
     api_key = req.api_key
     if "****" in api_key or not api_key:
         saved = deps.manager.settings.image if req.kind == "image" else deps.manager.settings.llm
-        api_key = saved.api_key if saved.provider == req.provider else ""
+        api_key = _resolve_placeholder_key(req.kind, req.provider, api_key, saved)
     base_url = req.base_url or (PROVIDER_PRESETS[req.provider].get("base_url") or "")
 
     # 火山方舟未开放 /models 列表接口（且对未知路径也返回 401，无法区分 key 有效性），

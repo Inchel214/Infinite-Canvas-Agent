@@ -557,6 +557,11 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   // 本地位置覆盖（拖拽时即时更新，不等待 API）
   const sizeStorageKey = `ica:display-sizes:${canvasId}`;
   const [localStatusMsg, setLocalStatusMsg] = useState<string | null>(null);
+  // 短暂提示：自动消失，避免失败文案长期挂在画布上
+  const flashStatus = useCallback((message: string, ms = 3200) => {
+    setLocalStatusMsg(message);
+    window.setTimeout(() => setLocalStatusMsg(null), ms);
+  }, []);
   const [showHelp, setShowHelp] = useState(false);
 
   // 画布只保留明/暗两档，避免颜色选择器打断画布操作。
@@ -1712,19 +1717,37 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     const w = ratio.w >= ratio.h ? long : Math.round((long * ratio.w) / ratio.h);
     const h = ratio.w >= ratio.h ? Math.round((long * ratio.h) / ratio.w) : long;
 
-    if (nodes.length > 0) {
+    if (nodes.length > 0 && srcNodes.length > 0) {
       const segs = segmentsOf(nodes);
       const gap = 60;
-      // 候选1：源图组右侧，顶部对齐
-      const rightX = Math.max(...srcNodes.map((n) => n.x + n.width)) + gap;
-      const rightY = Math.min(...srcNodes.map((n) => n.y));
-      if (spotFree(nodes, segs, rightX, rightY, w, h)) return { x: rightX, y: rightY, w, h };
-      // 候选2：源图组下方，左对齐
-      const belowY = Math.max(...srcNodes.map((n) => n.y + n.height)) + gap;
-      const belowX = Math.min(...srcNodes.map((n) => n.x));
-      if (spotFree(nodes, segs, belowX, belowY, w, h)) return { x: belowX, y: belowY, w, h };
-      // 候选3：全部内容最右侧（必然无重叠）
+      const left = Math.min(...srcNodes.map((n) => n.x));
+      const top = Math.min(...srcNodes.map((n) => n.y));
+      const right = Math.max(...srcNodes.map((n) => n.x + n.width));
+      const bottom = Math.max(...srcNodes.map((n) => n.y + n.height));
+      // 就近放置：围绕源图逐圈向外找空位（右→下→左→上），
+      // 避免源图相邻位置被占用时直接跳到画布最远处
+      const stepX = right - left + gap;
+      const stepY = bottom - top + gap;
+      for (let ring = 0; ring < 6; ring += 1) {
+        const spots = [
+          { x: right + gap + ring * stepX, y: top },
+          { x: left, y: bottom + gap + ring * stepY },
+          { x: left - w - gap - ring * stepX, y: top },
+          { x: left, y: top - h - gap - ring * stepY },
+        ];
+        for (const spot of spots) {
+          if (spotFree(nodes, segs, spot.x, spot.y, w, h)) return { x: spot.x, y: spot.y, w, h };
+        }
+      }
+      // 兜底：全部内容最右侧（必然无重叠）
       const allX = Math.max(...nodes.map((n) => n.x + n.width)) + gap;
+      const allY = Math.min(...nodes.map((n) => n.y));
+      return { x: allX, y: allY, w, h };
+    }
+
+    if (nodes.length > 0) {
+      // 有内容但没有源图（纯文生图）：放在全部内容右侧
+      const allX = Math.max(...nodes.map((n) => n.x + n.width)) + 60;
       const allY = Math.min(...nodes.map((n) => n.y));
       return { x: allX, y: allY, w, h };
     }
@@ -1844,9 +1867,17 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         mask,
         experienceIds: experienceIds?.length ? experienceIds : undefined,
       };
-      Promise.resolve(onAction(action)).finally(() => removeProcessingBox(boxId));
+      Promise.resolve(onAction(action))
+        .then((ok) => {
+          if (!ok) flashStatus("局部编辑未完成，可重试");
+        })
+        .catch((err) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          flashStatus(`局部编辑失败：${msg}`, 5000);
+        })
+        .finally(() => removeProcessingBox(boxId));
     },
-    [onAction, maskEditor, nodes, buildProcessingBox, addProcessingBox, removeProcessingBox]
+    [onAction, maskEditor, nodes, buildProcessingBox, addProcessingBox, removeProcessingBox, flashStatus]
   );
 
   const handleDelete = useCallback(() => {
@@ -2567,7 +2598,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
           />
         ))}
 
-        <ImageCollectionCards zoom={zoom} groups={collections.views} dropTargetId={collectionDropTargetId} update={(id, patch) => {
+        <ImageCollectionCards zoom={zoom} groups={collections.views} bgIsLight={bgIsLight} dropTargetId={collectionDropTargetId} update={(id, patch) => {
           collections.update(id, patch);
           if (patch.collapsed) {
             const members = new Set(collections.views.find((group) => group.id === id)?.memberIds);

@@ -424,7 +424,8 @@ export async function editImage(
     }),
   });
   if (!res.ok) {
-    throw new Error(`${res.status}`);
+    const payload = await res.json().catch(() => null);
+    throw new Error(payload?.detail || `${res.status}`);
   }
   return res.json();
 }
@@ -676,6 +677,43 @@ export interface ProviderPreset {
 export interface TestResult {
   ok: boolean;
   message: string;
+}
+
+// 已保存的配置历史（成功保存后自动归档，key 脱敏回显，点击可回填）
+export interface SavedProfile {
+  id: string;
+  provider: string;
+  provider_name: string;
+  label: string;
+  api_key: string;
+  base_url: string;
+  model: string;
+  stream_model: string;
+  updated_at: number;
+}
+
+export interface SavedProfiles {
+  llm: SavedProfile[];
+  image: SavedProfile[];
+}
+
+export async function listProfiles(): Promise<SavedProfiles> {
+  const res = await fetch(`${API_BASE}/settings/profiles`);
+  if (!res.ok) throw new Error(`${res.status}`);
+  return res.json();
+}
+
+export async function deleteProfile(
+  kind: "llm" | "image",
+  id: string
+): Promise<void> {
+  const res = await fetch(`${API_BASE}/settings/profiles/${kind}/${id}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: `${res.status}` }));
+    throw new Error(err.detail || `${res.status}`);
+  }
 }
 
 export async function getSettings(): Promise<AppSettingsData> {

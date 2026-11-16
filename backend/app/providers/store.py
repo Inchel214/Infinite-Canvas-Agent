@@ -11,6 +11,7 @@ from app.providers.schema import AppSettings
 logger = logging.getLogger(__name__)
 
 _SETTINGS_FILE = Path(__file__).resolve().parent.parent.parent / "data" / "settings.json"
+_PROFILES_FILE = Path(__file__).resolve().parent.parent.parent / "data" / "settings_profiles.json"
 
 
 class SettingsStore:
@@ -21,6 +22,10 @@ class SettingsStore:
             env_dir = os.getenv("CANVAS_DATA_DIR")
             path = Path(env_dir).parent / "settings.json" if env_dir else _SETTINGS_FILE
         self._path = path
+
+    @property
+    def path(self) -> Path:
+        return self._path
 
     def load(self) -> AppSettings:
         try:
@@ -45,3 +50,32 @@ class SettingsStore:
 
     def clear(self) -> None:
         self._path.unlink(missing_ok=True)
+
+
+class ProfileStore:
+    """已保存配置历史的持久化：settings_profiles.json（文件不存在时返回空）"""
+
+    def __init__(self, path: Path | None = None):
+        if path is None:
+            env_dir = os.getenv("CANVAS_DATA_DIR")
+            path = Path(env_dir).parent / "settings_profiles.json" if env_dir else _PROFILES_FILE
+        self._path = path
+
+    def load(self) -> dict:
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            logger.warning("settings_profiles.json 读取失败（忽略历史配置）: %s", e)
+            return {}
+
+    def save(self, data: dict) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        try:
+            os.chmod(self._path, 0o600)
+        except OSError:
+            pass

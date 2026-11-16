@@ -10,6 +10,8 @@ import {
   addExperience,
   updateExperience,
   deleteExperience,
+  listProfiles,
+  deleteProfile,
   type AppSettingsData,
   type LLMSettings,
   type ImageSettings,
@@ -17,6 +19,8 @@ import {
   type ProviderPreset,
   type TestResult,
   type ExperienceMeta,
+  type SavedProfile,
+  type SavedProfiles,
 } from "../api/agent";
 
 interface SettingsPanelProps {
@@ -192,6 +196,63 @@ function ModelField(props: {
   );
 }
 
+// 已保存的配置历史：点击整块回填服务商 / 地址 / 模型 / Key，右侧 ✕ 删除
+function SavedProfileChips(props: {
+  items: SavedProfile[];
+  onPick: (p: SavedProfile) => void;
+  onDelete: (p: SavedProfile) => void;
+}) {
+  if (props.items.length === 0) return null;
+  return (
+    <div style={{ marginTop: 8 }}>
+      <div style={{ color: "#777", fontSize: 11, marginBottom: 4 }}>
+        已保存的配置（点击回填，无需重新输入 API Key）
+      </div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+        {props.items.map((p) => (
+          <span
+            key={p.id}
+            onClick={() => props.onPick(p)}
+            title="点击回填该配置"
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              maxWidth: "100%",
+              padding: "3px 4px 3px 9px",
+              borderRadius: 999,
+              background: "rgba(167,139,250,0.14)",
+              border: "1px solid rgba(167,139,250,0.32)",
+              color: "#cfc6f7",
+              fontSize: 11,
+              cursor: "pointer",
+            }}
+          >
+            <span
+              style={{
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {p.label}
+            </span>
+            <span
+              onClick={(e) => {
+                e.stopPropagation();
+                props.onDelete(p);
+              }}
+              title="删除该条已保存配置"
+              style={{ color: "#888", padding: "0 4px", cursor: "pointer" }}
+            >
+              ✕
+            </span>
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
   const [providers, setProviders] = useState<Record<string, ProviderPreset>>({});
   const [llm, setLlm] = useState<LLMSettings>({
@@ -209,6 +270,7 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
   });
   const [testing, setTesting] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [profiles, setProfiles] = useState<SavedProfiles>({ llm: [], image: [] });
   const [testResult, setTestResult] = useState<{
     llm?: TestResult;
     image?: TestResult;
@@ -228,19 +290,21 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
   const [importing, setImporting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // 加载技能列表 + 服务商预设
+  // 加载技能列表 + 服务商预设 + 已保存配置历史
   useEffect(() => {
     (async () => {
       try {
-        const [settings, providerData, exps] = await Promise.all([
+        const [settings, providerData, exps, savedProfiles] = await Promise.all([
           getSettings(),
           getProviders(),
           listExperiences().catch(() => [] as ExperienceMeta[]),
+          listProfiles().catch(() => ({ llm: [], image: [] }) as SavedProfiles),
         ]);
         setLlm(settings.llm);
         setImage(settings.image);
         setProviders(providerData.providers);
         setExperiences(exps);
+        setProfiles(savedProfiles);
       } catch (e) {
         setErrorMsg("加载配置失败：" + (e as Error).message);
       }
@@ -374,6 +438,42 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
 
   const buildPayload = () => ({ llm, image });
 
+  // 点击已保存配置 → 整组回填（Key 为脱敏串，保存时后端按历史还原真实 Key）
+  const handlePickProfile = (kind: "llm" | "image", p: SavedProfile) => {
+    if (kind === "llm") {
+      setLlm({
+        provider: p.provider,
+        api_key: p.api_key,
+        base_url: p.base_url,
+        model: p.model,
+      });
+    } else {
+      setImage((prev) => ({
+        ...prev,
+        source: "api",
+        provider: p.provider,
+        api_key: p.api_key,
+        base_url: p.base_url,
+        model: p.model,
+        stream_model: p.stream_model,
+      }));
+    }
+    setTestResult({});
+    setNotice("");
+  };
+
+  const handleDeleteProfile = async (kind: "llm" | "image", p: SavedProfile) => {
+    try {
+      await deleteProfile(kind, p.id);
+      setProfiles((prev) => ({
+        ...prev,
+        [kind]: prev[kind].filter((item) => item.id !== p.id),
+      }));
+    } catch (e) {
+      setErrorMsg("删除已保存配置失败：" + (e as Error).message);
+    }
+  };
+
   const handleTest = async () => {
     setTesting(true);
     setErrorMsg("");
@@ -396,6 +496,8 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
       const res = await saveSettings(buildPayload());
       setNotice(res.message);
       onSaved(res.settings);
+      // 保存成功即归档一份配置，刷新历史列表（便于之后一键切回）
+      listProfiles().then(setProfiles).catch(() => {});
       // 稍作停留后自动关闭
       setTimeout(onClose, 600);
     } catch (e) {
@@ -507,6 +609,12 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
           ))}
         </select>
 
+        <SavedProfileChips
+          items={profiles.llm}
+          onPick={(p) => handlePickProfile("llm", p)}
+          onDelete={(p) => handleDeleteProfile("llm", p)}
+        />
+
         {llm.provider !== "" && llm.provider !== "mock" && (
           <>
             <label style={labelStyle}>API Key</label>
@@ -601,6 +709,12 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
             </option>
           ))}
         </select>
+
+        <SavedProfileChips
+          items={profiles.image}
+          onPick={(p) => handlePickProfile("image", p)}
+          onDelete={(p) => handleDeleteProfile("image", p)}
+        />
 
         {image.provider !== "" && image.provider !== "mock" && (
           <>
