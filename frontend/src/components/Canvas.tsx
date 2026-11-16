@@ -8,6 +8,7 @@ import { generateImageStream, updateNodePosition, uploadImageNode, undoCanvas, r
 // 重构后的快捷键模块
 import { ShortcutHelpPanel } from "./canvas/components/ShortcutHelpPanel";
 import { useCanvasShortcuts } from "./canvas/hooks/useCanvasShortcuts";
+import { useGenerationSession } from "./canvas/hooks/useGenerationSession";
 import { matchesShortcut } from "./canvas/state/canvasShortcuts";
 import { swapReferenceSlots } from "./canvas/utils/references";
 
@@ -664,10 +665,11 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   // 生成中占位框：编辑/变体/组合执行时，在新图将要出现的位置预先画出矩形框，
   // 框内显示"正在编辑图片..."等状态；完成后新图淡入该位置。
   // 数组形式支持多张图同时编辑：每个操作绑定自己的占位框，完成时只移除自己的
-  const [processingBoxes, setProcessingBoxes] = useState<
-    { id: number; x: number; y: number; w: number; h: number; label: string }[]
-  >([]);
-  const processingSeqRef = useRef(0);
+  const {
+    containers, setContainers, generatingIds, setGeneratingIds,
+    genProgressMap, setGenProgressMap, generatingIdsRef, generatingPositionsRef,
+    processingBoxes, setProcessingBoxes, processingSeqRef,
+  } = useGenerationSession(canvasId);
   // 添加占位框（返回 id），操作结束时用 removeProcessingBox(id) 只清掉自己
   const addProcessingBox = useCallback(
     (box: { x: number; y: number; w: number; h: number }, label: string) => {
@@ -675,30 +677,19 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       setProcessingBoxes((prev) => [...prev, { ...box, id, label }]);
       return id;
     },
-    []
+    [processingSeqRef, setProcessingBoxes]
   );
   const removeProcessingBox = useCallback((id: number) => {
     setProcessingBoxes((prev) => prev.filter((b) => b.id !== id));
-  }, []);
+  }, [setProcessingBoxes]);
   // 编辑框真实屏幕矩形（屏幕层锚定连线终点；位置/尺寸变化时驱动连线重渲染）
   const [editPanelRect, setEditPanelRect] = useState({ x: 0, y: 0, w: 340, h: 420 });
 
   // ===== 待生成图片容器 + 连线 =====
-  const [containers, setContainers] = useState<PendingContainer[]>([]);
-  // 生成请求携带启动时的位置；拖动期间用 ref 留住最新坐标，供异步完成回调读取。
-  const generatingPositionsRef = useRef<Record<string, { x: number; y: number }>>({});
   const [connecting, setConnecting] = useState<{ fromId: string; x: number; y: number; sx: number; sy: number } | null>(null);
   const [draggingContainer, setDraggingContainer] = useState<{ id: string; offsetX: number; offsetY: number } | null>(null);
-  // 按容器独立跟踪生成状态：生成中的容器锁定自身，其它容器完全可操作（可并发生成）
-  const [generatingIds, setGeneratingIds] = useState<Set<string>>(new Set());
-  const [genProgressMap, setGenProgressMap] = useState<Record<string, number>>({});
   // 最近点击（激活）的容器 id：点击容器后按 Esc 直接关闭该容器
   const activeContainerIdRef = useRef<string | null>(null);
-  // Esc 处理器（固定依赖的 keydown effect）读最新生成中容器集合的镜像
-  const generatingIdsRef = useRef<Set<string>>(new Set());
-  useEffect(() => {
-    generatingIdsRef.current = generatingIds;
-  }, [generatingIds]);
   const containerSeqRef = useRef(0);
 
   const marqueeStartRef = useRef<{ x: number; y: number } | null>(null);
@@ -886,7 +877,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [selectedIds, nodes, onAction, canvasId, onCanvasUpdate, copySelectedImagesToSystemClipboard, shortcuts.bindings]);
+  }, [selectedIds, nodes, onAction, canvasId, onCanvasUpdate, copySelectedImagesToSystemClipboard, shortcuts.bindings, setContainers, generatingIdsRef]);
 
   // 使用浏览器原生 copy 事件接管 Cmd/Ctrl+C，避免快捷键先被浏览器或容器层拦截。
   // 输入控件与 Agent 面板中的文字选区仍保留普通的文本复制行为。
@@ -989,17 +980,17 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       refIds: refId ? [refId] : [],
     };
     setContainers((prev) => [...prev, c]);
-  }, [nodes, zoom]);
+  }, [nodes, zoom, setContainers]);
 
   const updateContainer = useCallback((id: string, patch: Partial<PendingContainer>) => {
     setContainers((prev) => prev.map((c) => (c.id === id ? { ...c, ...patch } : c)));
-  }, []);
+  }, [setContainers]);
 
   const removeContainer = useCallback((id: string) => {
     // 同步清掉激活标记（该容器被 × 删除后 Esc 不应再作用于它）
     if (activeContainerIdRef.current === id) activeContainerIdRef.current = null;
     setContainers((prev) => prev.filter((c) => c.id !== id));
-  }, []);
+  }, [setContainers]);
 
   // ===== 拖拽/粘贴上传本地图片 =====
   const uploadImages = useCallback(
@@ -1446,7 +1437,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         });
       });
     }
-  }, [connecting, draggingContainer, draggingNode, isPanning, pan, zoom, dragOffset, screenToWorld, collections.views]);
+  }, [connecting, draggingContainer, draggingNode, isPanning, pan, zoom, dragOffset, screenToWorld, collections.views, setContainers, generatingIdsRef, generatingPositionsRef]);
 
   const handleMouseUp = useCallback((e: React.MouseEvent) => {
     // 连线结束：编辑态按钳制后的屏幕矩形命中；生成态按世界卡片的实际屏幕投影命中。
@@ -1827,7 +1818,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         setLocalStatusMsg(`修改完成：${succeeded}/${count} 张${succeeded < count ? "，失败项可重新生成" : ""}`);
       }
     })();
-  }, [onAction, editPanel, nodes, buildProcessingBox, styleNamesByIds, addProcessingBox, removeProcessingBox, variantCount]);
+  }, [onAction, editPanel, nodes, buildProcessingBox, styleNamesByIds, addProcessingBox, removeProcessingBox, variantCount, setProcessingBoxes]);
 
   // 蒙版编辑器确认：执行局部编辑（Inpainting）
   const handleMaskEditorConfirm = useCallback(
@@ -1913,7 +1904,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       }
     };
     image.src = node.image_url;
-  }, [selectedIds, nodes, zoom, resolution, updateContainer]);
+  }, [selectedIds, nodes, zoom, resolution, updateContainer, setContainers]);
 
   // 更新节点内容（文本卡双击编辑后保存）
   const handleUpdateNodeContent = useCallback(
@@ -2141,7 +2132,6 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         await Promise.all(batch.map((item) => generateContainer(item)));
         return;
       }
-      generatingIdsRef.current.add(c.id);
       const op =
         c.refIds.length === 0 ? "generate" : c.refIds.length === 1 ? "variate" : "compose";
 
@@ -2240,7 +2230,11 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       } finally {
         window.clearInterval(timer);
         delete generatingPositionsRef.current[c.id];
-        generatingIdsRef.current.delete(c.id);
+        setGenProgressMap((previous) => {
+          const next = { ...previous };
+          delete next[c.id];
+          return next;
+        });
         // 只解除本容器的生成态（其它容器的进度不受影响）
         setGeneratingIds((prev) => {
           const next = new Set(prev);
@@ -2249,7 +2243,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         });
       }
     },
-    [canvasId, updateContainer, removeContainer, onCanvasUpdate, zoom]
+    [canvasId, updateContainer, removeContainer, onCanvasUpdate, zoom,
+      setContainers, setGeneratingIds, setGenProgressMap, generatingIdsRef, generatingPositionsRef]
   );
 
   const selectedCount = selectedIds.size;

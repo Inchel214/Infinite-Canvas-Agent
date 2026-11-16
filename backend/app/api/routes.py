@@ -940,10 +940,9 @@ def generate_image_stream(canvas_id: str, req: StreamGenRequest):
                     tool = deps.tool_manager.get("generate_image")
                     result = tool.run(state, prompt=prompt, size=size, x=req.x, y=req.y)
             except Exception as e:
-                if getattr(gen, "is_openart", False):
-                    yield _sse({"type": "done", "success": False, "message": str(e)})
-                    return
-                raise
+                logger.exception("图片生成失败")
+                yield _sse({"type": "done", "success": False, "message": str(e)})
+                return
             final_state = result.state
             generated_node_id = None
             if result.success:
@@ -1410,7 +1409,10 @@ def test_settings(req: SettingsRequest):
                     proxies={"http": None, "https": None},
                 )
                 if resp.status_code == 200:
-                    result["image"] = {"ok": True, "message": f"连接成功（{image.model}）"}
+                    result["image"] = {
+                        "ok": True,
+                        "message": f"模型列表接口连通（{image.model}）；未验证生图权限或额度",
+                    }
                 elif resp.status_code in (401, 403):
                     result["image"] = {"ok": False, "message": "API Key 无效或无权限"}
                 elif resp.status_code in (404, 405):

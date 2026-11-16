@@ -8,6 +8,7 @@
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "test:reference-slots": "node --experimental-strip-types --test test/reference-slots.test.mjs",
+    "test:generation-sessions": "node --experimental-strip-types --test test/generation-sessions.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
