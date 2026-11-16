@@ -81,6 +81,7 @@ class MockImageGenerator(BaseImageGenerator):
         width: int = 512,
         height: int = 512,
         size: str = "2K",
+        sketch: str | None = None,
     ) -> ImageResult:
         seed = f"edit:{prompt}:{source_image_url[:32]}"
         tag = "[局部编辑]" if mask else "[重绘]"

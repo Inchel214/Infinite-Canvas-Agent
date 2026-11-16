@@ -5,7 +5,7 @@ import { createPortal } from "react-dom";
 import { ImageCollectionCards, ImageCollectionDialog } from "./ImageCollections";
 import { useImageCollections } from "./useImageCollections";
 import type { CanvasState, CanvasNode } from "../types/canvas";
-import { generateImageStream, updateNodePosition, uploadImageNode, undoCanvas, redoCanvas, listExperiences, revealImageFile, type ExperienceMeta } from "../api/agent";
+import { generateImageStream, updateNodePosition, uploadImageNode, undoCanvas, redoCanvas, listExperiences, revealImageFile, getImageCapabilities, type ExperienceMeta, type ImageCapabilities } from "../api/agent";
 // 重构后的快捷键模块
 import { ShortcutHelpPanel } from "./canvas/components/ShortcutHelpPanel";
 import { useCanvasShortcuts } from "./canvas/hooks/useCanvasShortcuts";
@@ -18,7 +18,7 @@ export type CanvasAction =
   | { type: "text"; content: string; x: number; y: number }
   | { type: "compose"; nodeIds: string[]; prompt: string; size: string; x?: number; y?: number; experienceIds?: string[] }
   | { type: "variate"; nodeId: string; prompt: string; size: string; x?: number; y?: number; experienceIds?: string[] }
-  | { type: "edit"; nodeId: string; prompt: string; size: string; x?: number; y?: number; experienceIds?: string[]; mask?: string }
+  | { type: "edit"; nodeId: string; prompt: string; size: string; x?: number; y?: number; experienceIds?: string[]; mask?: string; sketch?: string }
   | { type: "generate"; prompt: string; size: string; x: number; y: number; experienceIds?: string[] }
   | { type: "delete"; nodeIds: string[] }
   | { type: "arrange"; mode: "soft" | "semantic"; excludeIds?: string[] }
@@ -674,6 +674,16 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     resolution?: string;
     styleIds?: string[];
   } | null>(null);
+  // 当前生图模型的编辑能力（决定草图笔是否可用）
+  const [imageCaps, setImageCaps] = useState<ImageCapabilities | null>(null);
+
+  // 每次进入局部编辑前刷新一次，保证切换模型后能力立即同步
+  useEffect(() => {
+    if (!maskEditor) return;
+    getImageCapabilities()
+      .then(setImageCaps)
+      .catch(() => { /* 后端不可用时按不支持草图处理 */ });
+  }, [maskEditor]);
   // 生成中占位框：编辑/变体/组合执行时，在新图将要出现的位置预先画出矩形框，
   // 框内显示"正在编辑图片..."等状态；完成后新图淡入该位置。
   // 数组形式支持多张图同时编辑：每个操作绑定自己的占位框，完成时只移除自己的
@@ -1914,7 +1924,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
 
   // 蒙版编辑器确认：执行局部编辑（Inpainting）
   const handleMaskEditorConfirm = useCallback(
-    (mask: string, prompt: string, size: string, experienceIds?: string[]) => {
+    (mask: string, prompt: string, size: string, experienceIds?: string[], sketch?: string) => {
       if (!onAction || !maskEditor) return;
       // 留空提示词时给默认描述，避免后端收到空 prompt
       const finalPrompt = prompt.trim() || "按蒙版区域重新生成，保持周围内容一致";
@@ -1934,6 +1944,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         x: box.x,
         y: box.y,
         mask,
+        sketch,
         experienceIds: experienceIds?.length ? experienceIds : undefined,
       };
       Promise.resolve(onAction(action))
@@ -3026,6 +3037,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
           onResetShortcuts={shortcuts.resetShortcuts}
           onConfirm={handleMaskEditorConfirm}
           onCancel={() => setMaskEditor(null)}
+          sketchEnabled={imageCaps?.sketchSupport ?? false}
+          sketchHint={imageCaps?.hint}
         />,
         document.body,
       )}

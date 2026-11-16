@@ -47,6 +47,7 @@ class EditImageTool(BaseTool):
         node_id = kwargs.get("node_id", "")
         prompt = kwargs.get("prompt", "")
         mask = kwargs.get("mask")  # base64 data URL 或 None
+        sketch = kwargs.get("sketch")  # 手绘草图 data URL 或 None
         size = str(kwargs.get("size", "2K"))
 
         source = state.get_node(node_id)
@@ -82,6 +83,7 @@ class EditImageTool(BaseTool):
             width=source.width,
             height=source.height,
             size=size,
+            sketch=sketch,
         )
 
         node = CanvasNode(

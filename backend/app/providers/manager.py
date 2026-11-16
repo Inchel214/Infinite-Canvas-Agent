@@ -28,9 +28,9 @@ class GeneratorProxy(BaseImageGenerator):
             source_image_url, prompt, width=width, height=height, size=size
         )
 
-    def edit(self, source_image_url, prompt, mask=None, width=300, height=300, size="2K"):
+    def edit(self, source_image_url, prompt, mask=None, width=300, height=300, size="2K", sketch=None):
         return self._manager.generator.edit(
-            source_image_url, prompt, mask=mask, width=width, height=height, size=size
+            source_image_url, prompt, mask=mask, width=width, height=height, size=size, sketch=sketch
         )
 
     def compose(self, image_urls, prompt="", width=300, height=300, size="2K"):

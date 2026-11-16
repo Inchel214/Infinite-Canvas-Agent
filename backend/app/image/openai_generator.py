@@ -364,11 +364,12 @@ class OpenAIImageGenerator(BaseImageGenerator):
     def variate(self, source_image_url, prompt, width=300, height=300, size="2K") -> ImageResult:
         return self._edit([source_image_url], prompt, size)
 
-    def edit(self, source_image_url, prompt, mask=None, width=300, height=300, size="2K") -> ImageResult:
+    def edit(self, source_image_url, prompt, mask=None, width=300, height=300, size="2K", sketch=None) -> ImageResult:
         """局部编辑（inpainting）：传入蒙版，只修改蒙版区域。
 
         mask: base64 data URL（PNG 格式，白色区域为要修改的部分）
         如果 mask 为空，退化为 img2img（全图重绘）。
+        sketch: OpenAI 系模型不支持手绘标记语义，该参数被忽略。
         """
         if mask:
             # 有蒙版：调用 inpainting API

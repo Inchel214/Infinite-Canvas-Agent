@@ -408,7 +408,8 @@ export async function editImage(
   x?: number,
   y?: number,
   experienceIds?: string[],
-  mask?: string  // 蒙版 base64 data URL（局部编辑 Inpainting）
+  mask?: string,  // 蒙版 base64 data URL（局部编辑 Inpainting）
+  sketch?: string  // 手绘草图 base64 data URL（标记式交互编辑）
 ): Promise<DirectResponse> {
   const res = await fetch(`${API_BASE}/canvas/${canvasId}/edit`, {
     method: "POST",
@@ -421,12 +422,28 @@ export async function editImage(
       y,
       experience_ids: experienceIds?.length ? experienceIds : undefined,
       mask,  // 蒙版（可选）
+      sketch,  // 草图（可选）
     }),
   });
   if (!res.ok) {
     const payload = await res.json().catch(() => null);
     throw new Error(payload?.detail || `${res.status}`);
   }
+  return res.json();
+}
+
+// 当前生图模型支持的编辑能力（草图笔是否可用等）
+export type ImageCapabilities = {
+  provider: string;
+  model: string;
+  regionControl: "mask" | "markup" | "none";
+  sketchSupport: boolean;
+  hint: string;
+};
+
+export async function getImageCapabilities(): Promise<ImageCapabilities> {
+  const res = await fetch(`${API_BASE}/image/capabilities`);
+  if (!res.ok) throw new Error(`${res.status}`);
   return res.json();
 }
 

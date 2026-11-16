@@ -97,7 +97,7 @@ class OpenArtImageGenerator(BaseImageGenerator):
     def variate(self, source_image_url, prompt, width=300, height=300, size="2K") -> ImageResult:
         return self._generate(prompt, [source_image_url])
 
-    def edit(self, source_image_url, prompt, mask=None, width=300, height=300, size="2K") -> ImageResult:
+    def edit(self, source_image_url, prompt, mask=None, width=300, height=300, size="2K", sketch=None) -> ImageResult:
         if mask:
             raise ValueError("OpenArt CLI 不支持蒙版局部编辑，请切换到原有 API 生图来源")
         return self._generate(prompt, [source_image_url])

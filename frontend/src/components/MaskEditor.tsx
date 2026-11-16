@@ -43,8 +43,12 @@ interface MaskEditorProps {
     modifiers?: { ctrl?: boolean; shift?: boolean; alt?: boolean; meta?: boolean },
   ) => void;
   onResetShortcuts: (scope: ShortcutScope | "all") => void;
-  onConfirm: (mask: string, prompt: string, size: string, experienceIds?: string[]) => void;
+  onConfirm: (mask: string, prompt: string, size: string, experienceIds?: string[], sketch?: string) => void;
   onCancel: () => void;
+  /** 当前模型是否支持手绘草图（标记式交互编辑） */
+  sketchEnabled?: boolean;
+  /** 能力提示文案（由后端能力声明接口给出） */
+  sketchHint?: string;
 }
 
 /** 局部编辑器内可自定义的动作（用于快捷键提示浮层） */
@@ -61,7 +65,7 @@ const EDITOR_ACTIONS: Array<{ action: keyof EditorShortcutConfig; label: string 
   { action: "help", label: "快捷键提示" },
 ];
 
-type Tool = "brush" | "eraser" | "lasso" | "rect" | "wand";
+type Tool = "brush" | "eraser" | "lasso" | "rect" | "wand" | "sketch";
 type ViewMode = "overlay" | "outline";
 
 const MASK_RGB = { r: 167, g: 139, b: 250 }; // 品牌紫
@@ -90,7 +94,7 @@ const customPresetStyle: CSSProperties = {
   whiteSpace: "nowrap",
 };
 
-export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt, initialAspect, initialResolution, initialStyleIds, shortcutBindings, conflicts, onUpdateShortcut, onResetShortcuts, onConfirm, onCancel }: MaskEditorProps) {
+export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt, initialAspect, initialResolution, initialStyleIds, shortcutBindings, conflicts, onUpdateShortcut, onResetShortcuts, onConfirm, onCancel, sketchEnabled = false, sketchHint }: MaskEditorProps) {
   const [tool, setTool] = useState<Tool>("brush");
   const [showHelp, setShowHelp] = useState(false);
   const [recordingAction, setRecordingAction] = useState<keyof EditorShortcutConfig | null>(null);
@@ -116,9 +120,12 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
   const [wandFailed, setWandFailed] = useState(false);
   // 图片是否允许读取像素（CORS 加载成功才可读，否则 canvas 被污染，魔棒不可用）
   const [pixelsReadable, setPixelsReadable] = useState(true);
+  const [hasSketch, setHasSketch] = useState(false); // 是否画过草图（无撤销栈，单独标记）
 
   const baseCanvasRef = useRef<HTMLCanvasElement>(null);      // 原图层
   const displayCanvasRef = useRef<HTMLCanvasElement>(null);   // 可视层（接收鼠标事件）
+  const sketchCanvasRef = useRef<HTMLCanvasElement>(null);    // 草图层（手绘标记）
+  const sketchLastPosRef = useRef<{ x: number; y: number } | null>(null);
   const logicMaskRef = useRef<HTMLCanvasElement | null>(null); // 离屏逻辑 mask（白色）
   const tintedRef = useRef<HTMLCanvasElement | null>(null);    // 紫色染色版（叠加模式用）
   const wandSrcRef = useRef<HTMLCanvasElement | null>(null);   // 原图像素源（natural 尺寸，魔棒用）
@@ -264,6 +271,12 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
     base.height = displayH;
     display.width = displayW;
     display.height = displayH;
+    const sketch = sketchCanvasRef.current;
+    if (sketch) {
+      sketch.width = displayW;
+      sketch.height = displayH;
+      setHasSketch(false); // 尺寸变化会清空草图，同步状态
+    }
 
     const bctx = base.getContext("2d");
     if (bctx) {
@@ -470,6 +483,42 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
     lastPosRef.current = pos;
   };
 
+  // ===== 草图：画在独立图层上，导出后由后端合成到输入图（标记式交互编辑） =====
+  const sketchTo = (pos: { x: number; y: number }) => {
+    const canvas = sketchCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    const last = sketchLastPosRef.current;
+    ctx.save();
+    ctx.strokeStyle = "rgba(0, 229, 255, 0.95)";
+    ctx.lineWidth = Math.max(2, Math.round(brushSize / 3));
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.beginPath();
+    if (last) ctx.moveTo(last.x, last.y);
+    else ctx.moveTo(pos.x - 0.01, pos.y);
+    ctx.lineTo(pos.x, pos.y);
+    ctx.stroke();
+    ctx.restore();
+    sketchLastPosRef.current = pos;
+    if (!hasSketch) setHasSketch(true);
+  };
+
+  const clearSketch = () => {
+    const canvas = sketchCanvasRef.current;
+    if (!canvas) return;
+    canvas.getContext("2d")?.clearRect(0, 0, canvas.width, canvas.height);
+    setHasSketch(false);
+  };
+
+  /** 导出草图：透明底 PNG，仅包含笔迹 */
+  const exportSketch = (): string | undefined => {
+    const canvas = sketchCanvasRef.current;
+    if (!hasSketch || !canvas) return undefined;
+    return canvas.toDataURL("image/png");
+  };
+
   // ===== 魔棒：扫描线 flood fill，选中与点击点颜色相近的连通区域 =====
   const floodFillSelect = (pos: { x: number; y: number }) => {
     const src = wandSrcRef.current;
@@ -606,6 +655,10 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
       pushUndo();
       floodFillSelect(pos);
       commitMask();
+    } else if (tool === "sketch") {
+      drawingRef.current = true;
+      sketchLastPosRef.current = null;
+      sketchTo(pos); // 单点也要落笔
     }
   };
 
@@ -630,6 +683,8 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
       renderLassoPreview();
     } else if (tool === "rect") {
       renderRectPreview(pos);
+    } else if (tool === "sketch") {
+      sketchTo(pos);
     }
   };
 
@@ -714,6 +769,8 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
     } else if (tool === "brush" || tool === "eraser") {
       lastPosRef.current = null;
       commitMask(); // 轮廓模式在此统一渲染边缘
+    } else if (tool === "sketch") {
+      sketchLastPosRef.current = null;
     }
   };
 
@@ -808,17 +865,23 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
   };
 
   const handleConfirm = () => {
-    if (!hasMask()) return;
-    const mask = exportMask();
-    if (mask) {
-      const size = calcSize(aspect, resolution);
-      // 留空提示词时使用默认描述，与无蒙版修改保持一致
-      onConfirm(mask, prompt.trim() || "按蒙版区域重新生成，保持周围内容一致", size, styleIds.length ? styleIds : undefined);
-    }
+    const masked = hasMask();
+    if (!masked && !hasSketch) return;
+    const mask = masked ? exportMask() : "";
+    if (masked && !mask) return;
+    const size = calcSize(aspect, resolution);
+    // 留空提示词时使用默认描述，与无蒙版修改保持一致
+    onConfirm(
+      mask,
+      prompt.trim() || "按蒙版区域重新生成，保持周围内容一致",
+      size,
+      styleIds.length ? styleIds : undefined,
+      exportSketch(),
+    );
   };
 
-  // 是否可执行（快捷键 effect 依赖此值，需提前声明）
-  const canExecute = hasMask();
+  // 是否可执行（快捷键 effect 依赖此值，需提前声明）：有选区或有草图即可
+  const canExecute = hasMask() || hasSketch;
 
   // ===== 快捷键录制（点击提示浮层里的按键后捕获下一次按键） =====
   useEffect(() => {
@@ -939,6 +1002,10 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
         if (pixelsReadable) setTool("wand");
         return;
       }
+      if (sketchEnabled && e.key.toLowerCase() === "p" && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        setTool("sketch");
+        return;
+      }
       if (matchesShortcut(e, shortcutBindings.invert)) {
         invertMask();
       }
@@ -953,7 +1020,7 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
       document.removeEventListener("keyup", onKeyUp, true);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [styleOpen, showHelp, recordingAction, shortcutBindings, undo, redo, onCancel, pixelsReadable, canExecute]);
+  }, [styleOpen, showHelp, recordingAction, shortcutBindings, undo, redo, onCancel, pixelsReadable, canExecute, sketchEnabled]);
 
   // ===== 风格下拉（原有逻辑保留） =====
   useEffect(() => {
@@ -1061,10 +1128,29 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
           >
             魔棒
           </button>
+          <button
+            onClick={() => sketchEnabled && setTool("sketch")}
+            disabled={!sketchEnabled}
+            style={{
+              ...toolBtn("sketch"),
+              opacity: sketchEnabled ? 1 : 0.4,
+              cursor: sketchEnabled ? "pointer" : "not-allowed",
+            }}
+            title={sketchEnabled ? "草图笔 (P)：在图上画出想要的样子，模型会参照草图生成" : "当前模型不支持手绘草图，请用画笔圈选区域并用文字描述"}
+          >
+            草图
+          </button>
+        </div>
+
+        {/* 草图可用性与提示 */}
+        <div style={{ fontSize: 11, color: "rgba(255,255,255,0.5)", maxWidth: 420 }}>
+          {sketchHint || (sketchEnabled
+            ? "草图笔：画出想要的样子，线条会被自动清理"
+            : "当前模型不支持草图，用画笔圈选区域即可")}
         </div>
 
         {/* 笔刷大小 / 魔棒阈值（按工具切换） */}
-        {(tool === "brush" || tool === "eraser") && (
+        {(tool === "brush" || tool === "eraser" || tool === "sketch") && (
           <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
             <span style={{ color: "#888", fontSize: 12 }}>大小:</span>
             <input
@@ -1098,6 +1184,15 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
           >
             清除
           </button>
+          {hasSketch && (
+            <button
+              onClick={clearSketch}
+              style={{ ...btnBase, background: "rgba(0, 229, 255, 0.18)", border: "1px solid rgba(0, 229, 255, 0.45)", color: "#67e8f9" }}
+              title="清除所有草图笔迹"
+            >
+              清除草图
+            </button>
+          )}
         </div>
 
         {/* 显示模式 */}
@@ -1201,6 +1296,16 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
                   display: "block",
                   border: "1px solid rgba(255, 255, 255, 0.15)",
                   borderRadius: 4,
+                }}
+              />
+              {/* 草图层（手绘标记） */}
+              <canvas
+                ref={sketchCanvasRef}
+                style={{
+                  position: "absolute",
+                  top: 0,
+                  left: 0,
+                  pointerEvents: "none",
                 }}
               />
               {/* 可视/交互层 */}

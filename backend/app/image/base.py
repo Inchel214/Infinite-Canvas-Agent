@@ -85,8 +85,12 @@ class BaseImageGenerator(ABC):
         width: int = 300,
         height: int = 300,
         size: str = "2K",
+        sketch: str | None = None,
     ) -> ImageResult:
-        """局部编辑：对图片进行 inpainting / outpainting"""
+        """局部编辑：对图片进行 inpainting / outpainting
+
+        sketch: 手绘草图 data URL（仅支持标记式交互编辑的模型会使用）
+        """
         ...
 
     @abstractmethod

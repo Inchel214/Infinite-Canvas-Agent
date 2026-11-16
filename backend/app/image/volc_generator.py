@@ -204,15 +204,54 @@ def _mask_to_bbox_tags(mask_data_url: str, max_boxes: int = 4) -> list[str]:
     return tags
 
 
-def _build_inpaint_prompt(prompt: str, tags: list[str]) -> str:
-    """把用户指令与区域坐标组装成模型能理解的编辑指令，并显式约束未框选区域不变。"""
-    if not tags:
-        return prompt
-    return (
-        f"将图1 {'、'.join(tags)} 区域内的内容按以下要求修改：{prompt}。"
-        "其余区域必须完全保持原样，不要修改任何未框选的内容"
-        "（包括未框选的人物、动物、建筑、天空、水面和前景）。"
+def _decode_ref(ref: str) -> bytes:
+    """把 data URL 或 http URL 统一取成二进制。"""
+    if ref.startswith("data:"):
+        return base64.b64decode(ref.split(",", 1)[-1])
+    session = requests.Session()
+    session.trust_env = False
+    resp = session.get(ref, timeout=30)
+    resp.raise_for_status()
+    return resp.content
+
+
+def _composite_sketch(image_ref: str, sketch_data_url: str) -> str:
+    """把用户的草图叠加到原图上，作为「标记式交互编辑」的输入。
+
+    Seedream 没有 mask 入参，但能识别图上的手绘标记/草图，因此把笔迹直接画进输入图。
+    """
+    import io
+
+    from PIL import Image
+
+    try:
+        base = Image.open(io.BytesIO(_decode_ref(image_ref))).convert("RGBA")
+        overlay = Image.open(io.BytesIO(_decode_ref(sketch_data_url))).convert("RGBA")
+        if overlay.size != base.size:
+            overlay = overlay.resize(base.size, Image.LANCZOS)
+        merged = Image.alpha_composite(base, overlay).convert("RGB")
+        buf = io.BytesIO()
+        merged.save(buf, format="JPEG", quality=95)
+        logger.debug("[Volc] 草图已合成到输入图 size=%sx%s", merged.width, merged.height)
+        return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception as exc:
+        logger.warning("[Volc] 草图和成失败，改用原图: %s", exc)
+        return image_ref
+
+
+def _build_inpaint_prompt(prompt: str, tags: list[str], has_sketch: bool = False) -> str:
+    """把用户指令、区域坐标与草图清理要求组装成模型能理解的编辑指令。"""
+    head = f"将图1 {'、'.join(tags)} 区域内的内容按以下要求修改：{prompt}" if tags else prompt
+    keep = (
+        "严格参照图1上的手绘草图生成对应内容，并移除所有草图线条，"
+        "不要保留任何笔迹、描边或线稿痕迹，其余区域必须完全保持原样。"
+        if has_sketch
+        else (
+            "其余区域必须完全保持原样，不要修改任何未框选的内容"
+            "（包括未框选的人物、动物、建筑、天空、水面和前景）。"
+        )
     )
+    return f"{head}。{keep}"
 
 
 class VolcEngineImageGenerator(BaseImageGenerator):
@@ -471,17 +510,18 @@ class VolcEngineImageGenerator(BaseImageGenerator):
         width: int = 300,
         height: int = 300,
         size: str = "2K",
+        sketch: str | None = None,
     ) -> ImageResult:
-        """局部编辑（inpainting）：传入蒙版，只修改蒙版区域。
+        """局部编辑：Ark 无 mask 入参，改为「草图合成 + 归一化 bbox 坐标」。
 
-        mask: base64 data URL（PNG 格式，白色区域为要修改的部分）
-        如果 mask 为空，退化为 img2img（全图重绘）。
+        mask: 黑白蒙版 data URL，转成 <bbox> 坐标写进 prompt
+        sketch: 手绘草图 data URL，按 alpha 叠加到输入图上
+        两者都为空时退化为 img2img（全图重绘）。
         """
-        if mask:
-            # 有蒙版：调用 inpainting API
-            url = self._call_inpaint(source_image_url, mask, prompt, size)
+        if mask or sketch:
+            url = self._call_inpaint(source_image_url, mask, prompt, size, sketch)
         else:
-            # 无蒙版：退化为 img2img
+            # 无蒙版、无草图：退化为 img2img
             url = self._call(prompt, image_urls=[source_image_url], size=size)
         w, h = _display_size(_image_size(url), (width, height))
         return ImageResult(image_url=url, width=w, height=h, prompt=prompt)
@@ -489,9 +529,10 @@ class VolcEngineImageGenerator(BaseImageGenerator):
     def _call_inpaint(
         self,
         image_url: str,
-        mask: str,
+        mask: str | None,
         prompt: str,
         size: str = "2K",
+        sketch: str | None = None,
     ) -> str:
         """调用 Ark inpainting API（局部编辑）。
 
@@ -500,12 +541,14 @@ class VolcEngineImageGenerator(BaseImageGenerator):
         import time as _time
         _t0 = _time.monotonic()
 
-        # 把原图转为可发送格式（相对 /images/ 地址也要转成内联 data URL）
+        # 把原图转为可发送格式（相对 /images/ 地址也要转成内联 data URL）；有草图时先合成到图上
         image_ref = to_sendable_ref(image_url)
+        if sketch:
+            image_ref = _composite_sketch(image_ref, sketch)
 
         # Ark 没有 mask 入参（传了会被静默忽略），区域只能用归一化 <bbox> 坐标告诉模型
-        tags = _mask_to_bbox_tags(mask)
-        final_prompt = _build_inpaint_prompt(prompt, tags)
+        tags = _mask_to_bbox_tags(mask) if mask else []
+        final_prompt = _build_inpaint_prompt(prompt, tags, bool(sketch))
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",

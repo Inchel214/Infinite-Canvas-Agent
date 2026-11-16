@@ -311,7 +311,7 @@ function App() {
         setStatusMsg(res.message);
         return res.success;
       } else if (action.type === "edit") {
-        const res = await editImage(canvasId, action.nodeId, action.prompt, action.size, action.x, action.y, action.experienceIds, action.mask);
+        const res = await editImage(canvasId, action.nodeId, action.prompt, action.size, action.x, action.y, action.experienceIds, action.mask, action.sketch);
         applyCanvasState(res.canvas);
         setStatusMsg(res.message);
         return res.success;

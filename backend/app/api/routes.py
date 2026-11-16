@@ -100,6 +100,7 @@ class EditRequest(BaseModel):
     experience_ids: Optional[List[str]] = None
     experience_id: Optional[str] = None
     mask: Optional[str] = None  # 蒙版 base64 data URL（局部编辑 Inpainting）
+    sketch: Optional[str] = None  # 手绘草图 base64 data URL（标记式交互编辑）
 
 
 class GenerateRequest(BaseModel):
@@ -356,6 +357,8 @@ def edit_image(canvas_id: str, req: EditRequest):
         kwargs["y"] = req.y
     if req.mask is not None:
         kwargs["mask"] = req.mask  # 蒙版（局部编辑 Inpainting）
+    if req.sketch is not None:
+        kwargs["sketch"] = req.sketch  # 手绘草图（标记式交互编辑）
     try:
         result = tool.run(state, **kwargs)
     except Exception as e:
@@ -1335,6 +1338,38 @@ def delete_experience_route(exp_id: str):
 @router.get("/settings", summary="获取当前大模型配置（key 脱敏）")
 def get_settings():
     return _masked_settings()
+
+
+@router.get("/image/capabilities", summary="当前生图模型支持的编辑能力")
+def image_capabilities():
+    """前端据此决定草图笔是否可用、显示什么提示，避免切模型后操作方式变化。"""
+    s = deps.manager.settings
+    provider = (s.image.provider or "").lower()
+    model = (s.image.model or "").lower()
+    # 豆包 Seedream 无 mask 入参，靠坐标/手绘标记定位；5.x 起支持任意标记与草图
+    doubao = provider in ("ark", "volc", "volcengine", "doubao") or "seedream" in model
+    seedream5 = doubao and ("seedream-5" in model or "seedream5" in model)
+
+    if seedream5:
+        region, sketch = "markup", True
+        hint = "当前模型支持手绘草图：在图上画出想要的样子，模型会参照草图生成；草图线条会被清理。"
+    elif doubao:
+        region, sketch = "markup", False
+        hint = "当前模型按标记区域理解修改范围，边界可能有轻微外溢，暂不支持手绘草图。"
+    elif provider == "openai":
+        region, sketch = "mask", False
+        hint = "当前模型使用蒙版精确定位修改范围，不支持手绘草图示意。"
+    else:
+        region, sketch = "none", False
+        hint = "当前模型不支持精确的局部编辑，只会按文字描述重绘整图。"
+
+    return {
+        "provider": s.image.provider,
+        "model": s.image.model,
+        "regionControl": region,
+        "sketchSupport": sketch,
+        "hint": hint,
+    }
 
 
 @router.put("/settings", summary="保存大模型配置并热切换（无需重启）")
