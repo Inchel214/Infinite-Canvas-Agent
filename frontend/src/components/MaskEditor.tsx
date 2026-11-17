@@ -466,19 +466,23 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
   };
 
   // ===== 画笔/橡皮：连续笔迹（lineTo 插值，圆头线帽） =====
-  const strokeTo = (pos: { x: number; y: number }) => {
+  const strokeTo = (pos: { x: number; y: number }, pressure?: number) => {
     const mask = logicMaskRef.current;
     const display = displayCanvasRef.current;
     if (!mask || !display) return;
     const last = lastPosRef.current || pos;
     const erase = tool === "eraser";
+    // 压感只对笔生效：手指/鼠标不传 pressure，笔宽固定 = 滑块值（PC 行为不变）
+    const width = pressure == null
+      ? brushSize
+      : Math.max(1, brushSize * (0.35 + 0.65 * Math.min(1, Math.max(0, pressure))));
 
     const drawSeg = (ctx: CanvasRenderingContext2D, color: string, alpha: number) => {
       ctx.save();
       ctx.globalCompositeOperation = erase ? "destination-out" : "source-over";
       ctx.globalAlpha = alpha;
       ctx.strokeStyle = color;
-      ctx.lineWidth = brushSize;
+      ctx.lineWidth = width;
       ctx.lineCap = "round";
       ctx.lineJoin = "round";
       ctx.beginPath();
@@ -500,15 +504,20 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
   };
 
   // ===== 草图：画在独立图层上，导出后由后端合成到输入图（标记式交互编辑） =====
-  const sketchTo = (pos: { x: number; y: number }) => {
+  const sketchTo = (pos: { x: number; y: number }, pressure?: number) => {
     const canvas = sketchCanvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     const last = sketchLastPosRef.current;
+    const base = Math.max(2, Math.round(brushSize / 3));
+    // 压感只对笔生效：手指/鼠标不传 pressure，线宽与原来一致
+    const width = pressure == null
+      ? base
+      : Math.max(2, Math.round(base * (0.4 + 0.8 * Math.min(1, Math.max(0, pressure)))));
     ctx.save();
     ctx.strokeStyle = "rgba(0, 229, 255, 0.95)";
-    ctx.lineWidth = Math.max(2, Math.round(brushSize / 3));
+    ctx.lineWidth = width;
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
     ctx.beginPath();
@@ -792,13 +801,13 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
 
   // ===== 触控笔 / 触摸输入：与鼠标逻辑隔离，鼠标仍走上面的 handleMouse* =====
   /** 笔或手指开始落笔（工具行为与鼠标一致，但不涉及鼠标特有的 panning） */
-  const beginStroke = (pos: { x: number; y: number }, pointerId: number) => {
+  const beginStroke = (pos: { x: number; y: number }, pointerId: number, pressure?: number) => {
     activePointerIdRef.current = pointerId;
     if (tool === "brush" || tool === "eraser") {
       pushUndo();
       drawingRef.current = true;
       lastPosRef.current = pos;
-      strokeTo(pos);
+      strokeTo(pos, pressure);
     } else if (tool === "lasso") {
       pushUndo();
       drawingRef.current = true;
@@ -816,14 +825,14 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
     } else if (tool === "sketch") {
       drawingRef.current = true;
       sketchLastPosRef.current = null;
-      sketchTo(pos);
+      sketchTo(pos, pressure);
     }
   };
 
-  const continueStroke = (pos: { x: number; y: number }) => {
+  const continueStroke = (pos: { x: number; y: number }, pressure?: number) => {
     if (!drawingRef.current) return;
     if (tool === "brush" || tool === "eraser") {
-      strokeTo(pos);
+      strokeTo(pos, pressure);
     } else if (tool === "lasso") {
       lastPosRef.current = pos;
       lassoRef.current.push(pos);
@@ -832,7 +841,7 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
       lastPosRef.current = pos;
       renderRectPreview(pos);
     } else if (tool === "sketch") {
-      sketchTo(pos);
+      sketchTo(pos, pressure);
     }
   };
 
@@ -914,7 +923,8 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
       touchPanRef.current = null;
       gestureRef.current = null;
       e.currentTarget.setPointerCapture(e.pointerId);
-      beginStroke(getPos(e), e.pointerId);
+      // pressure 为 0 表示设备不提供压感，此时退回固定笔宽
+      beginStroke(getPos(e), e.pointerId, e.pressure > 0 ? e.pressure : undefined);
       return;
     }
 
@@ -961,7 +971,7 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
 
     if (e.pointerType === "pen") {
       if (activePointerIdRef.current !== e.pointerId || !drawingRef.current) return;
-      continueStroke(getPos(e));
+      continueStroke(getPos(e), e.pressure > 0 ? e.pressure : undefined);
       return;
     }
 
@@ -1339,6 +1349,7 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
 
   return (
     <div
+      data-mask-editor
       style={{
         position: "fixed",
         top: 0,
@@ -1636,6 +1647,7 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
 
         {/* 右侧控制面板 */}
         <div
+          data-mask-panel
           style={{
             width: 280,
             flexShrink: 0,

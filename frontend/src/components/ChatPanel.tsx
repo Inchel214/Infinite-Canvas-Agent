@@ -361,6 +361,10 @@ interface ChatPanelProps {
   onClearRefs: () => void;
   // Agent 操作画布后（生成/移动/删除节点）通知上层刷新画布状态
   onCanvasUpdate: (canvas: CanvasState) => void;
+  // 外部（另一端设备）写入画布时递增的同步信号：用于拉取最新对话历史
+  syncToken?: number;
+  // 该画布当前生成中的任务数（含另一端发起的）；本端未流式时用于提示
+  remoteGenerating?: number;
 }
 
 const TOOL_LABELS: Record<string, string> = {
@@ -824,6 +828,8 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
   canvasNodes,
   onClearRefs,
   onCanvasUpdate,
+  syncToken = 0,
+  remoteGenerating = 0,
 }: ChatPanelProps, ref) {
   const [entries, setEntries] = useState<ChatEntry[]>([]);
   // 输入区是否有内容（文本或引用芯片）：驱动发送按钮禁用态
@@ -853,6 +859,31 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
   // Agent 是否执行中（存在直播中的 assistant 条目）：思考指示/停止按钮据此显示。
   // 执行中用户可继续输入，消息进入队列（steering 注入或下一轮执行）。
   const sending = entries.some((e) => e.role === "assistant" && e.live);
+  // 供同步副作用读取最新值（避免把 entries 放进依赖导致频繁重建）
+  const sendingRef = useRef(false);
+  sendingRef.current = sending;
+
+  // 另一端设备写入画布（syncToken 变化）时，拉取最新对话历史，实现跨端对话同步。
+  // 本端正在流式时跳过，避免覆盖直播条目；任务结束后下一轮同步会补齐。
+  const lastSyncTokenRef = useRef(syncToken);
+  useEffect(() => {
+    if (syncToken === lastSyncTokenRef.current) return;
+    lastSyncTokenRef.current = syncToken;
+    if (!canvasId || sendingRef.current) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const { messages, runs } = await getChatHistory(canvasId);
+        if (cancelled || sendingRef.current) return;
+        setEntries(buildHistoryEntries(messages, runs));
+      } catch {
+        // 后端短暂不可用：下一轮同步再试
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [syncToken, canvasId]);
 
   // 暴露 saveDraft 方法给父组件（保留接口兼容性，实际草稿已实时保存）
   useImperativeHandle(ref, () => ({
@@ -1455,9 +1486,17 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
           borderBottom: "1px solid rgba(255,255,255,0.08)",
         }}
       >
-        <span style={{ color: "#ddd", fontSize: 14, fontWeight: 600 }}>
-          💬 AI 对话
-        </span>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+          <span style={{ color: "#ddd", fontSize: 14, fontWeight: 600 }}>💬 AI 对话</span>
+          {remoteGenerating > 0 && !sending && (
+            <span
+              title="另一台设备正在这个画布上生成，完成后会自动同步到这里"
+              style={{ fontSize: 11, color: "#c4b5fd", whiteSpace: "nowrap" }}
+            >
+              ● 其他设备生成中
+            </span>
+          )}
+        </div>
         <div data-panel-action style={{ display: "flex", alignItems: "center", gap: 10 }}>
           {panelPosition && <button type="button" onClick={() => setPanelPosition(null)}
             title="恢复面板默认位置" style={{ background: "none", border: 0, color: "#aaa", cursor: "pointer" }}>复位</button>}
