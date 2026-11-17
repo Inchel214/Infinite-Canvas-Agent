@@ -13,6 +13,8 @@ from PIL import Image
 from fastapi.testclient import TestClient
 
 from app import deps
+from app.canvas.store import FileStore
+from app.image import files as files_module
 from app.image import openart_generator as module
 from app.image.openai_generator import OpenAIImageGenerator
 from app.image.openart_generator import OpenArtImageGenerator
@@ -31,15 +33,32 @@ class OpenArtTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.env = patch.dict(os.environ, {key: "" for key in (
-            "ARK_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY", "SILICONFLOW_API_KEY",
-        )})
+        temp_path = Path(self.temp.name)
+        self.env = patch.dict(os.environ, {
+            **{key: "" for key in (
+                "ARK_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY", "SILICONFLOW_API_KEY",
+            )},
+            # 运行期按 env 解析的路径（tasks.json / sessions 等）一并隔离
+            "CANVAS_DATA_DIR": str(temp_path / "data" / "canvases"),
+            "CHAT_DATA_DIR": str(temp_path / "data" / "chats"),
+        })
         self.env.start()
         self.addCleanup(self.env.stop)
         self.store = SettingsStore(Path(self.temp.name) / "settings.json")
         self.store_patch = patch.object(deps.manager, "_store", self.store)
         self.store_patch.start()
         self.addCleanup(self.store_patch.stop)
+        # deps.store 与 IMAGES_DIR 是 import 时按真实路径创建的单例/常量，
+        # env patch 影响不到它们，必须显式替换——否则 POST /api/canvas
+        # 会把 "OpenArt test"/"Failure test" 画布写进真实 backend/data/
+        self.canvas_store_patch = patch.object(
+            deps, "store", FileStore(data_dir=str(temp_path / "data" / "canvases")))
+        self.canvas_store_patch.start()
+        self.addCleanup(self.canvas_store_patch.stop)
+        self.images_dir_patch = patch.object(
+            files_module, "IMAGES_DIR", temp_path / "data" / "images")
+        self.images_dir_patch.start()
+        self.addCleanup(self.images_dir_patch.stop)
         deps.manager.reset()
         self.client = TestClient(app)
 
@@ -114,7 +133,12 @@ class OpenArtTests(unittest.TestCase):
         self.assertEqual(node["width"] / node["height"], 2)
         self.assertEqual(node["content"], "--model literal prompt")
         image_path = node["image_url"].split("/images/", 1)[1]
-        self.assertEqual(self.client.get("/images/" + image_path).status_code, 200)
+        # IMAGES_DIR 已隔离到 temp（StaticFiles 挂载仍指向真实目录，故不断言 HTTP，
+        # 直接验证图片真实落盘到了隔离目录）
+        self.assertTrue(
+            (Path(self.temp.name) / "data" / "images" / image_path).is_file(),
+            f"生成图片未落盘到隔离目录: {image_path}",
+        )
 
     def test_reference_upload_and_mask_rejection(self):
         ref = "data:image/png;base64," + base64.b64encode(image_data()).decode()

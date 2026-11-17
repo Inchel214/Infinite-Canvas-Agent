@@ -462,6 +462,8 @@ interface CanvasProps {
   chatDockWidth?: number;
   // 新建画布（由应用层提供，供快捷键调用）
   onNewCanvas?: () => void;
+  // 对话卡片"定位"请求：token 变化时把指定节点移到视野中央并短暂高亮
+  focusRequest?: { nodeId: string; token: number } | null;
 }
 
 /**
@@ -470,7 +472,7 @@ interface CanvasProps {
  * 多选：单击/Ctrl+Shift+点选、空白直接拖动框选、右键菜单直接生成
  * 平移：空格+拖动 / Shift+拖动 / 鼠标中键拖动
  */
-export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved, onAction, onCanvasUpdate, onAddToChat, chatDockWidth = 0, onNewCanvas }: CanvasProps) {
+export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved, onAction, onCanvasUpdate, onAddToChat, chatDockWidth = 0, onNewCanvas, focusRequest }: CanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   // 相机视角存档：每个画布记住用户上次停留的视角（localStorage），切回/刷新时还原。
   // 否则切画布时组件重挂载、视角重置到世界原点——内容不在原点附近时就表现为"画布空白不显示"
@@ -755,6 +757,15 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   const [managedCollectionId, setManagedCollectionId] = useState<string | null>(null);
   const managedCollection = collections.views.find((group) => group.id === managedCollectionId);
   const displayBounds = useMemo(() => [...collections.visibleNodes, ...collections.views.filter((group) => group.collapsed)], [collections.visibleNodes, collections.views]);
+  // 对话卡片"定位"：镜头跳转时读最新节点与面板宽度，避免它们变化导致重复触发
+  const nodesRef = useRef(nodes);
+  nodesRef.current = nodes;
+  const chatDockWidthRef = useRef(chatDockWidth);
+  chatDockWidthRef.current = chatDockWidth;
+  const [highlightNodeId, setHighlightNodeId] = useState<string | null>(null);
+  const [cameraAnimating, setCameraAnimating] = useState(false);
+  const highlightTimerRef = useRef<number | null>(null);
+  const cameraAnimTimerRef = useRef<number | null>(null);
   const connectionBounds = (node: CanvasNode): BBox => collections.collapsedByNode.get(node.id) ?? node;
 
   // 自动整理菜单：轻整理（最小位移） / 语义分区（按连线与分组收块）
@@ -1224,6 +1235,46 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       fitAllNodes();
     }
   }, [canvasState, fitAllNodes]);
+
+  // 对话卡片"定位"：把指定节点平稳移到可视区中央（避开右侧对话面板），并高亮提示位置
+  useEffect(() => {
+    if (!focusRequest) return;
+    const node = nodesRef.current.find((n) => n.id === focusRequest.nodeId);
+    const container = containerRef.current;
+    if (!node || !container) return;
+    const cw = container.clientWidth;
+    const ch = container.clientHeight;
+    const availW = Math.max(240, cw - chatDockWidthRef.current);
+    const targetZoom = Math.min(
+      1,
+      Math.max(0.15, Math.min((availW * 0.6) / node.width, (ch * 0.6) / node.height)),
+    );
+    setCameraAnimating(true);
+    setZoom(targetZoom);
+    setPan({
+      x: availW / 2 - (node.x + node.width / 2) * targetZoom,
+      y: ch / 2 - (node.y + node.height / 2) * targetZoom,
+    });
+    // 定位是用户主动操作：之后不再让节点增减自动接管视角
+    userPannedRef.current = true;
+    setHighlightNodeId(node.id);
+    if (highlightTimerRef.current !== null) window.clearTimeout(highlightTimerRef.current);
+    highlightTimerRef.current = window.setTimeout(() => {
+      highlightTimerRef.current = null;
+      setHighlightNodeId(null);
+    }, 2400);
+    if (cameraAnimTimerRef.current !== null) window.clearTimeout(cameraAnimTimerRef.current);
+    cameraAnimTimerRef.current = window.setTimeout(() => {
+      cameraAnimTimerRef.current = null;
+      setCameraAnimating(false);
+    }, 420);
+  }, [focusRequest?.token]);
+
+  // 卸载时清理高亮/动画定时器
+  useEffect(() => () => {
+    if (highlightTimerRef.current !== null) window.clearTimeout(highlightTimerRef.current);
+    if (cameraAnimTimerRef.current !== null) window.clearTimeout(cameraAnimTimerRef.current);
+  }, []);
 
   // 滚轮缩放：原生非 passive 监听（React onWheel 是 passive，preventDefault 无效）
   // rAF 合帧：同一帧内的多次 wheel 事件合并为一次渲染，避免高频重渲染卡顿
@@ -2502,6 +2553,10 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
           0%, 100% { box-shadow: 0 0 0 3px rgba(167,139,250,0.95), 0 0 28px rgba(167,139,250,0.5); }
           50%      { box-shadow: 0 0 0 5px rgba(196,181,253,0.55), 0 0 42px rgba(167,139,250,0.9); }
         }
+        @keyframes ica-focus-pulse {
+          0%, 100% { opacity: 1; }
+          50%      { opacity: 0.45; }
+        }
         @keyframes ica-dot-bounce {
           0%, 80%, 100% { transform: translateY(0); opacity: 0.4; }
           40%           { transform: translateY(-6px); opacity: 1; }
@@ -2558,6 +2613,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
           position: "absolute",
           transformOrigin: "0 0",
           transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+          // "定位"跳转时短暂开启过渡：平滑飞行到目标节点；其余时间不设过渡以免拖拽/缩放延迟
+          transition: cameraAnimating ? "transform 0.4s cubic-bezier(0.22, 1, 0.36, 1)" : undefined,
           // 仅缩放手势期间提升为合成层：GPU 拉伸缓存纹理，保证手势流畅；
           // 停止后移除（见 markZoomGesture），让浏览器按最终 zoom 重新光栅化文字，
           // 常驻 will-change 会把光栅分辨率钉死在初始缩放 → 高倍放大文字发糊
@@ -2869,6 +2926,29 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
             </span>
           </div>
         ))}
+
+        {/* 定位高亮：目标节点四周呼吸光圈，2.4s 后自动消退 */}
+        {highlightNodeId && (() => {
+          const node = nodes.find((n) => n.id === highlightNodeId);
+          if (!node) return null;
+          return (
+            <div
+              style={{
+                position: "absolute",
+                left: node.x - 6,
+                top: node.y - 6,
+                width: node.width + 12,
+                height: node.height + 12,
+                border: "2px solid #818cf8",
+                borderRadius: 12,
+                boxShadow: "0 0 0 4px rgba(99,102,241,0.22), 0 0 28px rgba(99,102,241,0.55)",
+                pointerEvents: "none",
+                zIndex: 30,
+                animation: "ica-focus-pulse 1.2s ease-in-out 2",
+              }}
+            />
+          );
+        })()}
       </div>
 
       {/* 框选矩形（屏幕坐标） */}

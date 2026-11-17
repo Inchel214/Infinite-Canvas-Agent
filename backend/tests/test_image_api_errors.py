@@ -1,6 +1,9 @@
 """Regression checks for API errors over the canvas SSE connection."""
 import json
+import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import requests
@@ -15,6 +18,17 @@ from app.image.openai_generator import OpenAIImageGenerator
 
 class ImageAPIErrorTests(unittest.TestCase):
     def setUp(self):
+        # 路由里的未读状态/会话按 CANVAS_DATA_DIR、CHAT_DATA_DIR 写盘，
+        # 不隔离会碰真实 backend/data/tasks.json
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        temp_path = Path(self.temp.name)
+        self.env = patch.dict(os.environ, {
+            "CANVAS_DATA_DIR": str(temp_path / "canvases"),
+            "CHAT_DATA_DIR": str(temp_path / "chats"),
+        })
+        self.env.start()
+        self.addCleanup(self.env.stop)
         self.client = TestClient(app)
 
     def test_api_denial_reaches_canvas_for_all_generation_operations(self):

@@ -13,6 +13,7 @@ import copy
 import json
 import logging
 import os
+import re
 import threading
 import uuid
 from pathlib import Path
@@ -30,6 +31,53 @@ _MAX_RUNS = 50
 
 # 可整段合并的流式增量事件：连续同类增量合并成一条，避免逐 token 存事件
 _COALESCE_TYPES = ("delta", "reasoning_delta", "plan_delta")
+
+_PROFILE_BLOCK = re.compile(
+    r"\s*(?:```(?:json)?\s*)?<profile_delta>\s*(\{.*?\})\s*</profile_delta>\s*(?:```)?",
+    re.DOTALL,
+)
+
+
+def clean_profile_output(message: str) -> tuple[str, dict | None]:
+    """去掉内部结构块，并返回供会话档案合并的增量。"""
+    delta = None
+    for match in _PROFILE_BLOCK.finditer(message or ""):
+        try:
+            value = json.loads(match.group(1))
+            if isinstance(value, dict):
+                delta = value
+        except json.JSONDecodeError:
+            logger.warning("项目档案增量 JSON 无效，已忽略")
+    return _PROFILE_BLOCK.sub("", message or "").strip(), delta
+
+
+def _normalize_profile(profile: dict | None) -> dict:
+    source = profile or {}
+    result = {
+        "theme": str(source.get("theme") or "").strip()[:80],
+        "tone": str(source.get("tone") or "").strip()[:80],
+        "decisions": [],
+        "goals": [],
+    }
+    for key in ("decisions", "goals"):
+        values = source.get(key) if isinstance(source.get(key), list) else []
+        for value in values:
+            text = str(value).strip()[:100]
+            if text and text not in result[key]:
+                result[key].append(text)
+    # 序列化后最多约 400 字；优先保留最新决定和目标。
+    while len(json.dumps(result, ensure_ascii=False)) > 400:
+        if result["decisions"]:
+            result["decisions"].pop(0)
+        elif result["goals"]:
+            result["goals"].pop(0)
+        elif result["theme"]:
+            result["theme"] = result["theme"][:-1]
+        elif result["tone"]:
+            result["tone"] = result["tone"][:-1]
+        else:
+            break
+    return result
 
 
 def format_failure_note(run: dict | None) -> str | None:
@@ -86,6 +134,7 @@ class ChatSessionStore:
         self._sessions: dict[str, list[dict]] = {}
         # canvas_id -> 执行记录（每轮一条：状态/计划/工具参数），与 messages 同文件
         self._runs: dict[str, list[dict]] = {}
+        self._profiles: dict[str, dict] = {}
         # canvas_id -> 当前/最近一轮的流式事件缓冲（仅内存）。
         # 前端切换画布会断开 SSE，靠这份缓冲回放"计划/思考/工具过程"，
         # 否则这些内容只存在于前端内存，切回后必然丢失。
@@ -109,13 +158,32 @@ class ChatSessionStore:
                     data = json.load(f)
                 self._sessions[canvas_id] = data.get("messages", [])
                 self._runs[canvas_id] = data.get("runs", [])
+                self._profiles[canvas_id] = _normalize_profile(data.get("profile"))
             except (json.JSONDecodeError, OSError) as e:
                 logger.warning("对话历史读取失败（按空处理）: %s: %s", path.name, e)
                 self._sessions[canvas_id] = []
                 self._runs[canvas_id] = []
+                self._profiles[canvas_id] = _normalize_profile(None)
         else:
             self._sessions[canvas_id] = []
             self._runs[canvas_id] = []
+            self._profiles[canvas_id] = _normalize_profile(None)
+
+    def get_profile(self, canvas_id: str) -> dict:
+        with self._lock:
+            self._ensure_loaded(canvas_id)
+            return copy.deepcopy(self._profiles[canvas_id])
+
+    def _merge_profile(self, current: dict, delta: dict | None) -> dict:
+        merged = copy.deepcopy(current)
+        if delta:
+            for key in ("theme", "tone"):
+                if str(delta.get(key) or "").strip():
+                    merged[key] = str(delta[key]).strip()
+            for key in ("decisions", "goals"):
+                values = delta.get(key) if isinstance(delta.get(key), list) else []
+                merged[key] = list(merged.get(key) or []) + values
+        return _normalize_profile(merged)
 
     def get_messages(self, canvas_id: str) -> list[dict]:
         """全量历史（前端展示用），返回副本防止外部改写内部状态"""
@@ -207,9 +275,17 @@ class ChatSessionStore:
             runs = self._runs.get(canvas_id)
             if runs:
                 first = next(
-                    (i for i, r in enumerate(runs) if r.get("id") in run_ids), None
+                    (
+                        i
+                        for i, r in enumerate(runs)
+                        if r.get("id") in run_ids or r.get("round_id") == round_id
+                    ),
+                    None,
                 )
                 if first is not None:
+                    self._profiles[canvas_id] = _normalize_profile(
+                        runs[first].get("pre_profile")
+                    )
                     del runs[first:]
             logger.debug(
                 "[Session] 撤回轮次 canvas=%s | round=%s | 移除消息=%d条 | 剩余=%d条",
@@ -263,7 +339,7 @@ class ChatSessionStore:
                 del runs[: len(runs) - _MAX_RUNS]
             self._save(canvas_id)
 
-    def begin_run(self, canvas_id: str, prompt: str) -> str:
+    def begin_run(self, canvas_id: str, prompt: str, round_id: str | None = None) -> str:
         """开始一轮执行，创建 in_progress 状态的 run 记录并落盘。
 
         返回 run_id，后续通过 update_run_steps 增量更新步骤。
@@ -276,6 +352,7 @@ class ChatSessionStore:
                 "id": run_id,
                 "at": __import__("time").time(),
                 "prompt": prompt,
+                "round_id": round_id or "",
                 "status": "in_progress",
                 "plan": "",
                 "steps": [],
@@ -283,6 +360,7 @@ class ChatSessionStore:
                 "timeline": [],
                 "message": "",
                 "error": None,
+                "pre_profile": self.get_profile(canvas_id),
             }
             runs.append(record)
             if len(runs) > _MAX_RUNS:
@@ -353,9 +431,9 @@ class ChatSessionStore:
                 canvas_id, run_id, step.get("tool"),
             )
 
-    def finish_run(self, canvas_id: str, run_id: str, status: str, message: str = "", error: str | None = None) -> None:
-        """完成 run 记录，更新状态为 done/failed/stopped；
-        最终回复作为末尾 text 段补进 timeline（前端历史还原的收尾气泡）"""
+    def finish_run(self, canvas_id: str, run_id: str, status: str, message: str = "", error: str | None = None) -> str:
+        """完成 run、清理内部档案块，并返回可直接展示/保存的干净回复。"""
+        message, delta = clean_profile_output(message)
         with self._lock:
             self._ensure_loaded(canvas_id)
             runs = self._runs.get(canvas_id) or []
@@ -363,6 +441,10 @@ class ChatSessionStore:
                 if run.get("id") == run_id:
                     run["status"] = status
                     run["message"] = message
+                    if status == "done":
+                        self._profiles[canvas_id] = self._merge_profile(
+                            run.get("pre_profile"), delta
+                        )
                     if error:
                         run["error"] = error
                     if message:
@@ -377,6 +459,7 @@ class ChatSessionStore:
                     break
             self._save(canvas_id)
             logger.debug("[Session] 完成执行 canvas=%s run_id=%s status=%s", canvas_id, run_id, status)
+            return message
 
     def last_run(self, canvas_id: str) -> dict | None:
         """最近一条执行记录（判断"重试/继续"指向哪个任务），无记录返回 None"""
@@ -442,6 +525,7 @@ class ChatSessionStore:
         with self._lock:
             self._sessions[canvas_id] = []
             self._runs[canvas_id] = []
+            self._profiles[canvas_id] = _normalize_profile(None)
             self._live.pop(canvas_id, None)
             self._save(canvas_id)
 
@@ -450,6 +534,7 @@ class ChatSessionStore:
         with self._lock:
             self._sessions.pop(canvas_id, None)
             self._runs.pop(canvas_id, None)
+            self._profiles.pop(canvas_id, None)
             self._live.pop(canvas_id, None)
             try:
                 self._path(canvas_id).unlink(missing_ok=True)
@@ -467,6 +552,7 @@ class ChatSessionStore:
             "canvas_id": canvas_id,
             "messages": self._sessions.get(canvas_id, []),
             "runs": self._runs.get(canvas_id, []),
+            "profile": self._profiles.get(canvas_id, _normalize_profile(None)),
         }
         tmp = path.with_suffix(".json.tmp")
         try:

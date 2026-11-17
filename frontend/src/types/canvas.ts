@@ -14,6 +14,13 @@ export interface CanvasNode {
   index?: number | null;
   /** 分组标签（用于分区布局，如"需求"、"设计"、"流程"） */
   group?: string;
+  /** 图片生成配方；旧画布节点可能没有 */
+  recipe?: {
+    keywords: string[];
+    style: string;
+    size: string;
+    model: string;
+  };
 }
 
 export interface CanvasState {
@@ -46,6 +53,8 @@ export interface AgentStep {
   // 流式过程中的状态：pending=执行中，success=是否成功（结束后回填）
   pending?: boolean;
   success?: boolean;
+  /** 工具结果附带数据（新建节点的 node_id / image_url 等） */
+  data?: Record<string, unknown>;
 }
 
 export interface ChatResponse {
@@ -71,7 +80,7 @@ export interface ChatMessage {
 export type TimelineSegment =
   | { kind: "plan"; text: string }
   | { kind: "text"; text: string }
-  | { kind: "tool"; tool: string; args?: Record<string, unknown>; result: string; success?: boolean }
+  | { kind: "tool"; tool: string; args?: Record<string, unknown>; result: string; success?: boolean; data?: Record<string, unknown> }
   | { kind: "user"; text: string };
 
 /** 一轮执行的结构化记录（GET /agent/history 随 messages 一同返回） */

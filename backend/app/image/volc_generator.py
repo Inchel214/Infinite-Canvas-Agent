@@ -5,6 +5,7 @@ import base64
 import json
 import logging
 import os
+import re
 import struct
 import time
 from typing import Iterator
@@ -27,9 +28,21 @@ _DEFAULT_MODEL = "doubao-seedream-4-0-20260415"
 _STREAM_DEFAULT_MODEL = "doubao-seedream-4-0-20260415"
 
 # 流式模型（Seedream 5.0 Lite）总像素下限 3686400：不足时等比放大（32 倍数对齐）
-_MIN_PIXELS = 3686400
-# 其余模型（Seedream 4.0 / 5.0 Pro，实测 400 报错信息）总像素下限 921600（≈960x960）
-_BASE_MIN_PIXELS = 921600
+_MIN_PIXELS_45 = 3686400  # Seedream 4.0 / 4.5 / 5.0 Lite
+_MIN_PIXELS_30 = 921600   # Seedream 3.0 / Seededit 3.0（旧版）
+_MAX_PIXELS = 16777216   # 所有版本统一上限 4096x4096
+
+# Seedream 各版本官方 preset 白名单（方式 1）：必须严格匹配，否则 Ark 400 InvalidParameter
+# Seedream 4.0 / 4.5 / 5.0：只支持 2K / 4K（没有 1K）
+# Seedream 3.0 / Seededit 3.0：支持 1K / 2K / 4K（seededit 仅 adaptive，不支持 preset，但我们不调用它）
+_PRESETS_45 = {"2K", "4K"}
+_PRESETS_30 = {"1K", "2K", "4K"}
+
+_SIZE_RE = re.compile(r"^(\d+)[xX](\d+)$")  # WxH 自定义像素
+_SIZE_PRESET_RE = re.compile(r"^\d+K$")     # N K preset（用于匹配后再校验白名单）
+
+# 默认尺寸：非法值或未指定时兜底
+_DEFAULT_SIZE = "2K"
 
 # 网络重试：偶发超时/5xx/ConnectionError 时有限重试 + 指数退避
 _MAX_RETRIES = 3
@@ -103,29 +116,74 @@ def _retry_request(session: requests.Session, method: str, url: str, **kwargs) -
     raise last_exc  # 不会到达
 
 
-def _clamp_size(size: str, model: str = "") -> str:
-    # "1K" 显式转像素（Lite 模型达不到下限时由下方面积钳制兜底）；"2K"/"4K" 原样透传（API 原生支持）
-    if size.strip().upper() == "1K":
-        size = "1024x1024"
-    # 钳制阈值按模型区分：5.0 Lite 为 3686400，其余为 921600（无差别套 Lite 阈值会把
-    # 合法的 1024x1024（1K）悄悄放大成 1920x1920，导致分辨率档位与实际图片不符）
-    min_pixels = _MIN_PIXELS if "lite" in model.lower() else _BASE_MIN_PIXELS
-    try:
-        if "x" in size:
-            w, h = (int(v) for v in size.lower().split("x", 1))
-            if w * h < min_pixels:
-                scale = (min_pixels / (w * h)) ** 0.5
-                w = max(32, -(-int(w * scale) // 32) * 32)  # 向上取整到 32 倍数
-                h = max(32, -(-int(h * scale) // 32) * 32)
-                while w * h < min_pixels:  # 对齐后仍不足则继续加
-                    if w <= h:
-                        w += 32
-                    else:
-                        h += 32
-                return f"{w}x{h}"
-    except ValueError as e:
-        logger.warning("尺寸规格无法钳制（原样透传）: %r: %s", size, e)
-    return size
+def _normalize_size(size: str, model: str = "") -> str:
+    """把 Agent 传来的 size 字符串规范成 Ark 接受的格式。
+
+    - 合法 preset（2K / 4K，旧版 1K 也接受）→ 直接用；非法 preset → fallback 默认
+    - WxH 自定义像素 → 按模型下限钳制到 32 倍数、面积上限钳制
+    - 空串 / None → fallback 默认
+    核心目标：绝不把 Ark 不认识的 size 透传给上游，避免 400 InvalidParameter。
+    """
+    size = (size or "").strip()
+    if not size:
+        logger.debug("[Volc] size 为空，兜底 %s", _DEFAULT_SIZE)
+        return _DEFAULT_SIZE
+
+    upper = size.upper()
+    is_new = any(tag in model.lower() for tag in ("4-0", "4-5", "4.0", "4.5", "5-0", "5.0", "5.1", "lite"))
+    allowed_presets = _PRESETS_45 if is_new else _PRESETS_30
+    min_pixels = _MIN_PIXELS_45 if is_new else _MIN_PIXELS_30
+
+    # 1. preset 白名单校验
+    if _SIZE_PRESET_RE.match(upper):
+        if upper in allowed_presets:
+            # Seedream 3.0 的 "1K" 官方不支持 preset 方式 1？文档说支持 1K/2K/4K 都可以，直接透传
+            return upper
+        logger.warning(
+            "[Volc] 非法 preset 尺寸 %r（%s 模型仅支持 %s），兜底 %s",
+            size, model or "默认", ",".join(sorted(allowed_presets)), _DEFAULT_SIZE,
+        )
+        return _DEFAULT_SIZE
+
+    # 2. WxH 自定义像素
+    m = _SIZE_RE.match(upper)
+    if m:
+        try:
+            w, h = int(m.group(1)), int(m.group(2))
+        except ValueError:
+            logger.warning("[Volc] 自定义尺寸解析失败 %r，兜底 %s", size, _DEFAULT_SIZE)
+            return _DEFAULT_SIZE
+        if w <= 0 or h <= 0:
+            logger.warning("[Volc] 自定义尺寸 <=0 %r，兜底 %s", size, _DEFAULT_SIZE)
+            return _DEFAULT_SIZE
+        area = w * h
+        ratio = w / h
+        # 宽高比约束
+        if ratio < 1 / 16 or ratio > 16:
+            logger.warning("[Volc] 自定义尺寸宽高比 %.3f 超出 [1/16,16]，兜底 %s", ratio, _DEFAULT_SIZE)
+            return _DEFAULT_SIZE
+        # 面积下限钳制
+        if area < min_pixels:
+            scale = (min_pixels / area) ** 0.5
+            w = max(32, -(-int(w * scale) // 32) * 32)
+            h = max(32, -(-int(h * scale) // 32) * 32)
+            while w * h < min_pixels:
+                if w <= h:
+                    w += 32
+                else:
+                    h += 32
+            logger.debug("[Volc] 尺寸 %s 面积 %d 不足 %d，放大到 %dx%d", size, area, min_pixels, w, h)
+        # 面积上限钳制
+        if w * h > _MAX_PIXELS:
+            scale = (_MAX_PIXELS / (w * h)) ** 0.5
+            w = max(32, -(-int(w * scale) // 32) * 32)
+            h = max(32, -(-int(h * scale) // 32) * 32)
+            logger.debug("[Volc] 尺寸 %s 面积超限，缩小到 %dx%d", size, w, h)
+        return f"{w}x{h}"
+
+    # 3. 完全不认识的格式（比如 Agent 瞎写的 "ultra HD"、"高清"）
+    logger.warning("[Volc] 无法识别的 size 格式 %r，兜底 %s", size, _DEFAULT_SIZE)
+    return _DEFAULT_SIZE
 
 
 def _mask_to_bbox_tags(mask_data_url: str, max_boxes: int = 4) -> list[str]:
@@ -311,7 +369,7 @@ class VolcEngineImageGenerator(BaseImageGenerator):
         }
         if size:
             # 未指定 size 时不传该字段，交由模型默认输出（前端“自动”宽高比）
-            body["size"] = _clamp_size(size, self.model)
+            body["size"] = _normalize_size(size, self.model)
         refs = self._valid_refs(image_urls)
         if refs:
             body["image"] = refs
@@ -385,7 +443,7 @@ class VolcEngineImageGenerator(BaseImageGenerator):
         }
         if size:
             # 未指定 size 时不传，交由模型默认输出
-            body["size"] = _clamp_size(size, self.stream_model)
+            body["size"] = _normalize_size(size, self.stream_model)
         refs = self._valid_refs(image_urls)
         if refs:
             body["image"] = refs
@@ -563,7 +621,7 @@ class VolcEngineImageGenerator(BaseImageGenerator):
         }
         if size:
             # 未指定 size 时不传，交由模型默认输出
-            body["size"] = _clamp_size(size, self.model)
+            body["size"] = _normalize_size(size, self.model)
 
         logger.debug(
             "[Volc] Inpainting 请求 model=%s size=%s 选区=%s prompt=%s",

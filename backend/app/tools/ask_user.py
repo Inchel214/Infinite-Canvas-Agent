@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # 默认超时时间（秒）
-DEFAULT_TIMEOUT = 120  # 2 分钟
+DEFAULT_TIMEOUT = 300  # 5 分钟
 
 
 class AskUserTool(BaseTool):

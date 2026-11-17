@@ -82,6 +82,11 @@ function App() {
   const loadingRef = useRef(false);
   // ChatPanel ref：切换画布前保存草稿
   const chatPanelRef = useRef<ChatPanelRef>(null);
+  // 对话卡片"定位"：token 递增触发画布把新生成节点移到视野中央
+  const [focusRequest, setFocusRequest] = useState<{ nodeId: string; token: number } | null>(null);
+  const handleLocateNode = useCallback((nodeId: string) => {
+    setFocusRequest((prev) => ({ nodeId, token: (prev?.token ?? 0) + 1 }));
+  }, []);
 
   useEffect(() => {
     loadingRef.current = loading;
@@ -399,6 +404,7 @@ function App() {
           if (!chatOpen) toggleChatOpen(true);
         }}
         chatDockWidth={chatOpen ? chatWidth : 0}
+        focusRequest={focusRequest}
       />
 
       {/* 右上角入口：画布管理 + 大模型设置 */}
@@ -552,6 +558,7 @@ function App() {
         canvasNodes={canvasState ? Object.values(canvasState.nodes) : []}
         onClearRefs={() => setChatRefIds([])}
         onCanvasUpdate={applyCanvasState}
+        onLocateNode={handleLocateNode}
         syncToken={remoteSyncToken}
         remoteGenerating={canvasId ? badges[canvasId]?.generating ?? 0 : 0}
       />

@@ -101,6 +101,8 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
   const [showHelp, setShowHelp] = useState(false);
   const [recordingAction, setRecordingAction] = useState<keyof EditorShortcutConfig | null>(null);
   const [brushSize, setBrushSize] = useState(30);
+  // 草图笔独立大小：默认 5px（画笔/橡皮仍共用 brushSize）
+  const [sketchSize, setSketchSize] = useState(5);
   const [wandTol, setWandTol] = useState(32);
   const [viewMode, setViewMode] = useState<ViewMode>("overlay");
   const [isLoading, setIsLoading] = useState(true);
@@ -510,7 +512,7 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     const last = sketchLastPosRef.current;
-    const base = Math.max(2, Math.round(brushSize / 3));
+    const base = Math.max(1, sketchSize);
     // 压感只对笔生效：手指/鼠标不传 pressure，线宽与原来一致
     const width = pressure == null
       ? base
@@ -1246,11 +1248,13 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
       }
 
       if (matchesShortcut(e, shortcutBindings.brushSmaller)) {
-        setBrushSize((s) => Math.max(5, s - 5));
+        if (tool === "sketch") setSketchSize((s) => Math.max(1, s - 1));
+        else setBrushSize((s) => Math.max(5, s - 5));
         return;
       }
       if (matchesShortcut(e, shortcutBindings.brushLarger)) {
-        setBrushSize((s) => Math.min(100, s + 5));
+        if (tool === "sketch") setSketchSize((s) => Math.min(30, s + 1));
+        else setBrushSize((s) => Math.min(100, s + 5));
         return;
       }
       if (matchesShortcut(e, shortcutBindings.brush)) {
@@ -1291,7 +1295,7 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
       document.removeEventListener("keyup", onKeyUp, true);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [styleOpen, showHelp, recordingAction, shortcutBindings, undo, redo, onCancel, pixelsReadable, canExecute, sketchEnabled]);
+  }, [styleOpen, showHelp, recordingAction, shortcutBindings, undo, redo, onCancel, pixelsReadable, canExecute, sketchEnabled, tool]);
 
   // ===== 风格下拉（原有逻辑保留） =====
   useEffect(() => {
@@ -1443,11 +1447,20 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
           <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
             <span style={{ color: "#888", fontSize: 12 }}>大小:</span>
             <input
-              type="range" min="5" max="100" value={brushSize}
-              onChange={(e) => setBrushSize(Number(e.target.value))}
+              type="range"
+              min={tool === "sketch" ? 1 : 5}
+              max={tool === "sketch" ? 30 : 100}
+              value={tool === "sketch" ? sketchSize : brushSize}
+              onChange={(e) => {
+                const v = Number(e.target.value);
+                if (tool === "sketch") setSketchSize(v);
+                else setBrushSize(v);
+              }}
               style={{ width: 70 }}
             />
-            <span style={{ color: "#aaa", fontSize: 12, width: 22 }}>{brushSize}</span>
+            <span style={{ color: "#aaa", fontSize: 12, width: 22 }}>
+              {tool === "sketch" ? sketchSize : brushSize}
+            </span>
           </div>
         )}
         {tool === "wand" && (

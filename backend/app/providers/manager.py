@@ -20,6 +20,10 @@ class GeneratorProxy(BaseImageGenerator):
     def __init__(self, manager: "ProviderManager"):
         self._manager = manager
 
+    @property
+    def model(self) -> str:
+        return str(getattr(self._manager.generator, "model", "") or "")
+
     def generate(self, prompt, width=300, height=300, size="2K"):
         return self._manager.generator.generate(prompt, width=width, height=height, size=size)
 

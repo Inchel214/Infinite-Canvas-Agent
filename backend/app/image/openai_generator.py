@@ -63,6 +63,7 @@ def _retry_post(session: requests.Session, url: str, **kwargs) -> requests.Respo
 
 # 各档位映射的目标边长（OpenAI 官方最大 1024/1536，网关普遍支持更大值）
 _SIZE_MAP = {"1K": "1024x1024", "2K": "2048x2048", "4K": "2048x2048"}
+_DEFAULT_SIZE = "1024x1024"
 
 # OpenAI 图片编辑接口的通用预设。兼容网关对自定义尺寸支持不一：
 # 首次仍原样请求，只在自定义尺寸被 400 拒绝时降级到同方向预设。
@@ -71,8 +72,34 @@ _PIXEL_SIZE_RE = re.compile(r"^(\d+)[xX](\d+)$")
 
 
 def _norm_size(size: str) -> str:
-    """把 1K/2K/4K 归一化为 WxH；自定义 WxH 原样透传（由服务商校验）"""
-    return _SIZE_MAP.get(size.upper(), size)
+    """把 Agent 传来的 size 字符串规范成 OpenAI / 兼容网关接受的格式。
+
+    - 1K/2K/4K 档位映射到对应 WxH
+    - WxH 自定义像素原样透传（由网关 / 上游校验，失败时 _fallback_edit_size 再降级）
+    - 空串 / 非法 preset / 无法解析 → fallback 默认 1024x1024
+    核心目标：绝不把不认识的 size 透传给上游。
+    """
+    raw = (size or "").strip()
+    if not raw:
+        logger.debug("[OpenAI] size 为空，兜底 %s", _DEFAULT_SIZE)
+        return _DEFAULT_SIZE
+
+    upper = raw.upper()
+    if upper in _SIZE_MAP:
+        return _SIZE_MAP[upper]
+
+    # 合法 WxH 格式 → 直接用
+    if _PIXEL_SIZE_RE.fullmatch(upper):
+        try:
+            w, h = (int(v) for v in _PIXEL_SIZE_RE.match(upper).groups())
+            if w > 0 and h > 0:
+                return upper
+        except ValueError:
+            pass
+
+    # 非法 preset / 无法解析
+    logger.warning("[OpenAI] 无法识别的 size %r，兜底 %s", raw, _DEFAULT_SIZE)
+    return _DEFAULT_SIZE
 
 
 def _fallback_edit_size(size: str) -> str | None:

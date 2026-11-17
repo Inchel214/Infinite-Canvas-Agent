@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import threading
 import time
@@ -22,6 +23,7 @@ from typing import Callable
 
 from app.agent.llm import BaseLLM, LLMResponse, ToolCall
 from app.agent.prompts import build_system_prompt
+from app.agent.sessions import clean_profile_output
 from app.canvas.state import CanvasState
 from app.canvas.store import BaseStore
 from app.tools.base import ToolManager, ToolResult
@@ -48,23 +50,93 @@ def _clip_args(args: dict, n: int = 160) -> str:
 # 事件回调类型
 EventCallback = Callable[[dict], None]
 
-# 规划阶段附加在用户消息后的指令：工具任务给分步计划；纯对话以 [chat] 开头直接回答
+# 规划阶段附加在用户消息后的指令：先明确路由，再由主循环决定展示与执行方式
 PLAN_SUFFIX = (
-    "\n\n请先判断这个请求，按两种方式之一处理：\n"
-    "1. 若是需要调用工具的画布操作任务（生成、编辑、移动、删除图片、合并、查看节点等），"
-    "请给出简要分步计划（每步一句话，最多 5 步；单步任务也请列出）。只输出计划文字本身，不要调用工具。\n"
-    "2. 若是纯对话（问候、闲聊、知识问答、意见建议等），不需要操作画布，"
-    "请以标记 [chat] 开头回复，直接回答用户。"
+    "\n\n请先判断这个请求，严格按三种方式之一处理：\n"
+    "1. 可直接执行的画布操作任务（生成、编辑、移动、删除图片、合并、查看节点等）："
+    "给出简要分步计划（每步一句话，最多 5 步；单步任务也请列出）。只输出计划文字本身，不要调用工具。\n"
+    "2. 纯对话（问候、闲聊、知识问答、意见建议等），不需要操作画布："
+    "以标记 [chat] 开头，直接回答用户。\n"
+    "3. 缺少关键信息、必须让用户选择或确认后才能安全执行："
+    "以标记 [clarify] 开头，紧随其后只输出一个 JSON 对象，格式为 "
+    '{"question":"要问用户的问题","options":["选项1","选项2"],'
+    '"default_action":"取消本次操作","timeout":300}。'
+    "options 只在存在明确候选时提供；不要用正文提问，不要同时输出执行计划。"
 )
 
-# 纯对话标记：规划调用返回以它开头时，跳过计划与 ReAct 循环，单次调用收尾
+# 纯对话 / 阻塞式澄清标记：路由确定前不向 frontend 发送计划事件，避免误显示计划卡
 CHAT_PREFIX = "[chat]"
+CLARIFY_PREFIX = "[clarify]"
 
 # 工具失败后注入 tool 消息的反思提示：驱动 LLM 分析原因并调整方案
 REFLECTION_HINT = (
     "\n\n[系统提示] 上一步执行失败。请反思原因（参数是否正确、目标节点是否存在等），"
     "决定：调整参数重试、换一种方案、或如实告知用户无法完成。"
 )
+
+
+class _ClarifyStreamGuard:
+    """执行阶段流式预检：若 LLM 输出以 [clarify] 开头，拦截 delta 不推前端。
+
+    规划阶段的 [clarify] 识别只挂在 _make_plan；执行阶段 LLM 若沿用文本标记
+    模式澄清，未拦截时 "[clarify]{...}" 原文会随打字机 delta 推到前端。
+    非 clarify 的正常回复在可判定前缀后立即放行，首字符非 '[' 时零延迟。
+    """
+
+    def __init__(self, downstream: Callable[[str], None]):
+        self._downstream = downstream
+        self._buffer = ""
+        self._decided = False
+        self.suppressed = False
+
+    def feed(self, text: str) -> None:
+        if self.suppressed:
+            return
+        if self._decided:
+            self._downstream(text)
+            return
+        self._buffer += text
+        stripped = self._buffer.lstrip()
+        # 前缀尚未完整且仍有可能匹配 [clarify]：继续缓冲等待判定
+        if len(stripped) < len(CLARIFY_PREFIX) and CLARIFY_PREFIX.startswith(stripped):
+            return
+        self._decided = True
+        if stripped.startswith(CLARIFY_PREFIX):
+            self.suppressed = True
+            self._buffer = ""
+            return
+        buffered, self._buffer = self._buffer, ""
+        self._downstream(buffered)
+
+
+class _ProfileStreamFilter:
+    """流式隐藏内部 profile_delta；保留短尾部避免跨 chunk 标记泄漏。"""
+
+    def __init__(self, emit: EventCallback):
+        self.emit = emit
+        self.buffer = ""
+
+    def feed(self, text: str) -> None:
+        self.buffer += text
+        if "</profile_delta>" in self.buffer:
+            clean, _ = clean_profile_output(self.buffer)
+            self.buffer = ""
+            if clean:
+                self.emit({"type": "delta", "content": clean})
+            return
+        if "<profile_delta>" in self.buffer or "```" in self.buffer:
+            return
+        # 标记可能分片到达，尾部最多保留 32 字。
+        if len(self.buffer) > 32:
+            visible, self.buffer = self.buffer[:-32], self.buffer[-32:]
+            self.emit({"type": "delta", "content": visible})
+
+    def finish(self) -> str:
+        clean, _ = clean_profile_output(self.buffer)
+        self.buffer = ""
+        if clean:
+            self.emit({"type": "delta", "content": clean})
+        return clean
 
 
 class RunControl:
@@ -76,6 +148,7 @@ class RunControl:
         self._pause_events: dict[str, threading.Event] = {}  # 暂停信号（用户回复后 set）
         self._pending_questions: dict[str, dict] = {}  # 等待中的问题
         self._user_responses: dict[str, str] = {}  # 用户回复
+        self._last_activity: dict[str, float] = {}  # 最近一次用户操作（monotonic 时间）
 
     def register(self, canvas_id: str) -> threading.Event:
         """注册一次运行，返回其停止信号"""
@@ -95,6 +168,7 @@ class RunControl:
                 self._pause_events.pop(canvas_id, None)
                 self._pending_questions.pop(canvas_id, None)
                 self._user_responses.pop(canvas_id, None)
+                self._last_activity.pop(canvas_id, None)
 
     def request_stop(self, canvas_id: str) -> bool:
         """请求停止指定画布当前运行；返回是否存在进行中的运行"""
@@ -118,29 +192,46 @@ class RunControl:
             if not pause_evt or (stop_evt and stop_evt.is_set()):
                 return False
             self._pending_questions[canvas_id] = question
+            self._last_activity[canvas_id] = time.monotonic()
             pause_evt.clear()  # 清空，等待用户回复后 set
         logger.debug("[RunControl] 请求暂停 canvas=%s question=%s", canvas_id, question.get("question", "")[:50])
         return True
 
     def wait_for_response(self, canvas_id: str, timeout: int = 300) -> str | None:
-        """阻塞等待用户回复，返回用户输入或超时返回 None"""
+        """阻塞等待用户回复；用户活动时重新计算空闲超时。"""
         with self._lock:
             pause_evt = self._pause_events.get(canvas_id)
             stop_evt = self._events.get(canvas_id)
+            self._last_activity[canvas_id] = time.monotonic()
         if not pause_evt:
             return None
-        
-        # 阻塞等待，直到用户回复、超时、或被停止
-        if pause_evt.wait(timeout=timeout):
-            # 检查是否是被停止唤醒的
-            if stop_evt and stop_evt.is_set():
-                return None
+
+        while True:
             with self._lock:
-                response = self._user_responses.pop(canvas_id, None)
-            logger.debug("[RunControl] 收到用户回复 canvas=%s response=%s", canvas_id, (response or "")[:50])
-            return response
-        logger.debug("[RunControl] 等待用户回复超时 canvas=%s", canvas_id)
-        return None  # 超时
+                last_activity = self._last_activity.get(canvas_id, time.monotonic())
+            remaining = timeout - (time.monotonic() - last_activity)
+            if remaining <= 0:
+                logger.debug("[RunControl] 用户连续无操作超时 canvas=%s", canvas_id)
+                return None
+
+            if pause_evt.wait(timeout=remaining):
+                # 检查是否是被停止唤醒的
+                if stop_evt and stop_evt.is_set():
+                    return None
+                with self._lock:
+                    response = self._user_responses.pop(canvas_id, None)
+                logger.debug("[RunControl] 收到用户回复 canvas=%s response=%s", canvas_id, (response or "")[:50])
+                return response
+            # 等待到期后重新读取活动时间；期间有输入则进入下一轮，而不是直接超时。
+
+    def record_activity(self, canvas_id: str) -> bool:
+        """记录用户在询问卡上的操作；仅等待回复时有效。"""
+        with self._lock:
+            pause_evt = self._pause_events.get(canvas_id)
+            if not pause_evt or pause_evt.is_set():
+                return False
+            self._last_activity[canvas_id] = time.monotonic()
+            return True
 
     def provide_response(self, canvas_id: str, response: str) -> bool:
         """用户提供回复，恢复执行"""
@@ -187,6 +278,7 @@ class ReActAgent:
         max_steps: int = 100,
         control: RunControl | None = None,
         chat_sessions: "ChatSessionStore | None" = None,  # 工具步骤实时持久化
+        feedback=None,
     ):
         self.llm = llm
         self.tool_manager = tool_manager
@@ -194,6 +286,7 @@ class ReActAgent:
         self.max_steps = max_steps
         self.control = control or RunControl()
         self.chat_sessions = chat_sessions
+        self.feedback = feedback
 
     def run(
         self,
@@ -204,6 +297,7 @@ class ReActAgent:
         failure_note: str | None = None,
         referenced_images: list[dict] | None = None,  # Vision: 用户引用的图片列表
         steer_provider: Callable[[], dict | None] | None = None,  # 工具边界注入排队消息（steering）
+        round_id: str | None = None,
     ) -> AgentResult:
         """执行 Agent 循环。
 
@@ -222,15 +316,21 @@ class ReActAgent:
                 on_event(evt)
 
         stop_evt = self.control.register(canvas_id)
+        feedback_round_id = round_id or ""
         # 工具步骤实时持久化：创建 run 记录
         run_id = None
         if self.chat_sessions:
-            run_id = self.chat_sessions.begin_run(canvas_id, prompt)
+            run_id = self.chat_sessions.begin_run(canvas_id, prompt, round_id=round_id)
 
         def add_timeline(segment: dict) -> None:
             """追加一个时间线段（plan/text/tool/user），供前端按时间线还原执行过程"""
             if self.chat_sessions and run_id:
                 self.chat_sessions.append_timeline_segment(canvas_id, run_id, segment)
+
+        def tool_meta(result: ToolResult) -> dict:
+            """工具结果中前端展示/定位所需的数据（如新建节点的 node_id 与图片地址）"""
+            return {"data": result.data} if result.data else {}
+
         try:
             # system + 历史对话 + 当前用户消息（当前消息每步重建画布状态）
             system_prompt = build_system_prompt()
@@ -260,36 +360,38 @@ class ReActAgent:
             steps: list[dict] = []
 
             # ===== 规划 + 路由阶段：一次无工具 LLM 调用 =====
-            # 工具任务 → 分步计划（plan_delta 流式，注入上下文）；
-            # 纯对话 → [chat] 前缀直接回答（delta 流式，单次调用收尾，不出计划卡片）
-            plan, chat_answer = self._make_plan(messages, user_msg_index, emit)
+            # execute → 分类完成后再发计划；chat → 直接回复；
+            # clarify → 合成一次真实 ask_user 工具调用，复用暂停/回复/续跑链路。
+            plan, chat_answer, clarification = self._make_plan(messages, user_msg_index, emit)
             if chat_answer:
                 logger.debug("[Agent] 路由决策: 纯对话（chat），跳过 ReAct 循环")
+                if self.chat_sessions and run_id:
+                    chat_answer = self.chat_sessions.finish_run(
+                        canvas_id, run_id, "done", chat_answer
+                    )
+                else:
+                    chat_answer, _ = clean_profile_output(chat_answer)
                 steps.append({"type": "response", "content": chat_answer})
                 emit({"type": "response", "content": chat_answer})
-                # 完成 run 记录
-                if self.chat_sessions and run_id:
-                    self.chat_sessions.finish_run(canvas_id, run_id, "done", chat_answer)
                 return AgentResult(success=True, message=chat_answer, state=state, steps=steps, run_id=run_id)
-            if plan:
-                # 检查计划是否是询问用户（包含问号或询问句式，且没有明确的工具调用步骤）
-                if self._is_inquiry_plan(plan):
-                    # 询问性质的内容：只作为正文回复发出，不发 plan 事件
-                    # plan 卡片只用于工具任务的执行路线图，询问用户本质上是纯对话
-                    logger.debug("[Agent] 路由决策: 询问用户（inquiry），跳过 ReAct 循环")
-                    steps.append({"type": "response", "content": plan})
-                    emit({"type": "response", "content": plan})
-                    # 完成 run 记录
-                    if self.chat_sessions and run_id:
-                        self.chat_sessions.finish_run(canvas_id, run_id, "done", plan)
-                    return AgentResult(success=True, message=plan, state=state, steps=steps, run_id=run_id)
-                logger.debug("[Agent] 路由决策: 工具任务（plan），进入 ReAct 循环")
+
+            pending_tool_call: ToolCall | None = None
+            if clarification:
+                pending_tool_call = ToolCall(name="ask_user", args=clarification)
+                messages.append({
+                    "role": "assistant",
+                    "content": f"我需要先向用户确认：{clarification['question']}",
+                })
+                logger.info(
+                    "[Agent] 路由决策: 阻塞式澄清（clarify），暂停等待用户 canvas=%s question=%s",
+                    canvas_id, _clip(clarification["question"], 120),
+                )
+            elif plan:
+                logger.debug("[Agent] 路由决策: 工具任务（execute），进入 ReAct 循环")
                 steps.append({"type": "plan", "content": plan})
-                # 持久化计划
                 if self.chat_sessions and run_id:
                     self.chat_sessions.update_run_plan(canvas_id, run_id, plan)
                 add_timeline({"kind": "plan", "text": plan})
-                # 计划注入上下文，执行阶段模型能看到自己的计划
                 messages.append({"role": "assistant", "content": f"执行计划：\n{plan}"})
                 logger.info("[Agent] 计划已生成 canvas=%s plan=%s", canvas_id, _clip(plan, 120))
 
@@ -312,6 +414,7 @@ class ReActAgent:
                     steered = steer_provider()
                     if steered and steered.get("prompt"):
                         steer_prompt = steered["prompt"]
+                        feedback_round_id = steered.get("round_id") or feedback_round_id
                         logger.info(
                             "[Agent] steering 注入排队消息 canvas=%s prompt=%s",
                             canvas_id, _clip(steer_prompt, 80),
@@ -334,32 +437,56 @@ class ReActAgent:
                 # LLM 流式调用：深度思考过程实时推前端（reasoning_delta），
                 # 文本增量实时推前端（delta 打字机），tool_calls 聚合后照常执行。
                 # 执行阶段保留深度思考，复杂工具链的规划质量靠它。
-                _text_buffer = []
+                _text_filter = _ProfileStreamFilter(emit)
+                _clarify_guard = _ClarifyStreamGuard(_text_filter.feed)
                 def _on_text(s: str) -> None:
-                    _text_buffer.append(s)
-                    emit({"type": "delta", "content": s})
+                    _clarify_guard.feed(s)
 
-                response = self.llm.chat_stream(
-                    messages,
-                    tools=self.tool_manager.list_schemas(),
-                    on_text=_on_text,
-                    on_reasoning=lambda s: emit({"type": "reasoning_delta", "content": s}),
-                )
+                if pending_tool_call is not None:
+                    # 规划阶段已明确需要澄清：第一步不请求 LLM，直接走标准 ask_user 工具分支。
+                    response = LLMResponse(content="", tool_calls=[pending_tool_call])
+                    pending_tool_call = None
+                else:
+                    response = self.llm.chat_stream(
+                        messages,
+                        tools=self.tool_manager.list_schemas(),
+                        on_text=_on_text,
+                        on_reasoning=lambda s: emit({"type": "reasoning_delta", "content": s}),
+                    )
 
+                _text_filter.finish()
                 # LLM 返回文本，任务完成
                 if not response.tool_calls:
-                    steps.append({"type": "response", "content": response.content})
-                    emit({"type": "response", "content": response.content})
+                    # 执行阶段二次澄清兜底：[clarify] 识别原先只挂在规划阶段
+                    # （_make_plan），执行中沿用文本标记的澄清会被当最终回复，
+                    # 表现为"第二次提问退化成纯文字、run 直接结束"。这里统一
+                    # 转成 ask_user 工具调用，同一 run 内可多次澄清。
+                    clarify_payload = self._normalize_clarify_payload(response.content)
+                    if clarify_payload is not None:
+                        pending_tool_call = ToolCall(name="ask_user", args=clarify_payload)
+                        messages.append({
+                            "role": "assistant",
+                            "content": f"我需要先向用户确认：{clarify_payload['question']}",
+                        })
+                        logger.info(
+                            "[Agent] 执行阶段澄清（clarify 兜底），暂停等待用户 canvas=%s question=%s",
+                            canvas_id, _clip(clarify_payload["question"], 120),
+                        )
+                        continue
+                    clean_content, _ = clean_profile_output(response.content)
+                    if self.chat_sessions and run_id:
+                        clean_content = self.chat_sessions.finish_run(
+                            canvas_id, run_id, "done", response.content
+                        )
+                    steps.append({"type": "response", "content": clean_content})
+                    emit({"type": "response", "content": clean_content})
                     logger.info(
                         "[Agent] 任务完成 canvas=%s 步数=%d 回复=%s",
-                        canvas_id, _step + 1, _clip(response.content, 120),
+                        canvas_id, _step + 1, _clip(clean_content, 120),
                     )
-                    # 完成 run 记录
-                    if self.chat_sessions and run_id:
-                        self.chat_sessions.finish_run(canvas_id, run_id, "done", response.content)
                     return AgentResult(
                         success=True,
-                        message=response.content,
+                        message=clean_content,
                         state=state,
                         steps=steps,
                         run_id=run_id,
@@ -367,8 +494,9 @@ class ReActAgent:
 
                 # 中间说明文本 flush 到 timeline：工具卡片前的过程文本，
                 # 前端据此把"文本→工具→文本"按时间线完整还原
-                if response.content and response.content.strip():
-                    add_timeline({"kind": "text", "text": response.content})
+                intermediate_text, _ = clean_profile_output(response.content)
+                if intermediate_text:
+                    add_timeline({"kind": "text", "text": intermediate_text})
 
                 # 执行工具调用（支持并行执行生图工具）
                 aborted = False
@@ -400,7 +528,9 @@ class ReActAgent:
                     def execute_image_tool(idx: int, tool_call: ToolCall, tool_state: CanvasState) -> tuple[int, ToolResult, float]:
                         """执行单个生图工具，返回 (index, result, cost_ms)"""
                         _t0 = time.monotonic()
-                        result = self._execute_tool(tool_call, tool_state)
+                        result = self._execute_tool(
+                            tool_call, tool_state, round_id=feedback_round_id
+                        )
                         _cost_ms = int((time.monotonic() - _t0) * 1000)
                         return idx, result, _cost_ms
 
@@ -457,6 +587,7 @@ class ReActAgent:
                             "args": tool_call.args,
                             "result": result.message,
                             "success": result.success,
+                            **tool_meta(result),
                         })
 
                         # 工具结果加入消息
@@ -487,6 +618,7 @@ class ReActAgent:
                             "result": result.message,
                             "success": result.success,
                             "canvas": state.to_dict() if result.success else None,
+                            **tool_meta(result),
                         })
                 
                 # 单个生图工具走串行路径（并行分支只处理 >1 的情况，
@@ -507,7 +639,7 @@ class ReActAgent:
                             "question": tool_call.args.get("question", ""),
                             "options": tool_call.args.get("options", []),
                             "default_action": tool_call.args.get("default_action", ""),
-                            "timeout": tool_call.args.get("timeout", 120),
+                            "timeout": tool_call.args.get("timeout", 300),
                         })
 
                     emit({"type": "tool_start", "tool": tool_call.name, "args": tool_call.args})
@@ -520,7 +652,9 @@ class ReActAgent:
                         tool_call.name, canvas_id, tool_call.args,
                     )
                     _t0 = time.monotonic()
-                    result = self._execute_tool(tool_call, state)
+                    result = self._execute_tool(
+                        tool_call, state, round_id=feedback_round_id
+                    )
                     _cost_ms = int((time.monotonic() - _t0) * 1000)
                     if result.success:
                         logger.info(
@@ -553,6 +687,7 @@ class ReActAgent:
                         "args": tool_call.args,
                         "result": result.message,
                         "success": result.success,
+                        **tool_meta(result),
                     })
 
                     # 工具结果加入消息，供 LLM 决策下一步；失败时附反思提示
@@ -582,6 +717,7 @@ class ReActAgent:
                         "result": result.message,
                         "success": result.success,
                         **({"canvas": canvas_dict} if canvas_dict else {}),
+                        **tool_meta(result),
                     })
 
                 if aborted:
@@ -612,47 +748,66 @@ class ReActAgent:
         finally:
             self.control.unregister(canvas_id, stop_evt)
 
+    def _normalize_clarify_payload(self, content: str) -> dict | None:
+        """仅把带 [clarify] 前缀的执行阶段回复转换为询问参数。"""
+        stripped = content.strip()
+        if not stripped.startswith(CLARIFY_PREFIX):
+            return None
+        return self._parse_clarification(stripped[len(CLARIFY_PREFIX):])
+
     @staticmethod
-    def _is_inquiry_plan(plan: str) -> bool:
-        """判断计划是否是询问用户（而非可执行的工具任务）。
+    def _parse_clarification(payload: str) -> dict:
+        """解析 [clarify] 后的 JSON；格式异常时仍安全降级为自由输入询问。"""
+        raw = payload.strip()
+        if raw.startswith("```"):
+            lines = raw.splitlines()
+            lines = lines[1:]  # 去掉 ```json / ```
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            raw = "\n".join(lines).strip()
 
-        特征：
-        - 包含问号或询问句式（"请告诉我"、"你想"、"你希望"等）
-        - 以询问结尾（"要我现在开始吗"、"请确认"等）
-        """
-        inquiry_keywords = [
-            "请告诉我", "你想", "你希望", "请确认", "请选择", "你想要",
-            "告诉我", "确认一下", "你更", "哪种", "哪个",
-        ]
-        has_inquiry = any(kw in plan for kw in inquiry_keywords) or "？" in plan or "?" in plan
+        data: dict = {}
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                data = parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
 
-        # 检查是否以询问结尾（即使有工具调用步骤，只要结尾是询问也算）
-        inquiry_endings = [
-            "要我现在开始吗", "要我开始吗", "请确认", "请选择",
-            "你想", "你希望", "告诉我", "可以吗", "好不好",
-        ]
-        ends_with_inquiry = any(plan.rstrip().endswith(kw + "？") or plan.rstrip().endswith(kw + "?")
-                                for kw in inquiry_endings)
+        question = str(data.get("question") or "").strip()
+        if not question and raw and not raw.startswith("{"):
+            question = raw
+        if not question:
+            question = "请确认希望我如何继续？"
 
-        # 有询问关键词，或以询问结尾 → 是询问性质的计划
-        return has_inquiry or ends_with_inquiry
+        options = [
+            str(option).strip()
+            for option in data.get("options", [])
+            if str(option).strip()
+        ][:6] if isinstance(data.get("options", []), list) else []
+        try:
+            timeout = int(data.get("timeout", 300))
+        except (TypeError, ValueError):
+            timeout = 300
+        return {
+            "question": question,
+            "options": options,
+            "default_action": str(data.get("default_action") or "取消本次操作"),
+            "timeout": timeout,
+        }
 
     def _make_plan(
         self,
         messages: list[dict],
         user_msg_index: int,
         emit: Callable[[dict], None],
-    ) -> tuple[str, str]:
-        """规划 + 路由：一次无工具 LLM 调用完成判断与输出。
+    ) -> tuple[str, str, dict | None]:
+        """一次无工具 LLM 调用完成 execute / chat / clarify 路由。
 
-        返回 (plan, chat_answer)：
-        - 工具任务 → plan 非空（plan_delta 流式推送，注入执行上下文）
-        - 纯对话 → 模型以 [chat] 开头直接回答，chat_answer 非空，
-          调用方可跳过 ReAct 循环单次调用收尾
-        失败/空结果（如 Mock 模式）时静默降级为直接执行，不阻断主流程。
-
-        流式路由：开头几个 chunk 分不清是不是 [chat]，用小状态机——
-        未定时缓冲并匹配前缀，匹配上转 delta，不匹配转 plan_delta。
+        返回 (plan, chat_answer, clarification)，三者至多一个非空。
+        计划与澄清在完整分类前不外发，杜绝 inquiry 被先渲染成计划卡、又作为正文重复。
+        chat 仍在识别 [chat] 前缀后流式输出；execute 计划分类完成后一次性推送。
+        失败/空结果（如 Mock 模式）时降级为直接执行，不阻断主流程。
         """
         plan_messages = list(messages)
         # 处理多模态消息：content 可能是 str 或 list
@@ -681,36 +836,33 @@ class ReActAgent:
                 "content": user_content + PLAN_SUFFIX,
             }
 
-        # pending（未定）→ chat（纯对话，文本进 delta）/ plan（计划，文本进 plan_delta）
-        state = {"mode": "pending", "buf": ""}
+        # 只给确定是 chat 的内容流式外发；plan/clarify 等完整响应分类后再处理。
+        route_state = {"mode": "pending", "buf": ""}
+        chat_filter = _ProfileStreamFilter(emit)
 
         def on_text(s: str) -> None:
-            mode = state["mode"]
-            if mode == "chat":
-                emit({"type": "delta", "content": s})
+            if route_state["mode"] == "chat":
+                chat_filter.feed(s)
                 return
-            if mode == "plan":
-                emit({"type": "plan_delta", "content": s})
+            if route_state["mode"] != "pending":
                 return
-            # 未定：累积并尝试匹配 [chat] 前缀（忽略前导空白）
-            buf = (state["buf"] + s).lstrip()
-            state["buf"] = buf
+
+            buf = (route_state["buf"] + s).lstrip()
+            route_state["buf"] = buf
             if not buf:
-                return  # 目前只有空白，继续等
-            if buf == CHAT_PREFIX:
-                state["mode"] = "chat"
                 return
-            if CHAT_PREFIX.startswith(buf):
-                return  # [chat] 的部分前缀，继续缓冲等下一片
             if buf.startswith(CHAT_PREFIX):
-                # 整块到达（非流式降级路径常见）：[chat]+正文一次给出
-                state["mode"] = "chat"
+                route_state["mode"] = "chat"
                 rest = buf[len(CHAT_PREFIX):]
                 if rest:
-                    emit({"type": "delta", "content": rest})
+                    chat_filter.feed(rest)
                 return
-            state["mode"] = "plan"
-            emit({"type": "plan_delta", "content": buf})
+            if buf.startswith(CLARIFY_PREFIX):
+                route_state["mode"] = "clarify"
+                return
+            if CHAT_PREFIX.startswith(buf) or CLARIFY_PREFIX.startswith(buf):
+                return  # 前缀尚未完整，继续缓冲
+            route_state["mode"] = "execute"
 
         try:
             # 规划/路由阶段关闭深度思考：闲聊与列计划都是轻量任务，
@@ -720,13 +872,20 @@ class ReActAgent:
         except Exception:
             # 规划失败不阻断执行（网络抖动 / Mock 模式等）
             logger.warning("Agent 规划阶段失败，降级为无计划执行", exc_info=True)
-            return "", ""
+            return "", "", None
+        if route_state["mode"] == "chat":
+            chat_filter.finish()
         content = (resp.content or "").strip()
         logger.debug("[Agent] 规划结果 content=%s", _clip(content, 200))
         if content.startswith(CHAT_PREFIX):
-            # 纯对话：直接回答，跳过计划与主循环
-            return "", content[len(CHAT_PREFIX):].strip()
-        return content, ""
+            return "", content[len(CHAT_PREFIX):].strip(), None
+        if content.startswith(CLARIFY_PREFIX):
+            clarification = self._parse_clarification(content[len(CLARIFY_PREFIX):])
+            return "", "", clarification
+        if content:
+            # 路由已经确定为 execute，此时才允许创建计划卡。
+            emit({"type": "plan_delta", "content": content})
+        return content, "", None
 
     @staticmethod
     def _stopped_result(state: CanvasState, steps: list[dict], run_id: str | None = None) -> AgentResult:
@@ -739,8 +898,10 @@ class ReActAgent:
             run_id=run_id,
         )
 
-    def _execute_tool(self, tool_call: ToolCall, state: CanvasState) -> ToolResult:
-        """执行单个工具调用，处理特殊参数"""
+    def _execute_tool(
+        self, tool_call: ToolCall, state: CanvasState, round_id: str = ""
+    ) -> ToolResult:
+        """执行单个工具调用，处理特殊参数并记录图片行为反馈。"""
         args = dict(tool_call.args)
 
         # 处理单个 node_id 特殊值
@@ -768,8 +929,49 @@ class ReActAgent:
         if "node_ids" in args:
             args["node_ids"] = self._resolve_node_ids(args["node_ids"], state)
 
+        source = state.get_node(args.get("node_id", ""))
+        source_snapshot = source.to_dict() if source else None
+        if tool_call.name == "save_memory" and round_id:
+            args["source_round"] = round_id
+
         tool = self.tool_manager.get(tool_call.name)
-        return tool.run(state, **args)
+        result = tool.run(state, **args)
+        if result.success:
+            self._record_tool_feedback(
+                tool_call.name, state.canvas_id, source_snapshot, result, round_id
+            )
+        return result
+
+    def _record_tool_feedback(
+        self,
+        tool_name: str,
+        canvas_id: str,
+        source: dict | None,
+        result: ToolResult,
+        round_id: str,
+    ) -> None:
+        if not self.feedback:
+            return
+        try:
+            source_outcome = {
+                "delete_node": "deleted",
+                "variate_image": "retried",
+                "edit_image": "edited",
+            }.get(tool_name)
+            if source_outcome and source and source.get("type") == "image":
+                self.feedback.record(
+                    canvas_id, node=source, outcome=source_outcome, round_id=round_id
+                )
+            if tool_name in IMAGE_TOOLS:
+                node_id = (result.data or {}).get("node_id")
+                node = result.state.get_node(node_id) if result.state and node_id else None
+                if node and node.type == "image":
+                    self.feedback.record(
+                        canvas_id, node=node.to_dict(), outcome="kept", round_id=round_id
+                    )
+        except Exception:
+            # 行为反馈只用于后续检索，不能反向阻断已完成的画布操作。
+            logger.warning("图片行为反馈写入失败（已忽略）", exc_info=True)
 
     def _resolve_node_id(self, node_id: str, state: CanvasState) -> str | None:
         """解析特殊节点 ID：first/all，以及 #N / N / 图N 编号指代"""
@@ -843,7 +1045,14 @@ class ReActAgent:
                     f"- [{label}] {n.id}: {n.type} '{n.content}' at ({n.x}, {n.y})"
                 )
         canvas_context = "\n".join(nodes_info) if nodes_info else "(空画布)"
-        text_content = f"画布当前节点：\n{canvas_context}\n\n用户指令：{prompt}"
+        profile_text = ""
+        if self.chat_sessions:
+            profile = self.chat_sessions.get_profile(state.canvas_id)
+            if any(profile.values()):
+                profile_text = "项目档案（跨轮延续，仅在本轮有新增信息时更新）：\n" + json.dumps(
+                    profile, ensure_ascii=False
+                ) + "\n\n"
+        text_content = f"{profile_text}画布当前节点：\n{canvas_context}\n\n用户指令：{prompt}"
         if failure_note:
             text_content += f"\n\n{failure_note}"
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import uuid
 
 from app.canvas.state import CanvasNode, CanvasState
+from app.feedback import make_recipe
 from app.image.base import BaseImageGenerator
 from app.tools.base import BaseTool, ToolResult
 from app.tools.layout import next_position
@@ -23,7 +24,7 @@ class GenerateImageTool(BaseTool):
             "height": {"type": "number", "description": "图片高度"},
             "size": {
                 "type": "string",
-                "description": "生成尺寸：'1K'/'2K'/'4K' 分辨率档位，或 '宽x高' 具体像素（如 2048x1152 宽幅、1152x2048 竖幅）",
+                "description": "生成尺寸：'2K'/'4K' 分辨率档位（不要传 1K/8K 等其他档位），或 '宽x高' 具体像素（如 2048x1152 宽幅、1152x2048 竖幅）",
             },
         },
         "required": ["prompt"],
@@ -55,6 +56,12 @@ class GenerateImageTool(BaseTool):
             height=result.height,
             content=prompt,
             image_url=result.image_url,
+            recipe=make_recipe(
+                prompt,
+                style=str(kwargs.get("style", "") or ""),
+                size=size,
+                model=str(getattr(self.image_generator, "model", "") or ""),
+            ),
         )
         state.add_node(node)
         return ToolResult(
