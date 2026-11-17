@@ -9,6 +9,7 @@
     "lint": "oxlint",
     "test:reference-slots": "node --experimental-strip-types --test test/reference-slots.test.mjs",
     "test:generation-sessions": "node --experimental-strip-types --test test/generation-sessions.test.mjs",
+    "test:generation-recipe": "node --experimental-strip-types --test test/generation-recipe.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

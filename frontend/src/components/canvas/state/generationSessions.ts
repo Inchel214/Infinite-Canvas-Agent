@@ -1,6 +1,6 @@
 import type { PendingContainer } from "../types";
 
-type ProcessingBox = { id: number; x: number; y: number; w: number; h: number; label: string };
+type ProcessingBox = { id: number; x: number; y: number; w: number; h: number; label: string; recipe?: PendingContainer };
 type GenerationState = {
   containers: PendingContainer[];
   generatingIds: Set<string>;

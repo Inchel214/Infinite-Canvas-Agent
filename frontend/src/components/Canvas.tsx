@@ -12,6 +12,7 @@ import { useCanvasShortcuts } from "./canvas/hooks/useCanvasShortcuts";
 import { useGenerationSession } from "./canvas/hooks/useGenerationSession";
 import { matchesShortcut } from "./canvas/state/canvasShortcuts";
 import { swapReferenceSlots } from "./canvas/utils/references";
+import { duplicateGenerationRecipe } from "./canvas/utils/generationRecipe";
 
 // 右键菜单可触发的操作类型（experienceIds：风格库多选的风格，直连生图时后端确定性拼接）
 export type CanvasAction =
@@ -431,6 +432,7 @@ type MenuState = {
   x: number;
   y: number;
   mode: "menu" | "compose" | "background";
+  pendingContainer?: PendingContainer;
 };
 
 // 编辑图片框：独立于右键菜单，可与之并存
@@ -694,9 +696,14 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   } = useGenerationSession(canvasId);
   // 添加占位框（返回 id），操作结束时用 removeProcessingBox(id) 只清掉自己
   const addProcessingBox = useCallback(
-    (box: { x: number; y: number; w: number; h: number }, label: string) => {
+    (box: { x: number; y: number; w: number; h: number }, label: string,
+      inputs: Pick<PendingContainer, "prompt" | "refIds" | "aspect" | "resolution" | "experienceIds">) => {
       const id = ++processingSeqRef.current;
-      setProcessingBoxes((prev) => [...prev, { ...box, id, label }]);
+      const recipe: PendingContainer = {
+        ...inputs, id: `processing-${id}`, x: box.x, y: box.y,
+        w: CONTAINER_BASE_W, h: CONTAINER_BASE_H,
+      };
+      setProcessingBoxes((prev) => [...prev, { ...box, id, label, recipe }]);
       return id;
     },
     [processingSeqRef, setProcessingBoxes]
@@ -1118,8 +1125,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   }, [uploadImages, screenToWorld]);
 
   // 从图片边缘连接点开始拖线
-  const handlePortMouseDown = useCallback(
-    (e: React.MouseEvent, node: CanvasNode, portIdx: number) => {
+  const handlePortPointerDown = useCallback(
+    (e: React.PointerEvent, node: CanvasNode, portIdx: number) => {
       if (e.button !== 0) return;
       e.stopPropagation();
       e.preventDefault();
@@ -1852,7 +1859,9 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       setMenu(null);
       setPromptInput("");
       const sname = styleNamesByIds(menuStyleIds);
-      const boxId = addProcessingBox(box, sname ? `正在按《${sname}》组合...` : `正在组合 ${ids.length} 张图片...`);
+      const boxId = addProcessingBox(box, sname ? `正在按《${sname}》组合...` : `正在组合 ${ids.length} 张图片...`, {
+        prompt, refIds: ids, aspect, resolution, experienceIds: menuStyleIds,
+      });
       Promise.resolve(
         onAction({ type: "compose", nodeIds: ids, prompt, size, x: box.x, y: box.y, experienceIds: menuStyleIds.length ? menuStyleIds : undefined })
       ).finally(() => removeProcessingBox(boxId));
@@ -1881,6 +1890,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       const boxId = addProcessingBox(
         box,
         sname ? `正在按《${sname}》组合...` : `正在组合 ${refNodes.length} 张图片...`,
+        { ...editPanel, refIds: refNodes.map((node) => node.id), prompt },
       );
       Promise.resolve(onAction({
         type: "compose",
@@ -1899,7 +1909,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       const label = count > 1
         ? `${sname ? `《${sname}》` : ""}修改 ${i + 1}/${count} · 等待生成`
         : `${sname ? `《${sname}》` : ""}正在修改图片...`;
-      return { position, boxId: addProcessingBox(position, label) };
+      return { position, boxId: addProcessingBox(position, label, { ...editPanel, refIds: [nodeId], prompt }) };
     });
     void (async () => {
       let succeeded = 0;
@@ -1934,7 +1944,12 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         closestAspectKey(node.width, node.height),
         [node]
       );
-      const boxId = addProcessingBox(box, "正在局部编辑图片...");
+      const pixelSize = size.match(/^(\d+)x(\d+)$/i);
+      const boxId = addProcessingBox(box, "正在局部编辑图片...", {
+        prompt: finalPrompt, refIds: [node.id], aspect: closestAspectKey(node.width, node.height),
+        resolution: pixelSize ? closestResolutionKey(Math.max(Number(pixelSize[1]), Number(pixelSize[2]))) : size,
+        experienceIds,
+      });
       setMaskEditor(null);
       const action: CanvasAction = {
         type: "edit",
@@ -1969,6 +1984,19 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   // 复用一张已生成图的“配方”：保留原提示词、尺寸和来源参考图，
   // 直接生成一个可编辑容器，用户可替换参考图或小改提示词后再生成。
   const handleDuplicateAsEditable = useCallback(() => {
+    if (menu?.pendingContainer) {
+      const source = menu.pendingContainer;
+      const next = duplicateGenerationRecipe(
+        source, `pending-${crypto.randomUUID()}`,
+        Math.round(source.x + Math.max(400, source.w) + 48 / zoom), Math.round(source.y),
+      );
+      setContainers((previous) => [...previous, next]);
+      activeContainerIdRef.current = next.id;
+      setMenu(null);
+      setLocalStatusMsg("已复用生成设置，原任务继续生成");
+      window.setTimeout(() => setLocalStatusMsg(null), 2600);
+      return;
+    }
     if (selectedIds.size !== 1) return;
     const node = nodes.find((item) => item.id === [...selectedIds][0]);
     if (!node?.image_url) return;
@@ -2015,7 +2043,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       }
     };
     image.src = node.image_url;
-  }, [selectedIds, nodes, zoom, resolution, updateContainer, setContainers]);
+  }, [selectedIds, nodes, zoom, resolution, updateContainer, setContainers, menu]);
 
   // 更新节点内容（文本卡双击编辑后保存）
   const handleUpdateNodeContent = useCallback(
@@ -2646,7 +2674,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
             isLinked={!!(node.source_ids && node.source_ids.length >= 2)}
             isSelected={selectedIds.has(node.id)}
             showPorts={hoveredNode === node.id || (connecting?.fromId === node.id)}
-            onPortMouseDown={(e, portIdx) => handlePortMouseDown(e, node, portIdx)}
+            onPortPointerDown={(e, portIdx) => handlePortPointerDown(e, node, portIdx)}
             onPointerDown={(e) => handleNodePointerDown(e, node)}
             onMouseEnter={() => setHoveredNode(node.id)}
             onMouseLeave={() => setHoveredNode(null)}
@@ -2726,6 +2754,13 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
               onActivate={() => {
                 activeContainerIdRef.current = c.id;
               }}
+              onContextMenu={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                setSelectedIds(new Set());
+                activeContainerIdRef.current = null;
+                setMenu({ x: event.clientX, y: event.clientY, mode: "menu", pendingContainer: c });
+              }}
             />
           );
         })}
@@ -2734,6 +2769,16 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         {processingBoxes.map((box) => (
           <div
             key={box.id}
+            data-role="processing-placeholder"
+            onMouseDown={(event) => event.stopPropagation()}
+            onContextMenu={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              if (!box.recipe) return;
+              setSelectedIds(new Set());
+              activeContainerIdRef.current = null;
+              setMenu({ x: event.clientX, y: event.clientY, mode: "menu", pendingContainer: box.recipe });
+            }}
             style={{
               position: "absolute",
               left: box.x,
@@ -2751,7 +2796,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
               justifyContent: "center",
               gap: 10,
               zIndex: 20,
-              pointerEvents: "none",
+              pointerEvents: "auto",
             }}
           >
             <div style={{ display: "flex", gap: 5 }}>
@@ -2858,12 +2903,13 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
           x={menu.x}
           y={menu.y}
           mode={menu.mode}
-          selectedCount={selectedCount}
-          selectedImageCount={selectedImageCount}
+          selectedCount={menu.pendingContainer ? 1 : selectedCount}
+          selectedImageCount={menu.pendingContainer ? 0 : selectedImageCount}
+          imageUnavailable={!!menu.pendingContainer}
           selectedNodeContent={
-            selectedCount === 1
+            menu.pendingContainer?.prompt ?? (selectedCount === 1
               ? nodes.find((n) => n.id === [...selectedIds][0])?.content ?? ""
-              : ""
+              : "")
           }
           promptInput={promptInput}
           onPromptChange={setPromptInput}
@@ -2874,7 +2920,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
           experiences={experiences}
           styleIds={menuStyleIds}
           onStyleChange={setMenuStyleIds}
-          onMenuAction={handleMenuAction}
+          onMenuAction={menu.pendingContainer ? handleDuplicateAsEditable : handleMenuAction}
           onExecute={handleExecute}
           onDelete={handleDelete}
           onDuplicateEditable={handleDuplicateAsEditable}
@@ -3720,6 +3766,7 @@ const ContextMenu = ({
   selectedCount,
   selectedImageCount,
   selectedNodeContent,
+  imageUnavailable = false,
   promptInput,
   onPromptChange,
   aspect,
@@ -3749,6 +3796,7 @@ const ContextMenu = ({
   selectedCount: number;
   selectedImageCount: number;
   selectedNodeContent: string;
+  imageUnavailable?: boolean;
   promptInput: string;
   onPromptChange: (v: string) => void;
   aspect: string;
@@ -3820,6 +3868,22 @@ const ContextMenu = ({
   const hoverOut = (e: React.MouseEvent<HTMLElement>) => {
     e.currentTarget.style.background = "transparent";
   };
+  const imageActionProps = (action: () => void) => ({
+    role: "menuitem",
+    "aria-disabled": imageUnavailable,
+    tabIndex: imageUnavailable ? -1 : 0,
+    title: imageUnavailable ? "图片尚未生成，完成后可使用" : undefined,
+    style: { ...itemStyle, opacity: imageUnavailable ? 0.4 : 1, cursor: imageUnavailable ? "not-allowed" : "pointer" },
+    onClick: imageUnavailable ? undefined : action,
+    onMouseEnter: imageUnavailable ? undefined : hoverBg,
+    onMouseLeave: hoverOut,
+    onKeyDown: (event: React.KeyboardEvent) => {
+      if (!imageUnavailable && (event.key === "Enter" || event.key === " ")) {
+        event.preventDefault();
+        action();
+      }
+    },
+  });
 
   // 输入框模式（组合 / 变体）
   const inputPlaceholder =
@@ -3974,7 +4038,7 @@ const ContextMenu = ({
               <span style={{ fontSize: 11, color: "rgba(255,255,255,0.35)" }}>≥2 张</span>
             </div>
           )}
-          <div style={itemStyle} onMouseEnter={hoverBg} onMouseLeave={hoverOut} onClick={onAddToChat}>
+          <div {...imageActionProps(onAddToChat)}>
             <span>💬 添加到对话</span>
             <span style={{ fontSize: 11, color: "rgba(255,255,255,0.35)" }}>
               引用{selectedCount > 1 ? ` ${selectedCount} 张` : " #"}
@@ -3990,25 +4054,24 @@ const ContextMenu = ({
                 <span>📦 复用为可编辑节点</span>
                 <span style={{ fontSize: 11, color: "rgba(255,255,255,0.35)" }}>改参考图/提示词</span>
               </div>
-              <div style={itemStyle} onMouseEnter={hoverBg} onMouseLeave={hoverOut} onClick={onCopyImage}>
+              <div {...imageActionProps(onCopyImage)}>
                 <span>📋 复制图片</span>
                 <span style={{ fontSize: 11, color: "rgba(255,255,255,0.35)" }}>可粘贴到其他应用</span>
               </div>
-              <div style={itemStyle} onMouseEnter={hoverBg} onMouseLeave={hoverOut} onClick={onSaveImage}>
+              <div {...imageActionProps(onSaveImage)}>
                 <span>💾 另存为...</span>
                 <span style={{ fontSize: 11, color: "rgba(255,255,255,0.35)" }}>下载 PNG</span>
               </div>
-              <div style={itemStyle} onMouseEnter={hoverBg} onMouseLeave={hoverOut} onClick={onRevealImage}>
+              <div {...imageActionProps(onRevealImage)}>
                 <span>📂 打开所在文件夹</span>
                 <span style={{ fontSize: 11, color: "rgba(255,255,255,0.35)" }}>定位文件</span>
               </div>
             </>
           )}
           <div
-            style={{ ...itemStyle, color: "#f87171" }}
-            onMouseEnter={hoverBg}
-            onMouseLeave={hoverOut}
-            onClick={onDelete}
+            {...imageActionProps(onDelete)}
+            title={imageUnavailable ? "原任务继续生成，可复用设置创建新节点" : undefined}
+            style={{ ...imageActionProps(onDelete).style, color: "#f87171" }}
           >
             <span>🗑️ 删除{selectedCount > 1 ? ` ${selectedCount} 张` : ""}</span>
           </div>
@@ -4897,7 +4960,7 @@ const ImageNode = memo(function ImageNode({
   isLinked,
   isSelected,
   showPorts,
-  onPortMouseDown,
+  onPortPointerDown,
   onPointerDown,
   onMouseEnter,
   onMouseLeave,
@@ -4912,7 +4975,7 @@ const ImageNode = memo(function ImageNode({
   isLinked: boolean;
   isSelected: boolean;
   showPorts: boolean;
-  onPortMouseDown: (e: React.MouseEvent, portIdx: number) => void;
+  onPortPointerDown: (e: React.PointerEvent, portIdx: number) => void;
   onPointerDown: (e: React.PointerEvent) => void;
   onMouseEnter: () => void;
   onMouseLeave: () => void;
@@ -5023,7 +5086,8 @@ const ImageNode = memo(function ImageNode({
           return (
             <div
               key={i}
-              onMouseDown={(e) => onPortMouseDown(e, i)}
+              // 与节点拖拽使用同一事件，在冒泡到图片前接管连线操作。
+              onPointerDown={(e) => onPortPointerDown(e, i)}
               onMouseEnter={() => setHoveredPortIdx(i)}
               onMouseLeave={() => setHoveredPortIdx(null)}
               title="按住拖到图片容器（或空白处）建立参考连线"
@@ -5037,6 +5101,7 @@ const ImageNode = memo(function ImageNode({
                 alignItems: "center",
                 justifyContent: "center",
                 cursor: "crosshair",
+                touchAction: "none",
                 zIndex: 10,
               }}
             >
@@ -5388,7 +5453,7 @@ function ImageMentionPrompt({
       return;
     }
     const before = (node.textContent ?? "").slice(0, caret.startOffset);
-    const match = before.match(/@[^@\s]*$/);
+    const match = before.match(/[@＠][^@＠\s]*$/);
     if (!match || refNodes.length === 0) {
       setMentionRange(null);
       return;
@@ -5433,7 +5498,7 @@ function ImageMentionPrompt({
     range.deleteContents();
     const textNode = document.createTextNode(text);
     range.insertNode(textNode);
-    range.setStartAfter(textNode);
+    range.setStart(textNode, textNode.length);
     range.collapse(true);
     selection.removeAllRanges();
     selection.addRange(range);
@@ -5481,7 +5546,13 @@ function ImageMentionPrompt({
         onPaste={(e) => {
           e.preventDefault();
           insertPlainText(e.clipboardData.getData("text/plain"));
+          detectTypedMention();
         }}
+        onClick={detectTypedMention}
+        onKeyUp={(e) => {
+          if (!mentionRange && ["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) detectTypedMention();
+        }}
+        onScroll={() => setMentionRange(null)}
         onKeyDown={(e) => {
           if (composingRef.current || e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
           if (mentionRange && refNodes.length > 0) {
@@ -5593,13 +5664,33 @@ function ImageMentionPrompt({
           {placeholder}
         </span>
       )}
-      {mentionRange && refNodes.length > 0 && (
+      {mentionRange && refNodes.length > 0 && (() => {
+        // 菜单放到屏幕层，避免长提示词的滚动区域和节点边界裁掉候选图。
+        const caret = mentionRange.cloneRange();
+        caret.collapse(false);
+        const caretRect = caret.getBoundingClientRect();
+        const editorRect = editorRef.current?.getBoundingClientRect();
+        const anchor = caretRect.height ? caretRect : editorRect;
+        if (!anchor) return null;
+        const width = Math.min(190, window.innerWidth - 16);
+        const height = Math.min(148, refNodes.length * 36 + 10);
+        const left = Math.max(8, Math.min(anchor.left, window.innerWidth - width - 8));
+        const top = Math.max(8, Math.min(
+          anchor.top >= height + 12 ? anchor.top - height - 6 : anchor.bottom + 6,
+          window.innerHeight - height - 8,
+        ));
+        return createPortal(
         <div
+          role="listbox"
+          aria-label="参考图片"
+          onPointerDown={(e) => e.stopPropagation()}
+          onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); }}
+          onWheel={(e) => e.stopPropagation()}
           style={{
-            position: "absolute",
-            left: 8,
-            bottom: 30,
-            width: 190,
+            position: "fixed",
+            left,
+            top,
+            width,
             maxHeight: 148,
             overflowY: "auto",
             padding: 4,
@@ -5607,7 +5698,7 @@ function ImageMentionPrompt({
             background: "rgba(25,24,43,0.98)",
             border: "1px solid rgba(167,139,250,0.5)",
             boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
-            zIndex: 60,
+            zIndex: 10000,
           }}
         >
           {refNodes.map((node, index) => (
@@ -5644,8 +5735,8 @@ function ImageMentionPrompt({
               </span>
             </button>
           ))}
-        </div>
-      )}
+        </div>, document.body);
+      })()}
     </div>
   );
 }
@@ -5670,6 +5761,7 @@ function PendingContainerNode({
   onRemove,
   onGenerate,
   onActivate,
+  onContextMenu,
 }: {
   container: PendingContainer;
   displayX: number;
@@ -5686,6 +5778,7 @@ function PendingContainerNode({
   onRemove: () => void;
   onGenerate: () => void;
   onActivate: () => void;
+  onContextMenu: (event: React.MouseEvent) => void;
 }) {
   const refNodes = container.refIds
     .map((rid) => nodes.find((n) => n.id === rid))
@@ -5856,7 +5949,7 @@ function PendingContainerNode({
         e.stopPropagation();
         onActivate();
       }}
-      onContextMenu={(e) => e.preventDefault()}
+      onContextMenu={onContextMenu}
     >
       {/* 编辑态 scale(s / zoom) 抵消相机；生成态回到 scale(s)，成为普通画布卡片。 */}
       <div
