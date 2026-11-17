@@ -31,7 +31,7 @@ def _run(*args: str, timeout: int = 60):
     if result.returncode:
         detail = result.stderr.decode(errors="replace").strip()
         if "not logged in" in detail.lower():
-            raise ValueError("OpenArt 尚未登录，请运行项目中的 openart-login.command 完成登录")
+            raise ValueError("OpenArt 尚未登录，请先在终端运行 openart login 完成登录")
         if "timeout" in detail.lower() or "deadline exceeded" in detail.lower():
             raise ValueError("OpenArt 请求超时；请先检查 OpenArt 生成记录，任务可能已提交，请勿直接重试以免重复扣点")
         raise ValueError(f"OpenArt 请求失败：{detail[-1200:] or 'CLI 执行失败'}")

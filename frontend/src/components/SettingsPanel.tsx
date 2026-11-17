@@ -743,7 +743,7 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
               fetchModels={() => listModels({ kind: "image", provider: "openart", api_key: "", base_url: "" })}
             />
             <div style={{ color: "#999", fontSize: 12, marginTop: 6 }}>
-              首次使用请点下方“测试连接”；未登录时运行项目中的 openart-login.command。
+              首次使用请点下方“测试连接”；未登录时先在终端运行 openart login。
             </div>
           </>
         ) : (

@@ -172,7 +172,7 @@ class OpenArtTests(unittest.TestCase):
                 module._run("generate", "image", "test", timeout=300)
             self.assertEqual(run.call_count, 1)
         with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 1, b"", b"not logged in")):
-            with self.assertRaisesRegex(ValueError, "openart-login.command"):
+            with self.assertRaisesRegex(ValueError, "openart login"):
                 module._run("account")
 
 
