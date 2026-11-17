@@ -67,6 +67,8 @@ const EDITOR_ACTIONS: Array<{ action: keyof EditorShortcutConfig; label: string 
 
 type Tool = "brush" | "eraser" | "lasso" | "rect" | "wand" | "sketch";
 type ViewMode = "overlay" | "outline";
+// 鼠标与触控事件共用的坐标/按键字段集合（原有鼠标逻辑接收 pointer 事件时使用）
+type MaskPointerEvent = React.MouseEvent<HTMLCanvasElement> | React.PointerEvent<HTMLCanvasElement>;
 
 const MASK_RGB = { r: 167, g: 139, b: 250 }; // 品牌紫
 const MAX_UNDO = 20;
@@ -150,6 +152,20 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
   const panStartRef = useRef({ px: 0, py: 0, tx: 0, ty: 0 });
   const viewModeRef = useRef<ViewMode>("overlay");
   viewModeRef.current = viewMode;
+
+  // ===== 触屏 / 触控笔输入状态（鼠标仍走原有 mouse 逻辑）=====
+  // 手指绘制开关：默认关闭，只有笔/鼠标能画；开启后单指涂抹
+  const [fingerDraw, setFingerDraw] = useState(false);
+  const fingerDrawRef = useRef(fingerDraw);
+  fingerDrawRef.current = fingerDraw;
+  // 是否出现过触摸/笔输入：出现后才展示「手指绘制」开关，纯鼠标 PC 看不到这个按钮
+  const [hasTouch, setHasTouch] = useState(false);
+  // 笔按下期间忽略所有触摸指针（手掌抑制）
+  const penDownRef = useRef(false);
+  const activePointerIdRef = useRef<number | null>(null);
+  const touchPointsRef = useRef(new Map<number, { x: number; y: number }>());
+  const gestureRef = useRef<{ dist: number; midX: number; midY: number; s: number; tx: number; ty: number } | null>(null);
+  const touchPanRef = useRef<{ x: number; y: number; tx: number; ty: number; id: number } | null>(null);
 
   // ===== 视图变换 =====
   const applyTransform = useCallback(() => {
@@ -621,8 +637,8 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
     commitMask();
   };
 
-  // ===== 鼠标事件 =====
-  const onMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+  // ===== 鼠标事件（PC 原有逻辑保持不变，仅由 pointer 事件里的 mouse 分支调用）=====
+  const handleMouseDown = (e: MaskPointerEvent) => {
     // 平移：按住空格 + 左键，或中键
     if (spaceRef.current || e.button === 1) {
       panningRef.current = true;
@@ -662,7 +678,7 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
     }
   };
 
-  const onMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+  const handleMouseMove = (e: MaskPointerEvent) => {
     if (panningRef.current) {
       const t = transformRef.current;
       transformRef.current = {
@@ -729,7 +745,7 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
     ctx.restore();
   };
 
-  const onMouseUp = (e: React.MouseEvent<HTMLCanvasElement>) => {
+  const handleMouseUp = (e: MaskPointerEvent) => {
     if (panningRef.current) {
       panningRef.current = false;
       return;
@@ -772,6 +788,251 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
     } else if (tool === "sketch") {
       sketchLastPosRef.current = null;
     }
+  };
+
+  // ===== 触控笔 / 触摸输入：与鼠标逻辑隔离，鼠标仍走上面的 handleMouse* =====
+  /** 笔或手指开始落笔（工具行为与鼠标一致，但不涉及鼠标特有的 panning） */
+  const beginStroke = (pos: { x: number; y: number }, pointerId: number) => {
+    activePointerIdRef.current = pointerId;
+    if (tool === "brush" || tool === "eraser") {
+      pushUndo();
+      drawingRef.current = true;
+      lastPosRef.current = pos;
+      strokeTo(pos);
+    } else if (tool === "lasso") {
+      pushUndo();
+      drawingRef.current = true;
+      lastPosRef.current = pos;
+      lassoRef.current = [pos];
+    } else if (tool === "rect") {
+      pushUndo();
+      drawingRef.current = true;
+      lastPosRef.current = pos;
+      rectStartRef.current = pos;
+    } else if (tool === "wand") {
+      pushUndo();
+      floodFillSelect(pos);
+      commitMask();
+    } else if (tool === "sketch") {
+      drawingRef.current = true;
+      sketchLastPosRef.current = null;
+      sketchTo(pos);
+    }
+  };
+
+  const continueStroke = (pos: { x: number; y: number }) => {
+    if (!drawingRef.current) return;
+    if (tool === "brush" || tool === "eraser") {
+      strokeTo(pos);
+    } else if (tool === "lasso") {
+      lastPosRef.current = pos;
+      lassoRef.current.push(pos);
+      renderLassoPreview();
+    } else if (tool === "rect") {
+      lastPosRef.current = pos;
+      renderRectPreview(pos);
+    } else if (tool === "sketch") {
+      sketchTo(pos);
+    }
+  };
+
+  /** 结束笔画：笔抬起、第二根手指落下、pointercancel 时调用 */
+  const finishStroke = () => {
+    if (!drawingRef.current) return;
+    drawingRef.current = false;
+    const mask = logicMaskRef.current;
+    const mctx = mask?.getContext("2d");
+    const end = lastPosRef.current;
+
+    if (tool === "lasso" && mctx && lassoRef.current.length >= 2) {
+      const path = lassoRef.current;
+      mctx.save();
+      mctx.fillStyle = "#ffffff";
+      mctx.beginPath();
+      mctx.moveTo(path[0].x, path[0].y);
+      for (let i = 1; i < path.length; i++) mctx.lineTo(path[i].x, path[i].y);
+      mctx.closePath();
+      mctx.fill();
+      mctx.restore();
+      lassoRef.current = [];
+      lastPosRef.current = null;
+      commitMask();
+    } else if (tool === "rect" && mctx && rectStartRef.current && end) {
+      const start = rectStartRef.current;
+      mctx.save();
+      mctx.fillStyle = "#ffffff";
+      mctx.fillRect(
+        Math.min(start.x, end.x),
+        Math.min(start.y, end.y),
+        Math.abs(end.x - start.x),
+        Math.abs(end.y - start.y),
+      );
+      mctx.restore();
+      rectStartRef.current = null;
+      lastPosRef.current = null;
+      commitMask();
+    } else if (tool === "brush" || tool === "eraser") {
+      lastPosRef.current = null;
+      commitMask();
+    } else if (tool === "sketch") {
+      sketchLastPosRef.current = null;
+    }
+  };
+
+  /** 取消当前笔画（双指手势抢夺单指、或笔接管手指输入时）：回滚到落笔前的蒙版 */
+  const cancelStroke = () => {
+    if (!drawingRef.current) return;
+    drawingRef.current = false;
+    lastPosRef.current = null;
+    lassoRef.current = [];
+    rectStartRef.current = null;
+    sketchLastPosRef.current = null;
+    const url = undoRef.current.pop();
+    if (url) {
+      setUndoLen(undoRef.current.length);
+      restoreMask(url);
+    }
+  };
+
+  const onPointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    // 鼠标：完全沿用原有逻辑，PC 行为不变
+    if (e.pointerType === "mouse") {
+      handleMouseDown(e);
+      return;
+    }
+    if (!hasTouch) setHasTouch(true);
+    e.preventDefault();
+
+    if (e.pointerType === "pen") {
+      penDownRef.current = true;
+      // 笔优先：回滚手指刚开始的笔画，并清掉手指遗留的平移/手势状态
+      if (activePointerIdRef.current !== null) {
+        cancelStroke();
+        activePointerIdRef.current = null;
+      }
+      touchPointsRef.current.clear();
+      touchPanRef.current = null;
+      gestureRef.current = null;
+      e.currentTarget.setPointerCapture(e.pointerId);
+      beginStroke(getPos(e), e.pointerId);
+      return;
+    }
+
+    // 手指：笔按下期间全部忽略（手掌抑制）
+    if (penDownRef.current) return;
+    touchPointsRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    e.currentTarget.setPointerCapture(e.pointerId);
+
+    if (touchPointsRef.current.size === 2) {
+      // 双指手势优先：回滚单指已开始的笔画，结束单指平移
+      if (activePointerIdRef.current !== null) {
+        cancelStroke();
+        activePointerIdRef.current = null;
+      }
+      touchPanRef.current = null;
+      const [a, b] = [...touchPointsRef.current.values()];
+      const t = transformRef.current;
+      gestureRef.current = {
+        dist: Math.max(1, Math.hypot(a.x - b.x, a.y - b.y)),
+        midX: (a.x + b.x) / 2,
+        midY: (a.y + b.y) / 2,
+        s: t.s,
+        tx: t.tx,
+        ty: t.ty,
+      };
+      return;
+    }
+    if (touchPointsRef.current.size > 2) return;
+
+    if (fingerDrawRef.current) {
+      beginStroke(getPos(e), e.pointerId);
+    } else {
+      // 手指绘制关闭时：单指平移画布
+      const t = transformRef.current;
+      touchPanRef.current = { x: e.clientX, y: e.clientY, tx: t.tx, ty: t.ty, id: e.pointerId };
+    }
+  };
+
+  const onPointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (e.pointerType === "mouse") {
+      handleMouseMove(e);
+      return;
+    }
+
+    if (e.pointerType === "pen") {
+      if (activePointerIdRef.current !== e.pointerId || !drawingRef.current) return;
+      continueStroke(getPos(e));
+      return;
+    }
+
+    const tracked = touchPointsRef.current.get(e.pointerId);
+    if (!tracked) return;
+    tracked.x = e.clientX;
+    tracked.y = e.clientY;
+
+    // 双指：缩放 + 平移（以两指中点为锚点）
+    const gesture = gestureRef.current;
+    if (gesture && touchPointsRef.current.size >= 2) {
+      const [a, b] = [...touchPointsRef.current.values()];
+      const dist = Math.max(1, Math.hypot(a.x - b.x, a.y - b.y));
+      const midX = (a.x + b.x) / 2;
+      const midY = (a.y + b.y) / 2;
+      const nextScale = Math.min(8, Math.max(0.2, gesture.s * (dist / gesture.dist)));
+      const k = nextScale / gesture.s;
+      transformRef.current = {
+        s: nextScale,
+        tx: midX - (gesture.midX - gesture.tx) * k,
+        ty: midY - (gesture.midY - gesture.ty) * k,
+      };
+      applyTransform();
+      return;
+    }
+
+    // 单指平移（手指绘制关闭时）
+    const pan = touchPanRef.current;
+    if (pan && pan.id === e.pointerId) {
+      const t = transformRef.current;
+      transformRef.current = {
+        s: t.s,
+        tx: pan.tx + (e.clientX - pan.x),
+        ty: pan.ty + (e.clientY - pan.y),
+      };
+      applyTransform();
+      return;
+    }
+
+    if (activePointerIdRef.current === e.pointerId && drawingRef.current) {
+      continueStroke(getPos(e));
+    }
+  };
+
+  const onPointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (e.pointerType === "mouse") {
+      handleMouseUp(e);
+      return;
+    }
+
+    if (e.pointerType === "pen") {
+      penDownRef.current = false;
+      if (activePointerIdRef.current === e.pointerId) {
+        finishStroke();
+        activePointerIdRef.current = null;
+      }
+      return;
+    }
+
+    touchPointsRef.current.delete(e.pointerId);
+    if (touchPointsRef.current.size < 2) gestureRef.current = null;
+    if (touchPanRef.current?.id === e.pointerId) touchPanRef.current = null;
+    if (activePointerIdRef.current === e.pointerId) {
+      finishStroke();
+      activePointerIdRef.current = null;
+    }
+  };
+
+  const onPointerLeave = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    // 鼠标保留原有“拖出画布即结束”的行为；笔/手指有 pointer capture，不在此结束
+    if (e.pointerType === "mouse") handleMouseUp(e);
   };
 
   // ===== 清除 =====
@@ -1140,6 +1401,22 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
           >
             草图
           </button>
+          {hasTouch && (
+            <button
+              onClick={() => setFingerDraw((v) => !v)}
+              style={{
+                ...btnBase,
+                background: fingerDraw ? "rgba(167, 139, 250, 0.8)" : "rgba(255, 255, 255, 0.1)",
+              }}
+              title={
+                fingerDraw
+                  ? "手指绘制已开启：单指涂抹，双指缩放/平移"
+                  : "手指绘制已关闭：笔/鼠标涂画，单指平移，双指缩放"
+              }
+            >
+              手指绘制{fingerDraw ? "开" : "关"}
+            </button>
+          )}
         </div>
 
         {/* 草图可用性与提示 */}
@@ -1147,6 +1424,7 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
           {sketchHint || (sketchEnabled
             ? "草图笔：画出想要的样子，线条会被自动清理"
             : "当前模型不支持草图，用画笔圈选区域即可")}
+          {hasTouch && !fingerDraw ? "；触屏可用笔涂画，单指平移、双指缩放" : ""}
         </div>
 
         {/* 笔刷大小 / 魔棒阈值（按工具切换） */}
@@ -1214,11 +1492,10 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
         </div>
 
         <button
-          onMouseDown={() => setViewOriginal(true)}
-          onMouseUp={() => setViewOriginal(false)}
-          onMouseLeave={() => setViewOriginal(false)}
-          onTouchStart={() => setViewOriginal(true)}
-          onTouchEnd={() => setViewOriginal(false)}
+          onPointerDown={() => setViewOriginal(true)}
+          onPointerUp={() => setViewOriginal(false)}
+          onPointerCancel={() => setViewOriginal(false)}
+          onPointerLeave={() => setViewOriginal(false)}
           style={{ ...btnBase, background: viewOriginal ? "rgba(99, 102, 241, 0.6)" : "rgba(255, 255, 255, 0.1)" }}
         >
           {viewOriginal ? "正在查看原图" : "按住查看原图"}
@@ -1272,6 +1549,8 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
             flex: 1,
             overflow: "hidden",
             minWidth: 0,
+            // 触屏：画布区域禁用原生滚动/缩放，手势由组件自己处理
+            touchAction: "none",
           }}
         >
           {isLoading && (
@@ -1311,15 +1590,19 @@ export function MaskEditor({ imageUrl, width, height, experiences, initialPrompt
               {/* 可视/交互层 */}
               <canvas
                 ref={displayCanvasRef}
-                onMouseDown={onMouseDown}
-                onMouseMove={onMouseMove}
-                onMouseUp={onMouseUp}
-                onMouseLeave={onMouseUp}
+                onPointerDown={onPointerDown}
+                onPointerMove={onPointerMove}
+                onPointerUp={onPointerUp}
+                onPointerCancel={onPointerUp}
+                onPointerLeave={onPointerLeave}
                 style={{
                   position: "absolute",
                   top: 0,
                   left: 0,
                   cursor: cursorFor(),
+                  // 触屏：画布自己接管手势，避免浏览器滚动/长按打断笔画
+                  touchAction: "none",
+                  WebkitUserSelect: "none",
                   visibility: viewOriginal ? "hidden" : "visible",
                 }}
               />

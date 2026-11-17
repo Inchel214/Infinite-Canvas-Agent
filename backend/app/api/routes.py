@@ -1404,31 +1404,101 @@ def get_providers():
     return {"providers": PROVIDER_PRESETS}
 
 
-@router.get("/network/ips", summary="获取本机局域网 IPv4 列表")
-def get_network_ips():
-    """枚举本机可用的局域网 IPv4，供前端生成"手机/平板扫码访问"二维码。
+# 虚拟网卡名称关键字：这类地址局域网其他设备通常不可达，扫了也打不开
+_VIRTUAL_IFACE_HINTS = (
+    "vmware", "vmnet", "vbox", "virtualbox", "hyper-v", "vethernet", "docker",
+    "wsl", "loopback", "tailscale", "zerotier", "wireguard", "tun", "tap",
+    "vpn", "utun", "ppp", "bluetooth", "isatap", "teredo",
+)
 
-    两条来源互补：UDP 探测默认出口网卡地址 + 主机名解析（多网卡时更全）；
-    只保留可被局域网其他设备访问的地址，过滤回环与自动私有地址（169.254）。
-    """
-    ips: set[str] = set()
+# 与前端 base.ts 推导的端口保持一致：平板打开页面后会直连 <本机IP>:8000
+_BACKEND_PORT = 8000
+
+
+def _default_route_ip() -> str:
+    """UDP 探测默认出口网卡地址。不真正发包，离线时可能失败。"""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
-            # 不真正发包，只让内核选出默认出口网卡对应的地址（离线时可能失败）
             probe.connect(("8.8.8.8", 80))
-            ips.add(probe.getsockname()[0])
+            return probe.getsockname()[0]
     except OSError:
-        pass
+        return ""
+
+
+def _is_virtual_iface(name: str) -> bool:
+    lowered = name.lower()
+    return any(hint in lowered for hint in _VIRTUAL_IFACE_HINTS)
+
+
+def _backend_listening(ip: str) -> bool:
+    """自连一次本机地址的后端端口。
+
+    用来识别"后端只绑了 127.0.0.1"这种启动方式：此时平板即使打开了页面，
+    API 也会全部失败（白屏）。注意本机自连不经过外部网卡，不能代表防火墙已放行。
+    """
+    try:
+        with socket.create_connection((ip, _BACKEND_PORT), timeout=0.35):
+            return True
+    except OSError:
+        return False
+
+
+@router.get("/network/ips", summary="获取本机局域网 IPv4 列表")
+def get_network_ips():
+    """枚举本机局域网地址，供前端生成"手机/平板扫码访问"二维码。
+
+    多网卡机器（有线+WiFi、VMware/Docker/VPN 虚拟网卡）只凭默认路由或主机名解析
+    很容易给出平板根本到不了的地址，所以这里逐网卡枚举并带上名称与状态，
+    让前端能把"哪个地址更可能可用"展示给用户，而不是只甩一串 IP。
+    """
+    default_ip = _default_route_ip()
+    candidates: dict[str, dict] = {}
+
+    def add(ip: str, iface: str = "") -> None:
+        if not ip or ip.startswith("127.") or ip.startswith("169.254.") or ip == "0.0.0.0":
+            return
+        # 已记录过就补充网卡名（psutil 不可用时由主机名解析兜底，名称为空）
+        entry = candidates.setdefault(ip, {"ip": ip, "interface": iface})
+        if iface and not entry["interface"]:
+            entry["interface"] = iface
+
+    try:
+        import psutil  # 可选依赖：缺失时退化为默认路由 + 主机名解析
+    except ImportError:
+        psutil = None
+
+    if psutil is not None:
+        try:
+            stats = psutil.net_if_stats()
+            for name, addrs in psutil.net_if_addrs().items():
+                # down 的网卡（例如没插网线的有线口）地址仍在配置里，但不可用
+                if name in stats and not stats[name].isup:
+                    continue
+                for addr in addrs:
+                    if addr.family == socket.AF_INET:
+                        add(addr.address, name)
+        except Exception as exc:  # 平台差异不应影响接口可用性
+            logger.warning("枚举网卡失败，退回默认路由探测: %s", exc)
+
+    add(default_ip)
     try:
         for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-            ips.add(info[4][0])
+            add(info[4][0])
     except OSError:
         pass
-    usable = sorted(
-        ip for ip in ips
-        if not ip.startswith("127.") and not ip.startswith("169.254.")
-    )
-    return {"ips": usable}
+
+    result = []
+    for entry in candidates.values():
+        ip = entry["ip"]
+        result.append({
+            **entry,
+            "isDefault": ip == default_ip,
+            "virtual": _is_virtual_iface(entry["interface"]),
+            "listening": _backend_listening(ip),
+        })
+    # 默认出口（最接近真实上网的那张卡）优先，其次物理网卡，虚拟网卡排最后
+    result.sort(key=lambda item: (not item["isDefault"], item["virtual"], item["ip"]))
+    return {"interfaces": result, "backendPort": _BACKEND_PORT}
 
 
 def _err_snippet(resp: requests.Response) -> str:

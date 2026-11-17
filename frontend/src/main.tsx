@@ -22,6 +22,18 @@ if (apiToken) {
 // 全局错误捕获（window.onerror / unhandledrejection / 页面离开前 flush）
 installGlobalErrorReporting()
 
+// 标记真实出现过的输入源：只有触摸/笔真的用过，才启用触屏专属样式（如输入框 16px）。
+// 纯鼠标 PC（含带触屏但只用鼠标的笔记本）不会被 @media (pointer: coarse) 误伤。
+window.addEventListener(
+  'pointerdown',
+  (e) => {
+    if (e.pointerType === 'touch' || e.pointerType === 'pen') {
+      document.documentElement.dataset.input = e.pointerType
+    }
+  },
+  { capture: true, passive: true }
+)
+
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <ErrorBoundary>

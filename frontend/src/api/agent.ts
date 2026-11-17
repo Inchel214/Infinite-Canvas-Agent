@@ -780,11 +780,23 @@ export async function getProviders(): Promise<{
 }
 
 // 本机局域网 IPv4 列表（"手机/平板扫码访问"面板用来生成地址与二维码）
-export async function getLanIps(): Promise<string[]> {
+export interface LanInterface {
+  ip: string;
+  /** 网卡名（psutil 不可用时为空） */
+  interface: string;
+  /** 是否默认路由出口网卡，通常就是平板该扫的那个 */
+  isDefault: boolean;
+  /** 虚拟网卡（VMware/Docker/VPN 等），平板一般到不了 */
+  virtual: boolean;
+  /** 后端是否监听在该地址上（本机自测，不代表防火墙已放行） */
+  listening: boolean;
+}
+
+export async function getLanInterfaces(): Promise<LanInterface[]> {
   const res = await fetch(`${API_BASE}/network/ips`);
   if (!res.ok) throw new Error(`${res.status}`);
   const data = await res.json();
-  return Array.isArray(data.ips) ? data.ips : [];
+  return Array.isArray(data.interfaces) ? data.interfaces : [];
 }
 
 export async function testSettings(
