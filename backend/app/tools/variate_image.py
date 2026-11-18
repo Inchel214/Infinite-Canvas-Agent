@@ -4,6 +4,7 @@ from __future__ import annotations
 import uuid
 
 from app.canvas.state import CanvasNode, CanvasState
+from app.feedback import make_recipe
 from app.image.base import BaseImageGenerator
 from app.tools.base import BaseTool, ToolResult
 from app.tools.layout import next_position_near
@@ -22,7 +23,7 @@ class VariateImageTool(BaseTool):
             "y": {"type": "number", "description": "新图放置位置 y"},
             "size": {
                 "type": "string",
-                "description": "生成尺寸：'1K'/'2K'/'4K'，或 '宽x高' 具体像素（如 2048x1152）",
+                "description": "生成尺寸：'2K'/'4K' 分辨率档位（不要传 1K/8K 等其他档位），或 '宽x高' 具体像素（如 2048x1152）",
             },
         },
         "required": ["node_id", "prompt"],
@@ -81,6 +82,12 @@ class VariateImageTool(BaseTool):
             content=prompt,
             image_url=result.image_url,
             source_ids=[node_id],
+            recipe=make_recipe(
+                prompt,
+                style=str(kwargs.get("style", "") or ""),
+                size=size,
+                model=str(getattr(self.image_generator, "model", "") or ""),
+            ),
         )
         state.add_node(node)
         return ToolResult(

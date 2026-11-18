@@ -7,6 +7,7 @@ import {
   clearChatHistory,
   stopAgent,
   respondToAgent,
+  notifyAgentActivity,
   getStreamSnapshot,
   beginRound,
   undoRound,
@@ -26,6 +27,8 @@ type Segment =
       result: string;
       success?: boolean;
       pending: boolean;
+      /** 工具产出的新节点（图片预览与"定位"用） */
+      data?: { node_id?: string; image_url?: string };
     };
 
 // 面板内展示条目：assistant 携带时间线段（实时流/回放/历史 timeline 三条路径统一结构）
@@ -198,6 +201,7 @@ function reduceStreamEvent(
               result: evt.result || "",
               success: evt.success,
               pending: false,
+              data: evt.data as { node_id?: string; image_url?: string } | undefined,
             };
             break;
           }
@@ -313,6 +317,7 @@ function buildHistoryEntries(
               args: s.args,
               result: s.result || "",
               success: s.success,
+              data: s.data as { node_id?: string; image_url?: string } | undefined,
             }) as TimelineSegment
         ),
         ...(m.content ? [{ kind: "text", text: m.content } as TimelineSegment] : []),
@@ -336,7 +341,11 @@ function buildHistoryEntries(
         cur = { role: "assistant", content: "", segments: [], timestamp: 0 };
         entries.push(cur);
       } else if (seg.kind === "tool") {
-        cur.segments!.push({ ...seg, pending: false });
+        cur.segments!.push({
+          ...seg,
+          pending: false,
+          data: seg.data as { node_id?: string; image_url?: string } | undefined,
+        });
       } else {
         cur.segments!.push({ ...seg } as Segment);
       }
@@ -344,6 +353,31 @@ function buildHistoryEntries(
     cur.content = m.content;
   }
   return entries;
+}
+
+/**
+ * 新图相对画布已有内容的方位描述：告诉用户"新图放在哪了"。
+ * 以其余节点的包围盒中心为参照，只在偏移超过内容跨度 20% 时才标注方向。
+ */
+function describeNodePlacement(nodeId: string, nodes: CanvasNode[]): string {
+  const target = nodes.find((n) => n.id === nodeId);
+  const others = nodes.filter((n) => n.id !== nodeId);
+  if (!target || others.length === 0) return "";
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const n of others) {
+    minX = Math.min(minX, n.x);
+    minY = Math.min(minY, n.y);
+    maxX = Math.max(maxX, n.x + n.width);
+    maxY = Math.max(maxY, n.y + n.height);
+  }
+  const dx = target.x + target.width / 2 - (minX + maxX) / 2;
+  const dy = target.y + target.height / 2 - (minY + maxY) / 2;
+  const left = Math.abs(dx) > (maxX - minX) * 0.2 ? (dx > 0 ? "右" : "左") : "";
+  const vertical = Math.abs(dy) > (maxY - minY) * 0.2 ? (dy > 0 ? "下" : "上") : "";
+  if (left && vertical) return `画布${left}${vertical}方`;
+  if (left) return dx > 0 ? "画布右侧" : "画布左侧";
+  if (vertical) return dy > 0 ? "画布下方" : "画布上方";
+  return "画布中央";
 }
 
 interface ChatPanelProps {
@@ -361,7 +395,15 @@ interface ChatPanelProps {
   onClearRefs: () => void;
   // Agent 操作画布后（生成/移动/删除节点）通知上层刷新画布状态
   onCanvasUpdate: (canvas: CanvasState) => void;
+  // 点击工具卡片"定位"：把对应新节点移到视野中央并短暂高亮
+  onLocateNode?: (nodeId: string) => void;
+  // 外部（另一端设备）写入画布时递增的同步信号：用于拉取最新对话历史
+  syncToken?: number;
+  // 该画布当前生成中的任务数（含另一端发起的）；本端未流式时用于提示
+  remoteGenerating?: number;
 }
+
+const DEFAULT_ASK_USER_TIMEOUT = 300;
 
 const TOOL_LABELS: Record<string, string> = {
   generate_image: "文生图",
@@ -384,6 +426,7 @@ function AskUserCard({
   answered,
   response,
   onRespond,
+  onActivity,
 }: {
   question: string;
   options?: string[];
@@ -393,26 +436,45 @@ function AskUserCard({
   answered?: boolean;
   response?: string;
   onRespond: (response: string) => void;
+  onActivity: () => void;
 }) {
   const [inputValue, setInputValue] = useState("");
-  const [remaining, setRemaining] = useState(timeout || 120);
+  const [remaining, setRemaining] = useState(timeout || DEFAULT_ASK_USER_TIMEOUT);
+  const [activityTime, setActivityTime] = useState(startTime || Date.now());
+  const lastActivitySent = useRef(0);
 
-  // 倒计时效果
+  useEffect(() => {
+    setActivityTime(startTime || Date.now());
+    setRemaining(timeout || DEFAULT_ASK_USER_TIMEOUT);
+  }, [startTime, timeout]);
+
+  // 连续无操作倒计时：输入或聚焦输入框会重新开始计时
   useEffect(() => {
     if (answered || !startTime) return;
-    
+
     const interval = setInterval(() => {
-      const elapsed = Math.floor((Date.now() - startTime) / 1000);
-      const left = Math.max(0, (timeout || 120) - elapsed);
+      const elapsed = Math.floor((Date.now() - activityTime) / 1000);
+      const left = Math.max(0, (timeout || DEFAULT_ASK_USER_TIMEOUT) - elapsed);
       setRemaining(left);
-      
+
       if (left === 0) {
         clearInterval(interval);
       }
     }, 1000);
-    
+
     return () => clearInterval(interval);
-  }, [answered, startTime, timeout]);
+  }, [answered, startTime, activityTime, timeout]);
+
+  const notifyActivity = () => {
+    const now = Date.now();
+    setActivityTime(now);
+    setRemaining(timeout || DEFAULT_ASK_USER_TIMEOUT);
+    // 本地每次都重置；后端每 5 秒最多上报一次，避免逐键发送请求。
+    if (now - lastActivitySent.current >= 5000) {
+      lastActivitySent.current = now;
+      onActivity();
+    }
+  };
 
   const handleSubmit = (value: string) => {
     if (!value.trim()) return;
@@ -499,7 +561,11 @@ function AskUserCard({
             <input
               type="text"
               value={inputValue}
-              onChange={(e) => setInputValue(e.target.value)}
+              onFocus={notifyActivity}
+              onChange={(e) => {
+                setInputValue(e.target.value);
+                notifyActivity();
+              }}
               onKeyDown={(e) => {
                 if (e.key === "Enter") {
                   handleSubmit(inputValue);
@@ -536,8 +602,8 @@ function AskUserCard({
           {timeout && (
             <div style={{ fontSize: 11, color: "#666", fontStyle: "italic" }}>
               {default_action 
-                ? `⏱ ${Math.floor(timeout / 60)} 分钟未回复将自动：${default_action}`
-                : `⏱ ${Math.floor(timeout / 60)} 分钟未回复将由 Agent 自行决策`}
+                ? `⏱ ${Math.floor(timeout / 60)} 分钟未操作将自动：${default_action}`
+                : `⏱ ${Math.floor(timeout / 60)} 分钟未操作将由 Agent 自行决策`}
             </div>
           )}
         </div>
@@ -824,6 +890,9 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
   canvasNodes,
   onClearRefs,
   onCanvasUpdate,
+  onLocateNode,
+  syncToken = 0,
+  remoteGenerating = 0,
 }: ChatPanelProps, ref) {
   const [entries, setEntries] = useState<ChatEntry[]>([]);
   // 输入区是否有内容（文本或引用芯片）：驱动发送按钮禁用态
@@ -853,6 +922,31 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
   // Agent 是否执行中（存在直播中的 assistant 条目）：思考指示/停止按钮据此显示。
   // 执行中用户可继续输入，消息进入队列（steering 注入或下一轮执行）。
   const sending = entries.some((e) => e.role === "assistant" && e.live);
+  // 供同步副作用读取最新值（避免把 entries 放进依赖导致频繁重建）
+  const sendingRef = useRef(false);
+  sendingRef.current = sending;
+
+  // 另一端设备写入画布（syncToken 变化）时，拉取最新对话历史，实现跨端对话同步。
+  // 本端正在流式时跳过，避免覆盖直播条目；任务结束后下一轮同步会补齐。
+  const lastSyncTokenRef = useRef(syncToken);
+  useEffect(() => {
+    if (syncToken === lastSyncTokenRef.current) return;
+    lastSyncTokenRef.current = syncToken;
+    if (!canvasId || sendingRef.current) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const { messages, runs } = await getChatHistory(canvasId);
+        if (cancelled || sendingRef.current) return;
+        setEntries(buildHistoryEntries(messages, runs));
+      } catch {
+        // 后端短暂不可用：下一轮同步再试
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [syncToken, canvasId]);
 
   // 暴露 saveDraft 方法给父组件（保留接口兼容性，实际草稿已实时保存）
   useImperativeHandle(ref, () => ({
@@ -1455,9 +1549,17 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
           borderBottom: "1px solid rgba(255,255,255,0.08)",
         }}
       >
-        <span style={{ color: "#ddd", fontSize: 14, fontWeight: 600 }}>
-          💬 AI 对话
-        </span>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+          <span style={{ color: "#ddd", fontSize: 14, fontWeight: 600 }}>💬 AI 对话</span>
+          {remoteGenerating > 0 && !sending && (
+            <span
+              title="另一台设备正在这个画布上生成，完成后会自动同步到这里"
+              style={{ fontSize: 11, color: "#c4b5fd", whiteSpace: "nowrap" }}
+            >
+              ● 其他设备生成中
+            </span>
+          )}
+        </div>
         <div data-panel-action style={{ display: "flex", alignItems: "center", gap: 10 }}>
           {panelPosition && <button type="button" onClick={() => setPanelPosition(null)}
             title="恢复面板默认位置" style={{ background: "none", border: 0, color: "#aaa", cursor: "pointer" }}>复位</button>}
@@ -1741,7 +1843,9 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
                         </div>
                       );
                     }
-                    /* 工具调用卡片：按发生顺序穿插在文本流中 */
+                    /* 工具调用卡片：按发生顺序穿插在文本流中；生图结果附缩略图与定位入口 */
+                    const imageUrl = seg.data?.image_url;
+                    const nodeId = seg.data?.node_id;
                     return (
                       <div
                         key={j}
@@ -1754,41 +1858,93 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
                           borderRadius: 8,
                           padding: "6px 10px",
                           display: "flex",
-                          alignItems: "baseline",
-                          gap: 8,
+                          flexDirection: "column",
+                          gap: 6,
                           fontSize: 12,
                         }}
                       >
-                        <span
-                          style={{
-                            background: seg.pending
-                              ? "rgba(99,102,241,0.35)"
-                              : "rgba(99,102,241,0.2)",
-                            color: "#a5b4fc",
-                            padding: "1px 8px",
-                            borderRadius: 4,
-                            fontSize: 11,
-                            flexShrink: 0,
-                          }}
-                        >
-                          {TOOL_LABELS[seg.tool || ""] || seg.tool}
-                        </span>
-                        <span
-                          style={{
-                            color: seg.pending
-                              ? "#818cf8"
-                              : seg.success === false
-                                ? "#f87171"
-                                : "#888",
-                            overflow: "hidden",
-                            textOverflow: "ellipsis",
-                            whiteSpace: "nowrap",
-                            animation: seg.pending ? "chatblink 1.2s infinite" : undefined,
-                          }}
-                          title={seg.result || ""}
-                        >
-                          {seg.pending ? "执行中..." : seg.result || ""}
-                        </span>
+                        <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+                          <span
+                            style={{
+                              background: seg.pending
+                                ? "rgba(99,102,241,0.35)"
+                                : "rgba(99,102,241,0.2)",
+                              color: "#a5b4fc",
+                              padding: "1px 8px",
+                              borderRadius: 4,
+                              fontSize: 11,
+                              flexShrink: 0,
+                            }}
+                          >
+                            {TOOL_LABELS[seg.tool || ""] || seg.tool}
+                          </span>
+                          <span
+                            style={{
+                              flex: 1,
+                              minWidth: 0,
+                              color: seg.pending
+                                ? "#818cf8"
+                                : seg.success === false
+                                  ? "#f87171"
+                                  : "#888",
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              whiteSpace: "nowrap",
+                              animation: seg.pending ? "chatblink 1.2s infinite" : undefined,
+                            }}
+                            title={seg.result || ""}
+                          >
+                            {seg.pending ? "执行中..." : seg.result || ""}
+                          </span>
+                        </div>
+                        {imageUrl && (
+                          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                            <img
+                              src={imageUrl}
+                              alt=""
+                              style={{
+                                width: 48,
+                                height: 48,
+                                objectFit: "cover",
+                                borderRadius: 6,
+                                border: "1px solid rgba(255,255,255,0.12)",
+                                background: "rgba(255,255,255,0.04)",
+                                flexShrink: 0,
+                              }}
+                            />
+                            <span
+                              style={{
+                                flex: 1,
+                                minWidth: 0,
+                                fontSize: 11.5,
+                                color: "#9ca3af",
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                                whiteSpace: "nowrap",
+                              }}
+                            >
+                              {nodeId ? describeNodePlacement(nodeId, canvasNodes) || "已放到画布" : "已放到画布"}
+                            </span>
+                            {nodeId && onLocateNode && (
+                              <button
+                                onClick={() => onLocateNode(nodeId)}
+                                style={{
+                                  flexShrink: 0,
+                                  background: "rgba(99,102,241,0.2)",
+                                  border: "1px solid rgba(99,102,241,0.5)",
+                                  color: "#c7d2fe",
+                                  borderRadius: 6,
+                                  padding: "3px 9px",
+                                  fontSize: 11.5,
+                                  cursor: "pointer",
+                                  fontFamily: "inherit",
+                                }}
+                              >
+                                定位
+                              </button>
+                            )}
+                          </div>
+                        )}
                       </div>
                     );
                   })
@@ -1824,6 +1980,11 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
                   answered={entry.askUser.answered}
                   response={entry.askUser.response}
                   onRespond={handleRespond}
+                  onActivity={() => {
+                    if (canvasId) {
+                      void notifyAgentActivity(canvasId).catch(() => undefined);
+                    }
+                  }}
                 />
               )}
 

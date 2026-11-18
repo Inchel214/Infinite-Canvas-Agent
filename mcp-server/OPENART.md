@@ -9,8 +9,8 @@ upload endpoint; it does not alter the canvas UI or its default image provider.
 
 ## Login
 
-Double-click `openart-login.command` in the project root and complete the browser
-login. Credentials remain in the CLI's `~/.openart/cli-credentials.json`; no key
+Run `openart login` with the installed CLI and complete the browser login.
+Credentials remain in the CLI's `~/.openart/cli-credentials.json`; no key
 belongs in this repository or in MCP configuration.
 
 ## Tools

@@ -38,6 +38,8 @@ function App() {
   const [providers, setProviders] = useState<Record<string, ProviderPreset>>({});
   // 各画布生图任务状态（红点）：canvas_id -> { generating, pending }
   const [badges, setBadges] = useState<Record<string, { generating: number; pending: number }>>({});
+  // 跨端同步信号：轮询发现画布 version 被外部改动时递增，驱动对话历史刷新
+  const [remoteSyncToken, setRemoteSyncToken] = useState(0);
   // 对话引用的图片节点 ID（右键"添加到对话"）：随画布切换清空
   const [chatRefIds, setChatRefIds] = useState<string[]>([]);
   // ChatPanel 开合提升到 App：添加引用时即使面板收起也能自动弹出
@@ -80,6 +82,11 @@ function App() {
   const loadingRef = useRef(false);
   // ChatPanel ref：切换画布前保存草稿
   const chatPanelRef = useRef<ChatPanelRef>(null);
+  // 对话卡片"定位"：token 递增触发画布把新生成节点移到视野中央
+  const [focusRequest, setFocusRequest] = useState<{ nodeId: string; token: number } | null>(null);
+  const handleLocateNode = useCallback((nodeId: string) => {
+    setFocusRequest((prev) => ({ nodeId, token: (prev?.token ?? 0) + 1 }));
+  }, []);
 
   useEffect(() => {
     loadingRef.current = loading;
@@ -272,6 +279,8 @@ function App() {
         const state = await getCanvas(canvasId);
         if (state.version !== canvasVersionRef.current) {
           applyCanvasState(state);
+          // 另一端写入画布：通知对话面板拉取最新历史
+          setRemoteSyncToken((t) => t + 1);
         }
       } catch {
         // 后端重启中等瞬时失败静默，下轮重试
@@ -395,6 +404,7 @@ function App() {
           if (!chatOpen) toggleChatOpen(true);
         }}
         chatDockWidth={chatOpen ? chatWidth : 0}
+        focusRequest={focusRequest}
       />
 
       {/* 右上角入口：画布管理 + 大模型设置 */}
@@ -548,6 +558,9 @@ function App() {
         canvasNodes={canvasState ? Object.values(canvasState.nodes) : []}
         onClearRefs={() => setChatRefIds([])}
         onCanvasUpdate={applyCanvasState}
+        onLocateNode={handleLocateNode}
+        syncToken={remoteSyncToken}
+        remoteGenerating={canvasId ? badges[canvasId]?.generating ?? 0 : 0}
       />
 
       {/* 执行状态提示 */}

@@ -467,6 +467,8 @@ interface CanvasProps {
   chatDockWidth?: number;
   // 新建画布（由应用层提供，供快捷键调用）
   onNewCanvas?: () => void;
+  // 对话卡片"定位"请求：token 变化时把指定节点移到视野中央并短暂高亮
+  focusRequest?: { nodeId: string; token: number } | null;
 }
 
 /**
@@ -475,7 +477,7 @@ interface CanvasProps {
  * 多选：单击/Ctrl+Shift+点选、空白直接拖动框选、右键菜单直接生成
  * 平移：空格+拖动 / Shift+拖动 / 鼠标中键拖动
  */
-export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved, onAction, onCanvasUpdate, onAddToChat, chatDockWidth = 0, onNewCanvas }: CanvasProps) {
+export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved, onAction, onCanvasUpdate, onAddToChat, chatDockWidth = 0, onNewCanvas, focusRequest }: CanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   // 相机视角存档：每个画布记住用户上次停留的视角（localStorage），切回/刷新时还原。
   // 否则切画布时组件重挂载、视角重置到世界原点——内容不在原点附近时就表现为"画布空白不显示"
@@ -732,6 +734,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   const dragStartPosRef = useRef<{ x: number; y: number } | null>(null);
   // 触屏长按 = 右键：定时器在按住不动 500ms 后打开操作菜单
   const longPressRef = useRef<{ timer: number; x: number; y: number } | null>(null);
+  // 最近一次按下的输入源：用于判断 contextmenu 是否来自长按（触摸/笔），避免误伤鼠标右键
+  const lastPointerTypeRef = useRef<string>("mouse");
   const cancelLongPress = useCallback(() => {
     if (longPressRef.current) {
       window.clearTimeout(longPressRef.current.timer);
@@ -758,6 +762,15 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   const [managedCollectionId, setManagedCollectionId] = useState<string | null>(null);
   const managedCollection = collections.views.find((group) => group.id === managedCollectionId);
   const displayBounds = useMemo(() => [...collections.visibleNodes, ...collections.views.filter((group) => group.collapsed)], [collections.visibleNodes, collections.views]);
+  // 对话卡片"定位"：镜头跳转时读最新节点与面板宽度，避免它们变化导致重复触发
+  const nodesRef = useRef(nodes);
+  nodesRef.current = nodes;
+  const chatDockWidthRef = useRef(chatDockWidth);
+  chatDockWidthRef.current = chatDockWidth;
+  const [highlightNodeId, setHighlightNodeId] = useState<string | null>(null);
+  const [cameraAnimating, setCameraAnimating] = useState(false);
+  const highlightTimerRef = useRef<number | null>(null);
+  const cameraAnimTimerRef = useRef<number | null>(null);
   const connectionBounds = (node: CanvasNode): BBox => collections.collapsedByNode.get(node.id) ?? node;
 
   // 自动整理菜单：轻整理（最小位移） / 语义分区（按连线与分组收块）
@@ -1230,6 +1243,46 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     }
   }, [canvasState, fitAllNodes]);
 
+  // 对话卡片"定位"：把指定节点平稳移到可视区中央（避开右侧对话面板），并高亮提示位置
+  useEffect(() => {
+    if (!focusRequest) return;
+    const node = nodesRef.current.find((n) => n.id === focusRequest.nodeId);
+    const container = containerRef.current;
+    if (!node || !container) return;
+    const cw = container.clientWidth;
+    const ch = container.clientHeight;
+    const availW = Math.max(240, cw - chatDockWidthRef.current);
+    const targetZoom = Math.min(
+      1,
+      Math.max(0.15, Math.min((availW * 0.6) / node.width, (ch * 0.6) / node.height)),
+    );
+    setCameraAnimating(true);
+    setZoom(targetZoom);
+    setPan({
+      x: availW / 2 - (node.x + node.width / 2) * targetZoom,
+      y: ch / 2 - (node.y + node.height / 2) * targetZoom,
+    });
+    // 定位是用户主动操作：之后不再让节点增减自动接管视角
+    userPannedRef.current = true;
+    setHighlightNodeId(node.id);
+    if (highlightTimerRef.current !== null) window.clearTimeout(highlightTimerRef.current);
+    highlightTimerRef.current = window.setTimeout(() => {
+      highlightTimerRef.current = null;
+      setHighlightNodeId(null);
+    }, 2400);
+    if (cameraAnimTimerRef.current !== null) window.clearTimeout(cameraAnimTimerRef.current);
+    cameraAnimTimerRef.current = window.setTimeout(() => {
+      cameraAnimTimerRef.current = null;
+      setCameraAnimating(false);
+    }, 420);
+  }, [focusRequest?.token]);
+
+  // 卸载时清理高亮/动画定时器
+  useEffect(() => () => {
+    if (highlightTimerRef.current !== null) window.clearTimeout(highlightTimerRef.current);
+    if (cameraAnimTimerRef.current !== null) window.clearTimeout(cameraAnimTimerRef.current);
+  }, []);
+
   // 滚轮缩放：原生非 passive 监听（React onWheel 是 passive，preventDefault 无效）
   // rAF 合帧：同一帧内的多次 wheel 事件合并为一次渲染，避免高频重渲染卡顿
   useEffect(() => {
@@ -1422,9 +1475,24 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         // 直接拖动 = 框选
         marqueeStartRef.current = { x: e.clientX, y: e.clientY };
         setMarquee({ x1: e.clientX, y1: e.clientY, x2: e.clientX, y2: e.clientY });
+        // 触屏在空白处长按 = 右键菜单（与节点长按保持一致）
+        if (e.pointerType !== "mouse") {
+          cancelLongPress();
+          const px = e.clientX;
+          const py = e.clientY;
+          const timer = window.setTimeout(() => {
+            longPressRef.current = null;
+            marqueeStartRef.current = null;
+            setMarquee(null);
+            backgroundDownRef.current = null;
+            setIsPanning(false);
+            setMenu({ x: px, y: py, mode: "background" });
+          }, 500);
+          longPressRef.current = { timer, x: px, y: py };
+        }
       }
     }
-  }, [pan]);
+  }, [pan, cancelLongPress]);
 
   const handlePointerMove = useCallback((e: React.PointerEvent) => {
     // 触屏长按判定：手指移动超过阈值视为拖拽，取消长按菜单
@@ -1733,12 +1801,13 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   const handleNodeContextMenu = useCallback((e: React.MouseEvent, node: CanvasNode) => {
     e.preventDefault();
     e.stopPropagation();
+    cancelLongPress();
     if (!selectedIds.has(node.id)) {
       setSelectedIds(new Set([node.id]));
     }
     setPromptInput("");
     setMenu({ x: e.clientX, y: e.clientY, mode: "menu" });
-  }, [selectedIds]);
+  }, [selectedIds, cancelLongPress]);
 
   // 菜单操作
   const handleMenuAction = useCallback((mode: "compose" | "edit") => {
@@ -2184,8 +2253,16 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   // 空白右键：打开「新建容器」菜单
   const handleBackgroundContextMenu = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
+    cancelLongPress();
     setMenu({ x: e.clientX, y: e.clientY, mode: "background" });
-  }, []);
+  }, [cancelLongPress]);
+
+  // 触屏长按触发的原生 contextmenu：只拦掉浏览器默认行为，鼠标右键保持原样
+  const handleContextMenuCapture = useCallback((e: React.MouseEvent) => {
+    if (lastPointerTypeRef.current === "mouse") return;
+    e.preventDefault();
+    cancelLongPress();
+  }, [cancelLongPress]);
 
   // 操作类快捷键（默认不绑定）：全选 / 局部编辑 / 编辑图片 / 下载 / 新建画布
   useEffect(() => {
@@ -2400,11 +2477,16 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     <div
       ref={containerRef}
       data-role="canvas-root"
+      onPointerDownCapture={(e) => {
+        // 记录输入源：contextmenu 无法直接拿到 pointerType，用最近一次按下来判断
+        lastPointerTypeRef.current = e.pointerType;
+      }}
       onPointerDown={handlePointerDown}
       onPointerMove={handlePointerMove}
       onPointerUp={handlePointerUp}
       onPointerCancel={handlePointerUp}
       onPointerLeave={handlePointerUp}
+      onContextMenuCapture={handleContextMenuCapture}
       onContextMenu={handleBackgroundContextMenu}
       onDragOver={(e) => {
         e.preventDefault(); // 允许放置（否则浏览器直接打开图片文件）
@@ -2452,6 +2534,19 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         [data-role="canvas-root"] select { touch-action: auto; }
         /* 长按图片不弹出系统菜单，改为画布自己的长按操作菜单 */
         [data-role="canvas-root"] img { -webkit-touch-callout: none; }
+        /* 触屏：屏蔽系统长按菜单、文字选择放大镜；输入框恢复可选择，否则改字会坏。
+           只在真正出现过触摸/笔输入后生效（html[data-input]），鼠标操作不受影响。 */
+        html[data-input] [data-role="canvas-root"] {
+          -webkit-user-select: none;
+          user-select: none;
+          -webkit-touch-callout: none;
+        }
+        html[data-input] [data-role="canvas-root"] input,
+        html[data-input] [data-role="canvas-root"] textarea,
+        html[data-input] [data-role="canvas-root"] [contenteditable="true"] {
+          -webkit-user-select: text;
+          user-select: text;
+        }
         @keyframes ica-img-in {
           from { opacity: 0; transform: scale(0.92); }
           to   { opacity: 1; transform: scale(1); }
@@ -2464,6 +2559,10 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         @keyframes ica-proc-pulse {
           0%, 100% { box-shadow: 0 0 0 3px rgba(167,139,250,0.95), 0 0 28px rgba(167,139,250,0.5); }
           50%      { box-shadow: 0 0 0 5px rgba(196,181,253,0.55), 0 0 42px rgba(167,139,250,0.9); }
+        }
+        @keyframes ica-focus-pulse {
+          0%, 100% { opacity: 1; }
+          50%      { opacity: 0.45; }
         }
         @keyframes ica-dot-bounce {
           0%, 80%, 100% { transform: translateY(0); opacity: 0.4; }
@@ -2521,6 +2620,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
           position: "absolute",
           transformOrigin: "0 0",
           transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+          // "定位"跳转时短暂开启过渡：平滑飞行到目标节点；其余时间不设过渡以免拖拽/缩放延迟
+          transition: cameraAnimating ? "transform 0.4s cubic-bezier(0.22, 1, 0.36, 1)" : undefined,
           // 仅缩放手势期间提升为合成层：GPU 拉伸缓存纹理，保证手势流畅；
           // 停止后移除（见 markZoomGesture），让浏览器按最终 zoom 重新光栅化文字，
           // 常驻 will-change 会把光栅分辨率钉死在初始缩放 → 高倍放大文字发糊
@@ -2832,6 +2933,29 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
             </span>
           </div>
         ))}
+
+        {/* 定位高亮：目标节点四周呼吸光圈，2.4s 后自动消退 */}
+        {highlightNodeId && (() => {
+          const node = nodes.find((n) => n.id === highlightNodeId);
+          if (!node) return null;
+          return (
+            <div
+              style={{
+                position: "absolute",
+                left: node.x - 6,
+                top: node.y - 6,
+                width: node.width + 12,
+                height: node.height + 12,
+                border: "2px solid #818cf8",
+                borderRadius: 12,
+                boxShadow: "0 0 0 4px rgba(99,102,241,0.22), 0 0 28px rgba(99,102,241,0.55)",
+                pointerEvents: "none",
+                zIndex: 30,
+                animation: "ica-focus-pulse 1.2s ease-in-out 2",
+              }}
+            />
+          );
+        })()}
       </div>
 
       {/* 框选矩形（屏幕坐标） */}
@@ -4428,6 +4552,30 @@ const EditPanel = ({
     return () => ro.disconnect();
   }, [left, top, panelW, panelH, onRect, ref]);
 
+  // 触屏/窄屏：打开时自动贴合视口（顶部对齐、高度铺满、窄屏铺宽），
+  // 保证底部的「执行/取消」始终在屏幕内，而不是被推出视口。
+  // 只在挂载和窗口尺寸变化时执行，避免和面板拖拽/宽度调整互相触发。
+  const onMoveRef = useRef(onMove);
+  onMoveRef.current = onMove;
+  useEffect(() => {
+    const fit = () => {
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const touch = navigator.maxTouchPoints > 0;
+      if (vw <= 720) {
+        setPanelW((w) => Math.min(w, Math.max(300, vw - 16)));
+        setPanelH(Math.max(320, vh - 16));
+        onMoveRef.current(8, 8);
+      } else if (touch) {
+        setPanelH(Math.max(320, vh - 16));
+        onMoveRef.current(8, 8);
+      }
+    };
+    fit();
+    window.addEventListener("resize", fit);
+    return () => window.removeEventListener("resize", fit);
+  }, []);
+
   const canExecute = refNodes.length > 0;
 
   const finishReferenceDrag = (e: React.PointerEvent<HTMLElement>) => {
@@ -4462,6 +4610,10 @@ const EditPanel = ({
         top,
         width: panelW,
         height: panelH ?? undefined,
+        // 内容超出视口时限制高度，交由内部滚动，避免底部按钮被挤出屏幕
+        maxHeight: `calc(100vh - ${top + 8}px)`,
+        maxWidth: "calc(100vw - 16px)",
+        overflow: "hidden",
         display: "flex",
         flexDirection: "column",
         background: "rgba(26,26,46,0.97)",
@@ -4471,6 +4623,8 @@ const EditPanel = ({
         padding: 6,
         zIndex: 1000,
         backdropFilter: "blur(8px)",
+        // 面板内允许手指滚动，不把滚动/缩放手势交给画布
+        touchAction: "auto",
       }}
       onMouseDown={(e) => e.stopPropagation()}
       onMouseUp={(e) => {
@@ -4770,6 +4924,9 @@ const EditPanel = ({
           minHeight: 0,
           overflowY: "auto",
           overflowX: "hidden",
+          // iOS：允许手指在该区域内纵向滚动到底部按钮
+          touchAction: "pan-y",
+          WebkitOverflowScrolling: "touch",
           display: "flex",
           flexDirection: "column",
         }}
@@ -4847,7 +5004,18 @@ const EditPanel = ({
           🖌️ 涂抹区域，只改局部
         </button>
 
-        <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+        <div
+          style={{
+            display: "flex",
+            gap: 8,
+            marginTop: 8,
+            // 固定在滚动区底部：内容再长也能直接看到「执行 / 取消」
+            position: "sticky",
+            bottom: 0,
+            background: "rgba(26,26,46,0.97)",
+            paddingTop: 6,
+          }}
+        >
           <button
             onClick={onExecute}
             disabled={!canExecute}
@@ -5008,6 +5176,7 @@ const ImageNode = memo(function ImageNode({
       // wrapper 统一处理 hover/拖拽/右键：图片和连接点是同一交互整体，
       // 鼠标在图片和连接点之间移动不会触发 mouseleave（连接点不会闪没）
       <div
+        data-image-node="1"
         style={{
           position: "absolute",
           left: node.x,

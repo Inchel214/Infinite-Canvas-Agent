@@ -28,6 +28,8 @@ class CanvasNode:
     index: int | None = None
     # 分组标签（用于分区布局，如"需求"、"设计"、"流程"）
     group: str = ""
+    # 生成配方（关键词/风格/尺寸/模型），用于按行为检索历史反馈
+    recipe: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -42,6 +44,7 @@ class CanvasNode:
             "source_ids": self.source_ids,
             "index": self.index,
             "group": self.group,
+            "recipe": self.recipe,
         }
 
     @classmethod
@@ -58,6 +61,7 @@ class CanvasNode:
             source_ids=data.get("source_ids", []),
             index=data.get("index"),
             group=data.get("group", ""),
+            recipe=data.get("recipe", {}),
         )
 
 

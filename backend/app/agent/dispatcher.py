@@ -36,6 +36,7 @@ class Submitted:
 
     prompt: str
     referenced_images: list[dict] | None
+    round_id: str | None = None
     evq: "queue.Queue[dict | None]" = field(default_factory=queue.Queue)
     queued: bool = False  # 提交时是否在排队（决定 SSE 是否先发 queued 事件）
     position: int = 0  # 排队位置（1 起；0 表示立即执行）
@@ -74,7 +75,9 @@ class CanvasDispatcher:
         self._chat_sessions.append_user_message(
             canvas_id, prompt, round_id=round_id, pre_canvas=pre_canvas
         )
-        sub = Submitted(prompt=prompt, referenced_images=referenced_images)
+        sub = Submitted(
+            prompt=prompt, referenced_images=referenced_images, round_id=round_id
+        )
         start_worker = False
         with self._lock:
             if canvas_id in self._active:
@@ -132,6 +135,7 @@ class CanvasDispatcher:
                     return {
                         "prompt": nxt.prompt,
                         "referenced_images": nxt.referenced_images,
+                        "round_id": nxt.round_id,
                     }
 
                 # history / failure_note 在 run 启动时计算（此时 last_run 才准确，
@@ -149,6 +153,7 @@ class CanvasDispatcher:
                         failure_note=failure_note,
                         referenced_images=current.referenced_images,
                         steer_provider=steer_provider,
+                        round_id=current.round_id,
                     )
                     self._chat_sessions.append_assistant_message(
                         canvas_id, result.message, run_id=result.run_id

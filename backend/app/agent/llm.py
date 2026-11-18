@@ -11,6 +11,8 @@ from dataclasses import dataclass
 
 import requests
 
+from app.llm_logs import log_llm_request
+
 logger = logging.getLogger(__name__)
 
 
@@ -265,6 +267,7 @@ class OpenAICompatLLM(BaseLLM):
         oai_tools = self._to_openai_tools(tools)
         if oai_tools:
             body["tools"] = oai_tools
+        log_llm_request(body, stream=bool(body.get("stream")))
 
         # trust_env=False 绕过系统代理
         session = requests.Session()
@@ -327,6 +330,7 @@ class OpenAICompatLLM(BaseLLM):
         oai_tools = self._to_openai_tools(tools)
         if oai_tools:
             body["tools"] = oai_tools
+        log_llm_request(body, stream=bool(body.get("stream")))
 
         # trust_env=False 绕过系统代理
         session = requests.Session()
@@ -359,6 +363,7 @@ class OpenAICompatLLM(BaseLLM):
                 resp.close()
                 body.pop("thinking", None)
                 logger.debug("[LLM] thinking 参数被拒绝，去掉后重试")
+                log_llm_request(body, stream=bool(body.get("stream")))
                 resp = session.post(self.api_url, headers=headers, json=body,
                                     timeout=self.timeout, stream=True)
             resp.raise_for_status()

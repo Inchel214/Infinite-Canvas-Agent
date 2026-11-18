@@ -27,3 +27,6 @@ frontend/.vite/
 
 # Local OpenArt binary and downloaded generations
 .runtime/
+
+# 诊断日志打包（scripts/collect_logs 产物）
+logs_*.zip

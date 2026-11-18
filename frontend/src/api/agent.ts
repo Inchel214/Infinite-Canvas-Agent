@@ -71,6 +71,8 @@ export interface AgentStreamEvent {
   args?: Record<string, unknown>;
   result?: string;
   success?: boolean;
+  /** 工具结果附带数据（如新建图片节点的 node_id / image_url，用于预览与定位） */
+  data?: Record<string, unknown>;
   stopped?: boolean;
   message?: string;
   canvas?: CanvasState;
@@ -164,6 +166,18 @@ export async function respondToAgent(
     throw new Error(`${res.status}`);
   }
   return res.json();
+}
+
+// 用户在询问卡上输入/聚焦时刷新后端空闲计时（最多由调用方节流上报）
+export async function notifyAgentActivity(canvasId: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/agent/activity`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ canvas_id: canvasId }),
+  });
+  if (!res.ok) {
+    throw new Error(`${res.status}`);
+  }
 }
 
 // 获取画布对话历史（后端按画布持久化）：消息文本对 + 执行记录（含 timeline）
@@ -474,6 +488,13 @@ export async function cloneNode(
     height: number;
     content: string;
     source_ids: string[];
+    source_node_id?: string;
+    recipe?: {
+      keywords: string[];
+      style: string;
+      size: string;
+      model: string;
+    };
   }
 ): Promise<DirectResponse> {
   const res = await fetch(`${API_BASE}/canvas/${canvasId}/nodes/clone`, {
@@ -838,6 +859,43 @@ export async function listModels(payload: {
     throw new Error(err.detail || `${res.status}`);
   }
   return res.json();
+}
+
+// ===== 跨画布用户偏好 =====
+
+export interface MemoryItem {
+  id: string;
+  text: string;
+  hits: number;
+  last_hit: number;
+  source_round: string;
+}
+
+export async function listMemory(): Promise<MemoryItem[]> {
+  const res = await fetch(`${API_BASE}/memory`);
+  if (!res.ok) throw new Error(`${res.status}`);
+  const data = await res.json();
+  return data.items ?? [];
+}
+
+export async function updateMemory(id: string, text: string): Promise<MemoryItem> {
+  const res = await fetch(`${API_BASE}/memory/${encodeURIComponent(id)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+  if (!res.ok) {
+    const payload = await res.json().catch(() => null);
+    throw new Error(payload?.detail || `${res.status}`);
+  }
+  return res.json();
+}
+
+export async function deleteMemory(id: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/memory/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) throw new Error(`${res.status}`);
 }
 
 // ===== 风格库（经验文档）：设计师沉淀的风格指南，生图时确定性拼接 =====

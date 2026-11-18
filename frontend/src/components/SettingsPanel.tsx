@@ -10,6 +10,9 @@ import {
   addExperience,
   updateExperience,
   deleteExperience,
+  listMemory,
+  updateMemory,
+  deleteMemory,
   listProfiles,
   deleteProfile,
   type AppSettingsData,
@@ -19,6 +22,7 @@ import {
   type ProviderPreset,
   type TestResult,
   type ExperienceMeta,
+  type MemoryItem,
   type SavedProfile,
   type SavedProfiles,
 } from "../api/agent";
@@ -278,6 +282,15 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
   const [errorMsg, setErrorMsg] = useState("");
   const [notice, setNotice] = useState("");
 
+  // ===== 我的偏好（跨画布记忆）=====
+  const [memories, setMemories] = useState<MemoryItem[]>([]);
+  const [memoryDrafts, setMemoryDrafts] = useState<Record<string, string>>({});
+  const [memoryNotice, setMemoryNotice] = useState("");
+  const [memoryPending, setMemoryPending] = useState<{
+    id: string;
+    action: "save" | "delete";
+  } | null>(null);
+
   // ===== 技能库（提示词技能）=====
   const [experiences, setExperiences] = useState<ExperienceMeta[]>([]);
   const [expNotice, setExpNotice] = useState("");
@@ -290,26 +303,67 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
   const [importing, setImporting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // 加载技能列表 + 服务商预设 + 已保存配置历史
+  // 加载技能列表 + 服务商预设 + 已保存配置历史 + 跨画布偏好
   useEffect(() => {
     (async () => {
       try {
-        const [settings, providerData, exps, savedProfiles] = await Promise.all([
+        const [settings, providerData, exps, savedProfiles, memoryItems] = await Promise.all([
           getSettings(),
           getProviders(),
           listExperiences().catch(() => [] as ExperienceMeta[]),
           listProfiles().catch(() => ({ llm: [], image: [] }) as SavedProfiles),
+          listMemory().catch(() => [] as MemoryItem[]),
         ]);
         setLlm(settings.llm);
         setImage(settings.image);
         setProviders(providerData.providers);
         setExperiences(exps);
         setProfiles(savedProfiles);
+        setMemories(memoryItems);
+        setMemoryDrafts(Object.fromEntries(memoryItems.map((item) => [item.id, item.text])));
       } catch (e) {
         setErrorMsg("加载配置失败：" + (e as Error).message);
       }
     })();
   }, []);
+
+  const handleSaveMemory = async (item: MemoryItem) => {
+    const text = (memoryDrafts[item.id] ?? item.text).trim();
+    if (!text) return;
+    setMemoryPending({ id: item.id, action: "save" });
+    setMemoryNotice("");
+    try {
+      const updated = await updateMemory(item.id, text);
+      setMemories((prev) =>
+        prev.map((memory) => (memory.id === item.id ? updated : memory))
+      );
+      setMemoryDrafts((prev) => ({ ...prev, [item.id]: updated.text }));
+      setMemoryNotice("偏好已保存");
+    } catch (e) {
+      setMemoryNotice("保存偏好失败：" + (e as Error).message);
+    } finally {
+      setMemoryPending(null);
+    }
+  };
+
+  const handleDeleteMemory = async (id: string) => {
+    setMemoryPending({ id, action: "delete" });
+    setMemoryNotice("");
+    try {
+      await deleteMemory(id);
+      setMemories((prev) => prev.filter((item) => item.id !== id));
+      setMemoryDrafts((prev) => {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+      setMemoryNotice("偏好已删除");
+    } catch (e) {
+      setMemoryNotice("删除偏好失败：" + (e as Error).message);
+    } finally {
+      setMemoryPending(null);
+    }
+  };
 
   // 选择 MD 文件 → 打开导入表单（名称/描述自动预填，可编辑）
   const handlePickFile = async (file: File | undefined) => {
@@ -689,7 +743,7 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
               fetchModels={() => listModels({ kind: "image", provider: "openart", api_key: "", base_url: "" })}
             />
             <div style={{ color: "#999", fontSize: 12, marginTop: 6 }}>
-              首次使用请点下方“测试连接”；未登录时运行项目中的 openart-login.command。
+              首次使用请点下方“测试连接”；未登录时先在终端运行 openart login。
             </div>
           </>
         ) : (
@@ -774,6 +828,83 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
             {testResult.image.ok ? "✓ " : "✗ "}
             {testResult.image.message}
           </div>
+        )}
+
+        {/* ===== 我的偏好（跨画布记忆） ===== */}
+        <div style={sectionTitleStyle}>我的偏好（已记忆 {memories.length} 条）</div>
+        <div style={{ color: "#777", fontSize: 12, margin: "4px 0 8px" }}>
+          Agent 会跨画布参考这些偏好；此处逐条独立保存，不影响服务商配置
+        </div>
+        {memories.length === 0 ? (
+          <div style={{ color: "#666", fontSize: 12, padding: "6px 0" }}>
+            暂无记忆偏好
+          </div>
+        ) : (
+          memories.map((item) => {
+            const text = memoryDrafts[item.id] ?? item.text;
+            const pendingAction = memoryPending?.id === item.id ? memoryPending.action : null;
+            return (
+              <div
+                key={item.id}
+                style={{
+                  marginTop: 6,
+                  padding: 10,
+                  background: "rgba(255,255,255,0.04)",
+                  borderRadius: 6,
+                  border: "1px solid rgba(255,255,255,0.08)",
+                }}
+              >
+                <textarea
+                  aria-label="偏好内容"
+                  style={{
+                    ...inputStyle,
+                    minHeight: 58,
+                    resize: "vertical",
+                    lineHeight: 1.5,
+                  }}
+                  value={text}
+                  disabled={pendingAction !== null}
+                  onChange={(e) =>
+                    setMemoryDrafts((prev) => ({ ...prev, [item.id]: e.target.value }))
+                  }
+                />
+                <div style={{ display: "flex", gap: 8, marginTop: 6, justifyContent: "flex-end" }}>
+                  <button
+                    onClick={() => handleSaveMemory(item)}
+                    disabled={memoryPending !== null || !text.trim()}
+                    style={{
+                      ...inputStyle,
+                      width: "auto",
+                      padding: "6px 12px",
+                      cursor: "pointer",
+                      background: "rgba(167,139,250,0.22)",
+                      borderColor: "rgba(167,139,250,0.42)",
+                      color: "#eee",
+                    }}
+                  >
+                    {pendingAction === "save" ? "保存中..." : "保存"}
+                  </button>
+                  <button
+                    onClick={() => handleDeleteMemory(item.id)}
+                    disabled={memoryPending !== null}
+                    style={{
+                      ...inputStyle,
+                      width: "auto",
+                      padding: "6px 12px",
+                      cursor: "pointer",
+                      background: "transparent",
+                      color: "#f87171",
+                    }}
+                  >
+                    {pendingAction === "delete" ? "删除中..." : "删除"}
+                  </button>
+                </div>
+              </div>
+            );
+          })
+        )}
+        {memoryNotice && (
+          <div style={{ color: "#a78bfa", fontSize: 12, marginTop: 8 }}>{memoryNotice}</div>
         )}
 
         {/* ===== 技能库（提示词技能） ===== */}

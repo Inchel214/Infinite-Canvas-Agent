@@ -8,6 +8,8 @@ from app.agent.dispatcher import CanvasDispatcher
 from app.agent.react_loop import ReActAgent, RunControl
 from app.agent.sessions import ChatSessionStore
 from app.canvas.store import FileStore
+from app.feedback import feedback_store
+from app.memory import memory_store
 from app.providers.manager import GeneratorProxy, LLMProxy, ProviderManager
 from app.tools.add_text_node import AddTextNodeTool
 from app.tools.ask_user import AskUserTool
@@ -17,6 +19,7 @@ from app.tools.delete_node import DeleteNodeTool
 from app.tools.edit_image import EditImageTool
 from app.tools.generate_image import GenerateImageTool
 from app.tools.list_nodes import ListNodesTool
+from app.tools.memory_tools import ReadMemoryTool, ReadRecipeTool, SaveMemoryTool
 from app.tools.move_node import MoveNodeTool
 from app.tools.read_experience import ReadExperienceTool
 from app.tools.variate_image import VariateImageTool
@@ -46,6 +49,9 @@ tool_manager.register(ListNodesTool())
 tool_manager.register(AddTextNodeTool())
 # 风格库读取（Agent 按需读风格指南全文）
 tool_manager.register(ReadExperienceTool())
+tool_manager.register(SaveMemoryTool(memory_store))
+tool_manager.register(ReadMemoryTool(memory_store))
+tool_manager.register(ReadRecipeTool(feedback_store))
 # 人在回路：Agent 向用户询问信息或确认操作
 tool_manager.register(AskUserTool(control))
 
@@ -56,6 +62,7 @@ agent = ReActAgent(
     max_steps=100,
     control=control,
     chat_sessions=chat_sessions,  # 工具步骤实时持久化
+    feedback=feedback_store,
 )
 
 # 每画布请求调度器：串行执行 + 排队 + 工具边界 steering 注入

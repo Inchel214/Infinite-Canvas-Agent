@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from app import deps
 from app import experiences
 from app.canvas.state import CanvasNode, CanvasState
+from app.feedback import make_recipe
 from app.providers.schema import (
     AppSettings,
     ImageConfig,
@@ -150,6 +151,26 @@ def _apply_styles(req, prompt: str) -> str:
     return experiences.apply_experiences(ids, prompt) if ids else prompt
 
 
+def _style_recipe(req) -> str:
+    ids = list(req.experience_ids or [])
+    if req.experience_id and req.experience_id not in ids:
+        ids.append(req.experience_id)
+    return ",".join(ids)
+
+
+def _record_feedback(
+    canvas_id: str, node: CanvasNode | None, outcome: str, round_id: str = ""
+) -> None:
+    if node is None or node.type != "image":
+        return
+    try:
+        deps.feedback_store.record(
+            canvas_id, node=node.to_dict(), outcome=outcome, round_id=round_id
+        )
+    except Exception:
+        logger.warning("图片行为反馈写入失败（已忽略）", exc_info=True)
+
+
 def _resolve_node_ref(state: CanvasState, ref: str) -> CanvasNode | None:
     """节点引用解析：支持节点 ID 与 '#N' 编号两种写法。
 
@@ -168,6 +189,33 @@ def _resolve_node_ref(state: CanvasState, ref: str) -> CanvasNode | None:
                 return n
         return None
     return state.get_node(ref)
+
+
+class MemoryIn(BaseModel):
+    text: str
+
+
+@router.get("/memory", summary="读取全部跨画布偏好")
+def list_memory():
+    return {"items": deps.memory_store.list()}
+
+
+@router.put("/memory/{preference_id}", summary="编辑一条偏好")
+def update_memory(preference_id: str, req: MemoryIn):
+    try:
+        item = deps.memory_store.update(preference_id, req.text)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if item is None:
+        raise HTTPException(status_code=404, detail="偏好不存在")
+    return item
+
+
+@router.delete("/memory/{preference_id}", summary="删除一条偏好")
+def delete_memory(preference_id: str):
+    if not deps.memory_store.delete(preference_id):
+        raise HTTPException(status_code=404, detail="偏好不存在")
+    return {"success": True}
 
 
 class CanvasCreateIn(BaseModel):
@@ -285,7 +333,12 @@ def compose_images(canvas_id: str, req: ComposeRequest):
         raise HTTPException(status_code=404, detail=str(e))
     tool = deps.tool_manager.get("compose_images")
     prompt = _apply_styles(req, req.prompt)
-    kwargs = {"node_ids": req.node_ids, "prompt": prompt, "size": req.size}
+    kwargs = {
+        "node_ids": req.node_ids,
+        "prompt": prompt,
+        "size": req.size,
+        "style": _style_recipe(req),
+    }
     if req.x is not None:
         kwargs["x"] = req.x
     if req.y is not None:
@@ -293,6 +346,9 @@ def compose_images(canvas_id: str, req: ComposeRequest):
     result = tool.run(state, **kwargs)
     if result.state:
         deps.store.save_canvas(result.state)
+    if result.success and result.state:
+        created = result.state.get_node((result.data or {}).get("node_id", ""))
+        _record_feedback(canvas_id, created, "kept")
     return {
         "success": result.success,
         "message": result.message,
@@ -309,7 +365,13 @@ def variate_image(canvas_id: str, req: VariateRequest):
     prompt = req.prompt or "基于参考图生成一个高质量的新变体，保持风格一致"
     prompt = _apply_styles(req, prompt)
     tool = deps.tool_manager.get("variate_image")
-    kwargs = {"node_id": req.node_id, "prompt": prompt, "size": req.size}
+    source = state.get_node(req.node_id)
+    kwargs = {
+        "node_id": req.node_id,
+        "prompt": prompt,
+        "size": req.size,
+        "style": _style_recipe(req),
+    }
     if req.x is not None:
         kwargs["x"] = req.x
     if req.y is not None:
@@ -335,6 +397,8 @@ def variate_image(canvas_id: str, req: VariateRequest):
         node.index = None  # 旧快照编号可能与并发写入撞号，按最新画布统一重新分配
         latest.add_node(node)
         deps.store.save_canvas(latest)
+    _record_feedback(canvas_id, source, "retried")
+    _record_feedback(canvas_id, node, "kept")
     return {
         "success": True,
         "message": result.message,
@@ -350,7 +414,13 @@ def edit_image(canvas_id: str, req: EditRequest):
         raise HTTPException(status_code=404, detail=str(e))
     tool = deps.tool_manager.get("edit_image")
     prompt = _apply_styles(req, req.prompt)
-    kwargs = {"node_id": req.node_id, "prompt": prompt, "size": req.size}
+    source = state.get_node(req.node_id)
+    kwargs = {
+        "node_id": req.node_id,
+        "prompt": prompt,
+        "size": req.size,
+        "style": _style_recipe(req),
+    }
     if req.x is not None:
         kwargs["x"] = req.x
     if req.y is not None:
@@ -389,6 +459,8 @@ def edit_image(canvas_id: str, req: EditRequest):
         node.index = None  # 旧快照编号可能与并发写入撞号，按最新画布统一重新分配
         latest.add_node(node)
         deps.store.save_canvas(latest)
+    _record_feedback(canvas_id, source, "edited")
+    _record_feedback(canvas_id, node, "kept")
     return {
         "success": True,
         "message": result.message,
@@ -403,9 +475,12 @@ def delete_node(canvas_id: str, node_id: str):
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     tool = deps.tool_manager.get("delete_node")
+    deleted_node = state.get_node(node_id)
     result = tool.run(state, node_id=node_id)
     if result.state:
         deps.store.save_canvas(result.state)
+    if result.success:
+        _record_feedback(canvas_id, deleted_node, "deleted")
     return {
         "success": result.success,
         "message": result.message,
@@ -453,14 +528,17 @@ def batch_delete_nodes(canvas_id: str, req: BatchDeleteRequest):
         state = deps.store.get_canvas(canvas_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
-    deleted = 0
+    deleted_nodes = []
     for nid in req.node_ids:
         node = _resolve_node_ref(state, nid)
         if node:
             state.remove_node(node.id)
-            deleted += 1
-    if deleted > 0:
+            deleted_nodes.append(node)
+    if deleted_nodes:
         deps.store.save_canvas(state)
+        for node in deleted_nodes:
+            _record_feedback(canvas_id, node, "deleted")
+    deleted = len(deleted_nodes)
     return {
         "success": True,
         "message": f"已删除 {deleted} 张图片",
@@ -677,6 +755,7 @@ def undo_round(canvas_id: str, round_id: str):
     # 画布已回退：同步截断对话历史（该轮及其后的消息/执行记录），
     # 前端把这条输入放回编辑框，用户可修改后重新发送
     deps.chat_sessions.delete_round_from(canvas_id, round_id)
+    deps.feedback_store.void_round(canvas_id, round_id)
     return {"success": True, "message": "已撤回整轮操作", "canvas": result.to_dict()}
 
 
@@ -731,7 +810,7 @@ def generate_image(canvas_id: str, req: GenerateRequest):
         raise HTTPException(status_code=404, detail=str(e))
     tool = deps.tool_manager.get("generate_image")
     prompt = _apply_styles(req, req.prompt)
-    kwargs = {"prompt": prompt, "size": req.size}
+    kwargs = {"prompt": prompt, "size": req.size, "style": _style_recipe(req)}
     if req.x is not None:
         kwargs["x"] = req.x
     if req.y is not None:
@@ -758,6 +837,7 @@ def generate_image(canvas_id: str, req: GenerateRequest):
         node.index = None  # 旧快照上的编号可能与并发写入撞号，按最新画布重新分配
         latest.add_node(node)
         deps.store.save_canvas(latest)
+    _record_feedback(canvas_id, node, "kept")
     return {
         "success": True,
         "message": result.message,
@@ -810,6 +890,8 @@ class CloneNodeRequest(BaseModel):
     height: int = 300
     content: str = ""
     source_ids: list = []
+    source_node_id: Optional[str] = None
+    recipe: dict = {}
 
 
 @router.post("/canvas/{canvas_id}/nodes/clone", summary="克隆节点（复制完整属性，含提示词）")
@@ -818,6 +900,16 @@ def clone_node(canvas_id: str, req: CloneNodeRequest):
         state = deps.store.get_canvas(canvas_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    source = state.get_node(req.source_node_id) if req.source_node_id else None
+    if source is None:
+        source = next(
+            (
+                n for n in state.list_nodes()
+                if n.type == "image" and n.image_url == req.image_url
+                and n.content == req.content
+            ),
+            None,
+        )
     node = CanvasNode(
         id=str(uuid.uuid4()),
         type="image",
@@ -828,9 +920,11 @@ def clone_node(canvas_id: str, req: CloneNodeRequest):
         content=req.content,
         image_url=req.image_url,
         source_ids=list(req.source_ids),
+        recipe=req.recipe or (source.recipe if source else make_recipe(req.content)),
     )
     state.add_node(node)
     deps.store.save_canvas(state)
+    _record_feedback(canvas_id, source or node, "cloned")
     return {
         "success": True,
         "message": "已复制节点",
@@ -846,6 +940,7 @@ def generate_image_stream(canvas_id: str, req: StreamGenRequest):
         raise HTTPException(status_code=404, detail=str(e))
 
     # 解析参考图和提示词（与工具逻辑一致）
+    source = None
     if req.op == "compose":
         ids = req.node_ids or []
         sources = [state.get_node(nid) for nid in ids]
@@ -863,6 +958,7 @@ def generate_image_stream(canvas_id: str, req: StreamGenRequest):
         ref_urls = [node.image_url]
         prompt = req.prompt or "基于参考图生成一个高质量的新变体，保持风格一致"
         width, height = node.width, node.height
+        source = node
         ids = [req.node_id]
     else:
         if not req.prompt.strip():
@@ -894,9 +990,18 @@ def generate_image_stream(canvas_id: str, req: StreamGenRequest):
                 content=prompt or "生成的图片",
                 image_url=image_url,
                 source_ids=ids,
+                recipe=make_recipe(
+                    prompt,
+                    style=_style_recipe(req),
+                    size=size,
+                    model=str(getattr(deps.manager.generator, "model", "") or ""),
+                ),
             )
             latest.add_node(node)
             deps.store.save_canvas(latest)
+        if req.op == "variate":
+            _record_feedback(canvas_id, source, "retried")
+        _record_feedback(canvas_id, node, "kept")
         return latest, node.id
 
     gen = deps.manager.generator
@@ -956,16 +1061,21 @@ def generate_image_stream(canvas_id: str, req: StreamGenRequest):
                 if req.op == "compose":
                     tool = deps.tool_manager.get("compose_images")
                     result = tool.run(
-                        state, node_ids=req.node_ids or [], prompt=prompt, size=size, x=req.x, y=req.y
+                        state, node_ids=req.node_ids or [], prompt=prompt, size=size,
+                        x=req.x, y=req.y, style=_style_recipe(req)
                     )
                 elif req.op == "variate":
                     tool = deps.tool_manager.get("variate_image")
                     result = tool.run(
-                        state, node_id=req.node_id or "", prompt=prompt, size=size, x=req.x, y=req.y
+                        state, node_id=req.node_id or "", prompt=prompt, size=size,
+                        x=req.x, y=req.y, style=_style_recipe(req)
                     )
                 else:
                     tool = deps.tool_manager.get("generate_image")
-                    result = tool.run(state, prompt=prompt, size=size, x=req.x, y=req.y)
+                    result = tool.run(
+                        state, prompt=prompt, size=size, x=req.x, y=req.y,
+                        style=_style_recipe(req)
+                    )
             except Exception as e:
                 logger.exception("图片生成失败")
                 yield _sse({"type": "done", "success": False, "message": str(e)})
@@ -1000,6 +1110,9 @@ def generate_image_stream(canvas_id: str, req: StreamGenRequest):
                     latest.add_node(generated_node)
                     deps.store.save_canvas(latest)
                     final_state = latest
+                if req.op == "variate":
+                    _record_feedback(canvas_id, source, "retried")
+                _record_feedback(canvas_id, generated_node, "kept")
             yield _sse(
                 {
                     "type": "done",
@@ -1019,12 +1132,22 @@ def generate_image_stream(canvas_id: str, req: StreamGenRequest):
 def chat(req: ChatRequest):
     # 预校验画布存在（dispatcher 不做存在性校验）
     try:
-        deps.store.get_canvas(req.canvas_id)
+        state = deps.store.get_canvas(req.canvas_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
+    referenced_images = [
+        {"node_id": img.node_id, "image_url": img.image_url}
+        for img in req.referenced_images or []
+    ] or None
     # 走调度器：与流式端点同一套排队/串行语义，消除并发双跑隐患
-    handle = deps.dispatcher.submit(req.canvas_id, req.prompt)
+    handle = deps.dispatcher.submit(
+        req.canvas_id,
+        req.prompt,
+        referenced_images,
+        round_id=req.round_id,
+        pre_canvas=state.to_dict() if req.round_id else None,
+    )
     done_evt = None
     while True:
         evt = handle.evq.get()
@@ -1136,6 +1259,19 @@ def stop_agent(req: StopRequest):
 class RespondRequest(BaseModel):
     canvas_id: str
     response: str
+
+
+class AgentActivityRequest(BaseModel):
+    canvas_id: str
+
+
+@router.post("/agent/activity", summary="记录用户在 Agent 询问卡上的操作")
+def record_agent_activity(req: AgentActivityRequest):
+    """输入或聚焦询问输入框时刷新空闲计时，连续 5 分钟无操作才超时。"""
+    success = deps.agent.control.record_activity(req.canvas_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="没有等待回复的任务")
+    return {"success": True}
 
 
 @router.post("/agent/respond", summary="用户对 Agent 询问的回复")

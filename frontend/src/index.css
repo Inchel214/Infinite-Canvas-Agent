@@ -45,3 +45,49 @@ html[data-input="pen"] textarea,
 html[data-input="pen"] select {
   font-size: 16px !important;
 }
+
+/* 触屏设备（含 iPad 外接鼠标）：屏蔽图片/链接的长按系统气泡、系统文本选择操作条，
+   所有长按操作统一由应用自己的菜单提供。纯鼠标桌面端不命中。
+   输入框/可编辑区保留选择能力（见下方覆盖）。 */
+html[data-touch-device] body {
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+html[data-touch-device] input,
+html[data-touch-device] textarea,
+html[data-touch-device] [contenteditable="true"],
+html[data-touch-device] [data-allow-select] {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* 华为/部分 Chromium 系浏览器忽略 contextmenu 的 preventDefault，
+   长按 <img> 仍会弹「查看图片 / 保存图片 / 分享图片」。
+   让图片不接收指针事件，长按落到外层节点容器上，既不影响拖拽/右键菜单，
+   也不会再触发浏览器的图片长按菜单。 */
+html[data-touch-device] [data-role="canvas-root"] img,
+html[data-input] [data-role="canvas-root"] img,
+[data-role="canvas-root"] [data-image-node="1"] img {
+  pointer-events: none;
+  -webkit-user-drag: none;
+}
+
+/* 触屏：局部编辑器的按钮/滑块放大到适合笔尖和手指点按。
+   组件多用行内样式，这里用 !important 覆盖；鼠标用户不会命中。 */
+html[data-input] [data-mask-editor] button {
+  min-height: 40px;
+  padding: 9px 14px !important;
+  font-size: 14px !important;
+}
+
+html[data-input] [data-mask-editor] input[type="range"] {
+  width: 120px !important;
+}
+
+html[data-input] [data-mask-editor] [data-mask-panel] {
+  width: 240px !important;
+  padding: 12px !important;
+}

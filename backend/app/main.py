@@ -49,7 +49,14 @@ def _configure_threadpool() -> None:
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     _configure_threadpool()
-    yield
+    from app.canvas.backup import start_backup_task
+
+    backup_task = start_backup_task()
+    try:
+        yield
+    finally:
+        if backup_task is not None:
+            backup_task.cancel()
 
 
 app = FastAPI(title="Infinite Canvas Agent", version="0.1.0", lifespan=_lifespan)
