@@ -78,6 +78,11 @@ const CHAT_PANEL_SELECTOR = '[data-role="chat-panel"]';
 // 子组件回调仍可能传 MouseEvent，故通用处理器接受两者的并集。
 type CanvasPointerEvent = React.MouseEvent | React.PointerEvent;
 
+function hasSelectedText(): boolean {
+  const selection = window.getSelection();
+  return !!selection && !selection.isCollapsed && selection.toString().length > 0;
+}
+
 /**
  * Agent 面板里的输入焦点和文字选区应优先使用浏览器原生复制。
  * 画布会全局接管 copy 事件，因此不能只排除 input/textarea：消息正文是普通元素。
@@ -855,9 +860,11 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         setConnecting(null);
         return;
       }
-      // 输入控件或 Agent 面板文字处于复制上下文时，优先复制文字。
+      // 复制时优先使用文字选区，即使同时选中了图片节点。
+      // 文字选区只影响复制，不阻止删除、撤销等其它画布快捷键。
       // macOS 上真正的 Control+C 不会触发原生 copy，因此显式触发一次；Cmd+C 仍交给浏览器。
-      if (shouldPreserveNativeCopy(e.target)) {
+      if (shouldPreserveNativeCopy(e.target)
+          || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "c" && hasSelectedText())) {
         if (e.ctrlKey && !e.metaKey && e.key.toLowerCase() === "c") {
           e.preventDefault();
           document.execCommand("copy");
@@ -937,10 +944,10 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   }, [selectedIds, nodes, onAction, canvasId, onCanvasUpdate, copySelectedImagesToSystemClipboard, shortcuts.bindings, setContainers, generatingIdsRef]);
 
   // 使用浏览器原生 copy 事件接管 Cmd/Ctrl+C，避免快捷键先被浏览器或容器层拦截。
-  // 输入控件与 Agent 面板中的文字选区仍保留普通的文本复制行为。
+  // 任意文字选区、输入控件与 Agent 面板都保留普通的文本复制行为。
   useEffect(() => {
     const handler = (event: ClipboardEvent) => {
-      if (shouldPreserveNativeCopy(event.target)) return;
+      if (hasSelectedText() || shouldPreserveNativeCopy(event.target)) return;
       if (selectedIds.size === 0) return;
       if (!nodes.some((node) => selectedIds.has(node.id) && !!node.image_url)) return;
 
