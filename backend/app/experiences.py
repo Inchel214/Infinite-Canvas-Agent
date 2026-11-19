@@ -188,13 +188,15 @@ def add_experience(name: str, description: str, content: str, kind: str = "style
         }
 
 
-def update_experience(exp_id: str, name: str | None = None, description: str | None = None) -> dict | None:
-    """编辑风格的名称/描述（不改正文）"""
+def update_experience(exp_id: str, name: str | None = None, description: str | None = None, content: str | None = None) -> dict | None:
+    """编辑技能名称、描述及可选正文。"""
     with _lock:
         reg = _load_registry()
         meta = reg.get(exp_id)
         if not meta:
             return None
+        if content is not None and not content.strip():
+            raise ValueError("技能正文不能为空")
         if name is not None and name.strip():
             normalized_name = name.strip().casefold()
             if any(
@@ -206,6 +208,8 @@ def update_experience(exp_id: str, name: str | None = None, description: str | N
             meta["name"] = name.strip()
         if description is not None:
             meta["description"] = description.strip()
+        if content is not None:
+            (EXP_DIR / meta["file"]).write_text(content, encoding="utf-8")
         _save_registry(reg)
         logger.info("[Experiences] 更新风格 %s | name=%s", exp_id, name)
         return {"id": exp_id, "name": meta["name"], "description": meta["description"]}

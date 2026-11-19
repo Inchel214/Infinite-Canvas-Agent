@@ -134,7 +134,8 @@ class ExperienceIn(BaseModel):
 
 
 class ExperienceUpdate(BaseModel):
-    """编辑风格元数据（名称/描述）"""
+    """编辑技能名称、描述和 Markdown 正文"""
+    content: Optional[str] = None
     name: Optional[str] = None
     description: Optional[str] = None
 
@@ -1493,10 +1494,10 @@ def add_experience_route(req: ExperienceIn):
     return {"success": True, "experience": item}
 
 
-@router.put("/experiences/{exp_id}", summary="编辑风格名称/描述")
+@router.put("/experiences/{exp_id}", summary="编辑技能名称、用途与正文")
 def update_experience_route(exp_id: str, req: ExperienceUpdate):
     try:
-        item = experiences.update_experience(exp_id, req.name, req.description)
+        item = experiences.update_experience(exp_id, req.name, req.description, req.content)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     if not item:
@@ -1683,12 +1684,16 @@ def _err_snippet(resp: requests.Response) -> str:
 
 
 @router.post("/settings/test", summary="测试配置连通性（不保存）")
-def test_settings(req: SettingsRequest):
+def test_settings(req: SettingsRequest, kind: Optional[str] = None):
     """LLM 发 1 token 轻量对话验证；图片服务探测 /models 列表接口"""
+    if kind not in (None, "llm", "image"):
+        raise HTTPException(status_code=400, detail="Unknown connection kind")
     result: dict = {"llm": {}, "image": {}}
 
     # ---- LLM 测试 ----
-    if req.llm.provider in ("", "mock"):
+    if kind == "image":
+        pass
+    elif req.llm.provider in ("", "mock"):
         result["llm"] = {
             "ok": True,
             "message": "未设置（当前跟随 .env / Mock），无需测试",
@@ -1734,7 +1739,9 @@ def test_settings(req: SettingsRequest):
                 result["llm"] = {"ok": False, "message": f"连接失败: {e}"}
 
     # ---- 图片服务测试 ----
-    if req.image.source == "openart":
+    if kind == "llm":
+        pass
+    elif req.image.source == "openart":
         from app.image.openart_generator import OpenArtImageGenerator
 
         try:

@@ -482,49 +482,7 @@ function App() {
           </span>
         </div>
 
-        {/* 大模型设置入口 + 当前模式徽标 */}
-        <div
-          onClick={() => setShowSettings(true)}
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-            background: "rgba(26,26,46,0.95)",
-            border: "1px solid rgba(255,255,255,0.1)",
-            borderRadius: 10,
-            padding: "8px 14px",
-            cursor: "pointer",
-            color: "#ccc",
-            fontSize: 13,
-            userSelect: "none",
-            backdropFilter: "blur(8px)",
-          }}
-          title="点击设置大模型服务商与 API Key"
-        >
-        <span style={{ fontSize: 15 }}>⚙</span>
-        {settings ? (
-          <span>
-            图片 {providerName(settings.status.image.provider)}
-            <span style={{ color: "#555", margin: "0 4px" }}>|</span>
-            对话 {providerName(settings.status.llm.provider)}
-          </span>
-        ) : (
-          <span>设置</span>
-        )}
-        {settings && settings.status.image.mode === "mock" && (
-          <span
-            style={{
-              background: "rgba(217,119,6,0.25)",
-              color: "#fbbf24",
-              padding: "1px 8px",
-              borderRadius: 6,
-              fontSize: 11,
-            }}
-          >
-            未配置
-          </span>
-        )}
-        </div>
+        <button onClick={() => setShowSettings(true)} title={settings ? `对话：${settings.llm.model || providerName(settings.status.llm.provider)} · 图片：${settings.image.source === "openart" ? settings.image.openart_model : settings.image.model || providerName(settings.status.image.provider)}` : "打开设置"} style={{background:"rgba(26,26,46,0.95)",border:"1px solid rgba(255,255,255,.12)",borderRadius:10,padding:"10px 16px",color:"#ddd",fontSize:13,cursor:"pointer"}}>⚙ 设置</button>
       </div>
 
       {/* 设置面板 */}

@@ -1,12 +1,14 @@
 import { useEffect, useRef, useState } from "react";
+import "./SettingsPanel.css";
+import { SettingsNavIcon } from "./SettingsNavIcon";
 import {
   getSettings,
   getProviders,
   saveSettings,
-  resetSettings,
   testSettings,
   listModels,
   listExperiences,
+  getExperience,
   addExperience,
   updateExperience,
   deleteExperience,
@@ -200,61 +202,20 @@ function ModelField(props: {
   );
 }
 
-// 已保存的配置历史：点击整块回填服务商 / 地址 / 模型 / Key，右侧 ✕ 删除
+// 已保存连接折叠展示，恢复与删除使用独立按钮。
 function SavedProfileChips(props: {
   items: SavedProfile[];
   onPick: (p: SavedProfile) => void;
   onDelete: (p: SavedProfile) => void;
 }) {
   if (props.items.length === 0) return null;
-  return (
-    <div style={{ marginTop: 8 }}>
-      <div style={{ color: "#777", fontSize: 11, marginBottom: 4 }}>
-        已保存的配置（点击回填，无需重新输入 API Key）
-      </div>
-      <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-        {props.items.map((p) => (
-          <span
-            key={p.id}
-            onClick={() => props.onPick(p)}
-            title="点击回填该配置"
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              maxWidth: "100%",
-              padding: "3px 4px 3px 9px",
-              borderRadius: 999,
-              background: "rgba(167,139,250,0.14)",
-              border: "1px solid rgba(167,139,250,0.32)",
-              color: "#cfc6f7",
-              fontSize: 11,
-              cursor: "pointer",
-            }}
-          >
-            <span
-              style={{
-                overflow: "hidden",
-                textOverflow: "ellipsis",
-                whiteSpace: "nowrap",
-              }}
-            >
-              {p.label}
-            </span>
-            <span
-              onClick={(e) => {
-                e.stopPropagation();
-                props.onDelete(p);
-              }}
-              title="删除该条已保存配置"
-              style={{ color: "#888", padding: "0 4px", cursor: "pointer" }}
-            >
-              ✕
-            </span>
-          </span>
-        ))}
-      </div>
-    </div>
-  );
+  return <details className="settings-profiles">
+    <summary>切换已保存的连接 <span>{props.items.length}</span></summary>
+    <div>{props.items.map(p => <div className="settings-profile-row" key={p.id}>
+      <button onClick={e => {props.onPick(p); e.currentTarget.closest("details")?.removeAttribute("open");}} title={p.base_url}><strong>{p.model || p.provider_name}</strong><span>{p.provider_name} · {p.base_url}</span></button>
+      <button aria-label={`删除已保存连接 ${p.model}`} onClick={() => {if (window.confirm(`删除已保存的连接 ${p.model}？不会更改当前正在使用的配置。`)) props.onDelete(p);}}>删除</button>
+    </div>)}</div>
+  </details>;
 }
 
 export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
@@ -272,12 +233,25 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
     model: "",
     stream_model: "",
   });
-  const [testing, setTesting] = useState(false);
+  const [testing, setTesting] = useState<"llm" | "image" | null>(null);
+  const [tab, setTab] = useState<"models" | "skills" | "memory">("models");
+  const [modelKind, setModelKind] = useState<"llm" | "image">("llm");
+  const [search, setSearch] = useState("");
+  const [skillKind, setSkillKind] = useState("all");
+  const [loading, setLoading] = useState(true);
+  const [baseline, setBaseline] = useState({llm: "", image: ""});
+  const currentConfig = useRef({llm: "", image: ""});
+  useEffect(() => { currentConfig.current = {llm: JSON.stringify(llm), image: JSON.stringify(image)}; }, [llm, image]);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const requestClose = () => {
+    const dirty = (!loading && (baseline.llm !== JSON.stringify(llm) || baseline.image !== JSON.stringify(image))) || !!editDraft || !!importDraft || memories.some(m => memoryDrafts[m.id] !== m.text);
+    if (!dirty || window.confirm("有尚未保存的修改，确定关闭？")) onClose();
+  };
   const [saving, setSaving] = useState(false);
   const [profiles, setProfiles] = useState<SavedProfiles>({ llm: [], image: [] });
   const [testResult, setTestResult] = useState<{
-    llm?: TestResult;
-    image?: TestResult;
+    llm?: TestResult & {fingerprint: string};
+    image?: TestResult & {fingerprint: string};
   }>({});
   const [errorMsg, setErrorMsg] = useState("");
   const [notice, setNotice] = useState("");
@@ -314,6 +288,7 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
           listProfiles().catch(() => ({ llm: [], image: [] }) as SavedProfiles),
           listMemory().catch(() => [] as MemoryItem[]),
         ]);
+        setBaseline({llm: JSON.stringify(settings.llm), image: JSON.stringify(settings.image)});
         setLlm(settings.llm);
         setImage(settings.image);
         setProviders(providerData.providers);
@@ -323,7 +298,7 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
         setMemoryDrafts(Object.fromEntries(memoryItems.map((item) => [item.id, item.text])));
       } catch (e) {
         setErrorMsg("加载配置失败：" + (e as Error).message);
-      }
+      } finally { setLoading(false); }
     })();
   }, []);
 
@@ -368,6 +343,8 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
   // 选择 MD 文件 → 打开导入表单（名称/描述自动预填，可编辑）
   const handlePickFile = async (file: File | undefined) => {
     if (!file) return;
+    if ((editDraft || importDraft) && !window.confirm("放弃当前技能的未保存修改？")) return;
+    setEditDraft(null);
     try {
       const content = await file.text();
       if (!content.trim()) {
@@ -424,11 +401,12 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
     }
   };
 
-  // ===== 编辑技能名称/描述 =====
+  // ===== 编辑技能名称、用途与正文 =====
   const [editDraft, setEditDraft] = useState<{
     id: string;
     name: string;
     description: string;
+    content: string;
   } | null>(null);
   const [editSaving, setEditSaving] = useState(false);
 
@@ -439,6 +417,7 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
       const updated = await updateExperience(editDraft.id, {
         name: editDraft.name.trim(),
         description: editDraft.description.trim(),
+        content: editDraft.content,
       });
       setExperiences((prev) =>
         prev.map((e) => (e.id === updated.id ? { ...e, ...updated } : e))
@@ -454,14 +433,24 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
     }
   };
 
-  // Esc 关闭
+  // Keep keyboard focus inside the settings dialog; restore it to the entry on exit.
+  const closeRef = useRef(requestClose);
+  useEffect(() => { closeRef.current = requestClose; });
   useEffect(() => {
+    const previous = document.activeElement as HTMLElement | null;
+    dialogRef.current?.focus();
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") { e.stopPropagation(); closeRef.current(); }
+      if (e.key !== "Tab") return;
+      const nodes = Array.from(dialogRef.current?.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), summary, [tabindex="0"]') ?? []).filter(el => el.getClientRects().length);
+      if (!nodes.length) { e.preventDefault(); return; }
+      const first = nodes[0], last = nodes[nodes.length - 1];
+      if (e.shiftKey && (document.activeElement === first || document.activeElement === dialogRef.current)) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && (document.activeElement === last || document.activeElement === dialogRef.current)) { e.preventDefault(); first.focus(); }
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+    window.addEventListener("keydown", onKey, true);
+    return () => { window.removeEventListener("keydown", onKey, true); previous?.focus(); };
+  }, []);
 
   // 切换服务商：自动填充预设的 base_url / 模型名（未设置 / Mock 清空字段）
   const pickProvider = (
@@ -492,8 +481,6 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
     }
     setTestResult({});
   };
-
-  const buildPayload = () => ({ llm, image });
 
   // 点击已保存配置 → 整组回填（Key 为脱敏串，保存时后端按历史还原真实 Key）
   const handlePickProfile = (kind: "llm" | "image", p: SavedProfile) => {
@@ -535,53 +522,45 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
   };
 
   const handleTest = async () => {
-    setTesting(true);
+    const kind = modelKind;
+    const fingerprint = currentConfig.current[kind];
+    setTesting(kind);
     setErrorMsg("");
-    setNotice("");
     try {
-      const result = await testSettings(buildPayload());
-      setTestResult(result);
+      const result = await testSettings({ llm, image }, kind);
+      if (currentConfig.current[kind] === fingerprint) setTestResult(prev => ({...prev, [kind]: {...result[kind], fingerprint}}));
     } catch (e) {
-      setErrorMsg("测试失败：" + (e as Error).message);
-    } finally {
-      setTesting(false);
-    }
+      if (currentConfig.current[kind] === fingerprint) setTestResult(prev => ({...prev, [kind]: {ok: false, message: "测试失败：" + (e as Error).message, fingerprint}}));
+    } finally { setTesting(null); }
   };
 
   const handleSave = async () => {
+    const kind = modelKind;
+    const draft = kind === "llm" ? llm : image;
     setSaving(true);
     setErrorMsg("");
     setNotice("");
     try {
-      const res = await saveSettings(buildPayload());
-      setNotice(res.message);
+      // Only commit this connection. Another tab's unsaved draft stays unsaved.
+      const latest = await getSettings();
+      const res = await saveSettings({ llm: latest.llm, image: latest.image, [kind]: draft });
+      if (kind === "llm") setLlm(res.settings.llm); else setImage(res.settings.image);
+      setBaseline(prev => ({...prev, [kind]: JSON.stringify(res.settings[kind])}));
+      setNotice(`${kind === "llm" ? "对话" : "图片"}配置已保存`);
       onSaved(res.settings);
-      // 保存成功即归档一份配置，刷新历史列表（便于之后一键切回）
       listProfiles().then(setProfiles).catch(() => {});
-      // 稍作停留后自动关闭
-      setTimeout(onClose, 600);
-    } catch (e) {
-      setErrorMsg("保存失败：" + (e as Error).message);
-    } finally {
-      setSaving(false);
-    }
+    } catch (e) { setErrorMsg("保存失败：" + (e as Error).message); }
+    finally { setSaving(false); }
   };
 
-  const handleReset = async () => {
-    setSaving(true);
-    setErrorMsg("");
-    setNotice("");
+  const openSkill = async (id: string) => {
+    if ((editDraft || importDraft) && !window.confirm("放弃当前技能的未保存修改？")) return;
     try {
-      const res = await resetSettings();
-      setLlm(res.settings.llm);
-      setImage(res.settings.image);
-      setNotice(res.message);
-      onSaved(res.settings);
-    } catch (e) {
-      setErrorMsg("恢复失败：" + (e as Error).message);
-    } finally {
-      setSaving(false);
-    }
+      const item = await getExperience(id);
+      setImportDraft(null);
+      setEditDraft({id, name: item.name, description: item.description, content: item.content});
+      setExpNotice("");
+    } catch (e) { setExpNotice("读取技能失败：" + (e as Error).message); }
   };
 
   const providerOptions = (kind: "llm" | "image") => {
@@ -592,66 +571,42 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
     return entries;
   };
 
-  const resultStyle = (r?: TestResult): React.CSSProperties => ({
-    fontSize: 12,
-    marginTop: 4,
-    color: r ? (r.ok ? "#4ade80" : "#f87171") : "#888",
-  });
+  const filteredSkills = experiences.filter(exp =>
+    (skillKind === "all" || (exp.kind || "style") === skillKind) &&
+    `${exp.name} ${exp.description}`.toLowerCase().includes(search.toLowerCase())
+  );
+  const dirty = baseline[modelKind] !== JSON.stringify(modelKind === "llm" ? llm : image);
+  const candidateResult = testResult[modelKind];
+  const activeResult = candidateResult?.fingerprint === JSON.stringify(modelKind === "llm" ? llm : image) ? candidateResult : undefined;
 
   return (
-    <div
-      style={{
-        position: "fixed",
-        inset: 0,
-        background: "rgba(0,0,0,0.45)",
-        zIndex: 2000,
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-      }}
-      onMouseDown={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
-    >
-      <div
-        style={{
-          width: 560,
-          maxWidth: "92vw",
-          maxHeight: "88vh",
-          overflowY: "auto",
-          background: "rgba(26,26,46,0.98)",
-          border: "1px solid rgba(255,255,255,0.12)",
-          borderRadius: 12,
-          padding: "18px 20px 16px",
-          boxShadow: "0 12px 48px rgba(0,0,0,0.5)",
-        }}
-      >
-        {/* 标题 */}
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-            marginBottom: 4,
-          }}
-        >
-          <span style={{ fontSize: 16, fontWeight: 600, color: "#fff" }}>
-            ⚙ 大模型设置
-          </span>
-          <span
-            onClick={onClose}
-            style={{ color: "#888", fontSize: 13, cursor: "pointer" }}
-          >
-            ✕
-          </span>
-        </div>
-        <div style={{ color: "#777", fontSize: 12 }}>
-          对话模型与图片生成可分别使用不同服务商，保存后立即生效（无需重启）
-        </div>
-
+    <div className="settings-overlay" onMouseDown={e => { if (e.target === e.currentTarget) requestClose(); }}>
+      <div className="settings-shell" role="dialog" aria-modal="true" aria-labelledby="settings-title" tabIndex={-1} ref={dialogRef}>
+        <header className="settings-header">
+          <h2 id="settings-title">设置</h2>
+          <button className="settings-close" aria-label="关闭设置" onClick={requestClose}>×</button>
+        </header>
+        <div className="settings-body">
+          <nav className="settings-nav" aria-label="设置分类">
+            <button aria-current={tab === "models" ? "page" : undefined} onClick={() => {setTab("models");setNotice("");}}><SettingsNavIcon name="models" />模型与服务</button>
+            <button aria-current={tab === "skills" ? "page" : undefined} onClick={() => {setTab("skills");setNotice("");}}><SettingsNavIcon name="skills" />技能库 <small>{experiences.length}</small></button>
+            <button aria-current={tab === "memory" ? "page" : undefined} onClick={() => {setTab("memory");setNotice("");}}><SettingsNavIcon name="memory" />偏好与记忆</button>
+            <div className="settings-nav-note">Infinite Canvas</div>
+          </nav>
+          <div className="settings-workspace">
+            {loading ? <div className="settings-empty" role="status">正在加载设置…</div> : <>
+            {tab === "models" && <>
+              <div className="settings-page-heading"><div><h3>模型与服务</h3><p>分别配置对话与图片生成使用的连接。</p></div></div>
+              <div className="settings-model-switch" role="group" aria-label="连接类型">
+                <button aria-pressed={modelKind === "llm"} onClick={() => {setModelKind("llm");setNotice("");}}><span>对话模型</span><strong>{llm.model || "跟随环境配置"}</strong></button>
+                <button aria-pressed={modelKind === "image"} onClick={() => {setModelKind("image");setNotice("");}}><span>图片生成</span><strong>{image.source === "openart" ? image.openart_model || "nano-banana-2" : image.model || "跟随环境配置"}</strong></button>
+              </div>
+              <div className="settings-scroll settings-connection">
+                <fieldset disabled={saving || testing !== null}>
+                  {modelKind === "llm" ? <>
         {/* ===== 对话模型 ===== */}
         <div style={sectionTitleStyle}>
-          💬 对话模型（Agent 大脑）
+          对话连接
         </div>
         <label style={labelStyle}>服务商</label>
         <select
@@ -709,16 +664,10 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
             />
           </>
         )}
-        {testResult.llm && (
-          <div style={resultStyle(testResult.llm)}>
-            {testResult.llm.ok ? "✓ " : "✗ "}
-            {testResult.llm.message}
-          </div>
-        )}
-
+                  </> : <>
         {/* ===== 图片生成 ===== */}
         <div style={sectionTitleStyle}>
-          🖼️ 图片生成模型
+          图片连接
         </div>
         <label style={labelStyle}>生图来源</label>
         <select
@@ -749,7 +698,7 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
               fetchModels={() => listModels({ kind: "image", provider: "openart", api_key: "", base_url: "" })}
             />
             <div style={{ color: "#999", fontSize: 12, marginTop: 6 }}>
-              首次使用请点下方“测试连接”；未登录时先在终端运行 openart login。
+              未登录时，请先在终端运行 openart login。
             </div>
           </>
         ) : (
@@ -853,218 +802,42 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
         )}
           </>
         )}
-        {testResult.image && (
-          <div style={resultStyle(testResult.image)}>
-            {testResult.image.ok ? "✓ " : "✗ "}
-            {testResult.image.message}
-          </div>
-        )}
-
-        {/* ===== 我的偏好（跨画布记忆） ===== */}
-        <div style={sectionTitleStyle}>我的偏好（已记忆 {memories.length} 条）</div>
-        <div style={{ color: "#777", fontSize: 12, margin: "4px 0 8px" }}>
-          Agent 会跨画布参考这些偏好；此处逐条独立保存，不影响服务商配置
-        </div>
-        {memories.length === 0 ? (
-          <div style={{ color: "#666", fontSize: 12, padding: "6px 0" }}>
-            暂无记忆偏好
-          </div>
-        ) : (
-          memories.map((item) => {
-            const text = memoryDrafts[item.id] ?? item.text;
-            const pendingAction = memoryPending?.id === item.id ? memoryPending.action : null;
-            return (
-              <div
-                key={item.id}
-                style={{
-                  marginTop: 6,
-                  padding: 10,
-                  background: "rgba(255,255,255,0.04)",
-                  borderRadius: 6,
-                  border: "1px solid rgba(255,255,255,0.08)",
-                }}
-              >
-                <textarea
-                  aria-label="偏好内容"
-                  style={{
-                    ...inputStyle,
-                    minHeight: 58,
-                    resize: "vertical",
-                    lineHeight: 1.5,
-                  }}
-                  value={text}
-                  disabled={pendingAction !== null}
-                  onChange={(e) =>
-                    setMemoryDrafts((prev) => ({ ...prev, [item.id]: e.target.value }))
-                  }
-                />
-                <div style={{ display: "flex", gap: 8, marginTop: 6, justifyContent: "flex-end" }}>
-                  <button
-                    onClick={() => handleSaveMemory(item)}
-                    disabled={memoryPending !== null || !text.trim()}
-                    style={{
-                      ...inputStyle,
-                      width: "auto",
-                      padding: "6px 12px",
-                      cursor: "pointer",
-                      background: "rgba(167,139,250,0.22)",
-                      borderColor: "rgba(167,139,250,0.42)",
-                      color: "#eee",
-                    }}
-                  >
-                    {pendingAction === "save" ? "保存中..." : "保存"}
-                  </button>
-                  <button
-                    onClick={() => handleDeleteMemory(item.id)}
-                    disabled={memoryPending !== null}
-                    style={{
-                      ...inputStyle,
-                      width: "auto",
-                      padding: "6px 12px",
-                      cursor: "pointer",
-                      background: "transparent",
-                      color: "#f87171",
-                    }}
-                  >
-                    {pendingAction === "delete" ? "删除中..." : "删除"}
-                  </button>
-                </div>
+                  </>}
+                </fieldset>
               </div>
-            );
-          })
-        )}
-        {memoryNotice && (
-          <div style={{ color: "#a78bfa", fontSize: 12, marginTop: 8 }}>{memoryNotice}</div>
-        )}
-
-        {/* ===== 技能库（提示词技能） ===== */}
-        <div style={sectionTitleStyle}>🛠️ 技能库（提示词技能）</div>
-        <div style={{ color: "#777", fontSize: 12, margin: "4px 0 8px" }}>
-          手动沉淀或导入技能 MD，生成图片时可在面板中选择；Agent 对话也会按需引用
-        </div>
-
-        {/* 技能列表 */}
-        {experiences.length === 0 && !importDraft && (
-          <div style={{ color: "#666", fontSize: 12, padding: "6px 0" }}>
-            暂无技能，可手动新建或导入第一个 MD
-          </div>
-        )}
-        {experiences.map((exp) =>
-          // 编辑态：名称/描述表单（保存调 PUT，改正文需删了重导）
-          editDraft?.id === exp.id ? (
-            <div
-              key={exp.id}
-              style={{
-                marginTop: 6,
-                padding: 10,
-                background: "rgba(167,139,250,0.06)",
-                borderRadius: 6,
-                border: "1px solid rgba(167,139,250,0.25)",
-              }}
-            >
-              <label style={labelStyle}>技能名称</label>
-              <input
-                style={inputStyle}
-                value={editDraft.name}
-                onChange={(e) => setEditDraft({ ...editDraft, name: e.target.value })}
-                autoFocus
-              />
-              <label style={labelStyle}>一句话描述（Agent 按此判断何时使用）</label>
-              <input
-                style={inputStyle}
-                value={editDraft.description}
-                onChange={(e) => setEditDraft({ ...editDraft, description: e.target.value })}
-                placeholder="如：低饱和暖色、晕染、留白，适合儿童绘本"
-              />
-              <div style={{ display: "flex", gap: 8, marginTop: 10, justifyContent: "flex-end" }}>
-                <button
-                  onClick={() => setEditDraft(null)}
-                  disabled={editSaving}
-                  style={{
-                    ...inputStyle,
-                    width: "auto",
-                    padding: "7px 12px",
-                    cursor: "pointer",
-                    background: "transparent",
-                    color: "#999",
-                  }}
-                >
-                  取消
-                </button>
-                <button
-                  onClick={handleEditSave}
-                  disabled={editSaving || !editDraft.name.trim()}
-                  style={{
-                    ...inputStyle,
-                    width: "auto",
-                    padding: "7px 12px",
-                    cursor: "pointer",
-                    background: "rgba(167,139,250,0.25)",
-                    color: "#eee",
-                  }}
-                >
-                  {editSaving ? "保存中..." : "保存"}
-                </button>
-              </div>
-            </div>
-          ) : (
-            <div
-              key={exp.id}
-              style={{
-                display: "flex",
-                alignItems: "flex-start",
-                gap: 8,
-                padding: "7px 10px",
-                marginTop: 6,
-                background: "rgba(255,255,255,0.04)",
-                borderRadius: 6,
-                border: "1px solid rgba(255,255,255,0.08)",
-              }}
-            >
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ color: "#ddd", fontSize: 13, fontWeight: 600 }}>
-                  {exp.name}
+              <footer className="settings-connection-footer">
+                <div className="settings-test-status" role="status" data-state={activeResult ? activeResult.ok ? "success" : "error" : "idle"}>
+                  {testing === modelKind ? "正在测试当前连接…" : activeResult ? activeResult.message : "当前配置尚未测试"}
+                  <small>{modelKind === "image" ? "连接测试不生成图片；模型效果请在画布中验证。" : "发送一条最小对话请求验证，不保存配置。"}</small>
                 </div>
-                <div style={{ color: "#888", fontSize: 12, marginTop: 2, wordBreak: "break-word" }}>
-                  {exp.description || "（无描述，Agent 判断匹配时可能不准，建议补一句适用场景）"}
+                <div className="settings-actions">
+                  <button disabled={saving || testing !== null} onClick={handleTest}>{testing === modelKind ? "测试中…" : "测试当前连接"}</button>
+                  <button className="primary" disabled={saving || testing !== null || !dirty} onClick={handleSave}>{saving ? "保存中…" : "保存此连接"}</button>
                 </div>
-              </div>
-              <button
-                onClick={() =>
-                  setEditDraft({ id: exp.id, name: exp.name, description: exp.description })
-                }
-                style={{
-                  background: "transparent",
-                  border: "none",
-                  color: "#a78bfa",
-                  fontSize: 12,
-                  cursor: "pointer",
-                  padding: "2px 4px",
-                  whiteSpace: "nowrap",
-                }}
-                title={`编辑《${exp.name}》的名称/描述`}
-              >
-                编辑
-              </button>
-              <button
-                onClick={() => handleDeleteExp(exp.id, exp.name)}
-                style={{
-                  background: "transparent",
-                  border: "none",
-                  color: "#f87171",
-                  fontSize: 12,
-                  cursor: "pointer",
-                  padding: "2px 4px",
-                  whiteSpace: "nowrap",
-                }}
-                title={`删除《${exp.name}》`}
-              >
-                删除
-              </button>
-            </div>
-          )
-        )}
-
+              </footer>
+            </>}
+            {tab === "skills" && <>
+              <div className="settings-page-heading"><div><h3>技能库</h3><p>管理可在对话和图片生成中调用的提示词。</p></div><div className="settings-actions">
+                <button onClick={() => fileInputRef.current?.click()}>导入 MD</button>
+                <button className="primary" onClick={() => {if ((editDraft || importDraft) && !window.confirm("放弃当前技能的未保存修改？")) return; setEditDraft(null);setImportDraft({name:"",description:"",content:""});setDraftSource("manual");}}>＋ 新建</button>
+              </div></div>
+              <div className="settings-skill-tools"><input aria-label="搜索技能" placeholder="搜索名称或用途…" value={search} onChange={e => setSearch(e.target.value)} /><select aria-label="筛选技能类型" value={skillKind} onChange={e => setSkillKind(e.target.value)}><option value="all">全部类型</option><option value="style">风格指南</option><option value="preset">场景预设</option></select></div>
+              <div className="settings-scroll settings-skills">
+                {!importDraft && !editDraft && <div className="settings-skill-list">
+                  {filteredSkills.map(exp => <div className="settings-skill-row" key={exp.id}>
+                    <button className="settings-skill-open" onClick={() => openSkill(exp.id)}><strong>{exp.name}</strong><span>{exp.description || "暂无用途描述"}</span></button>
+                    {new Set(experiences.map(item => item.kind || "style")).size > 1 && <span className="settings-kind">{exp.kind === "preset" ? "预设" : "风格"}</span>}
+                    <details className="settings-skill-menu"><summary aria-label={`管理${exp.name}`}>···</summary><div><button onClick={() => openSkill(exp.id)}>编辑技能</button><button onClick={() => {if (window.confirm(`删除《${exp.name}》？此操作无法撤销。`)) handleDeleteExp(exp.id, exp.name);}}>删除技能</button></div></details>
+                  </div>)}
+                  {!filteredSkills.length && <div className="settings-empty">{search || skillKind !== "all" ? "没有匹配的技能" : "暂无技能，导入 MD 或新建一个。"}</div>}
+                </div>}
+                {editDraft && <div className="settings-editor">
+                  <div className="settings-editor-heading"><h4>编辑技能</h4><button onClick={() => {if(window.confirm("放弃当前技能的修改？")) setEditDraft(null);}}>返回列表</button></div>
+                  <label>技能名称<input value={editDraft.name} onChange={e => setEditDraft({...editDraft,name:e.target.value})} /></label>
+                  <label>一句话用途<input value={editDraft.description} onChange={e => setEditDraft({...editDraft,description:e.target.value})} /></label>
+                  <label>Markdown 正文<textarea value={editDraft.content} onChange={e => setEditDraft({...editDraft,content:e.target.value})} /></label>
+                  <div className="settings-actions"><button className="primary" disabled={editSaving || !editDraft.name.trim() || !editDraft.content.trim()} onClick={handleEditSave}>{editSaving ? "保存中…" : "保存技能"}</button></div>
+                </div>}
         {/* 新建/导入表单：手动模式可直接编辑 Markdown 正文 */}
         {importDraft ? (
           <div
@@ -1178,41 +951,7 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
               </button>
             </div>
           </div>
-        ) : (
-          <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
-            <button
-              onClick={() => {
-                setImportDraft({ name: "", description: "", content: "" });
-                setDraftSource("manual");
-                setExpNotice("");
-              }}
-              disabled={importing}
-              style={{
-                ...inputStyle,
-                flex: 1,
-                cursor: "pointer",
-                background: "rgba(167,139,250,0.22)",
-                borderColor: "rgba(167,139,250,0.42)",
-                color: "#eee",
-              }}
-            >
-              ＋ 手动新建
-            </button>
-            <button
-              onClick={() => fileInputRef.current?.click()}
-              disabled={importing}
-              style={{
-                ...inputStyle,
-                flex: 1,
-                cursor: "pointer",
-                background: "rgba(255,255,255,0.08)",
-                color: "#ddd",
-              }}
-            >
-              📁 导入 MD 文件
-            </button>
-          </div>
-        )}
+        ) : null}
         <input
           ref={fileInputRef}
           type="file"
@@ -1228,74 +967,92 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
           <div style={{ color: "#a78bfa", fontSize: 12, marginTop: 8 }}>{expNotice}</div>
         )}
 
-        {/* 提示信息 */}
-        {errorMsg && (
-          <div style={{ color: "#f87171", fontSize: 12, marginTop: 12 }}>
-            {errorMsg}
-          </div>
-        )}
-        {notice && (
-          <div style={{ color: "#4ade80", fontSize: 12, marginTop: 12 }}>
-            {notice}
-          </div>
-        )}
-
-        {/* 操作按钮 */}
-        <div
-          style={{
-            display: "flex",
-            gap: 10,
-            marginTop: 18,
-            justifyContent: "flex-end",
-          }}
-        >
-          <button
-            onClick={handleReset}
-            disabled={saving || testing}
-            style={{
-              ...inputStyle,
-              width: "auto",
-              padding: "8px 14px",
-              cursor: "pointer",
-              background: "transparent",
-              color: "#999",
-            }}
-          >
-            恢复默认
-          </button>
-          <button
-            onClick={handleTest}
-            disabled={saving || testing}
-            style={{
-              ...inputStyle,
-              width: "auto",
-              padding: "8px 14px",
-              cursor: "pointer",
-              background: "rgba(255,255,255,0.08)",
-              color: "#ddd",
-            }}
-          >
-            {testing ? "测试中..." : "测试连接"}
-          </button>
-          <button
-            onClick={handleSave}
-            disabled={saving || testing}
-            style={{
-              ...inputStyle,
-              width: "auto",
-              padding: "8px 18px",
-              cursor: "pointer",
-              background: "rgba(99,102,241,0.85)",
-              borderColor: "rgba(99,102,241,0.9)",
-              color: "#fff",
-              fontWeight: 600,
-            }}
-          >
-            {saving ? "保存中..." : "保存"}
-          </button>
+              </div>
+            </>}
+            {tab === "memory" && <><div className="settings-page-heading"><div><h3>偏好与记忆</h3><p>查看和调整 Agent 记住的使用偏好。</p></div></div><div className="settings-scroll settings-memory">
+        {/* ===== 我的偏好（跨画布记忆） ===== */}
+        <div style={sectionTitleStyle}>已记忆 {memories.length} 条偏好</div>
+        <div style={{ color: "#777", fontSize: 12, margin: "4px 0 8px" }}>
+          Agent 会在不同画布中参考这些偏好。每条修改独立保存。
         </div>
+        {memories.length === 0 ? (
+          <div style={{ color: "#666", fontSize: 12, padding: "6px 0" }}>
+            暂无记忆偏好
+          </div>
+        ) : (
+          memories.map((item) => {
+            const text = memoryDrafts[item.id] ?? item.text;
+            const pendingAction = memoryPending?.id === item.id ? memoryPending.action : null;
+            return (
+              <div
+                key={item.id}
+                style={{
+                  marginTop: 6,
+                  padding: 10,
+                  background: "rgba(255,255,255,0.04)",
+                  borderRadius: 6,
+                  border: "1px solid rgba(255,255,255,0.08)",
+                }}
+              >
+                <textarea
+                  aria-label="偏好内容"
+                  style={{
+                    ...inputStyle,
+                    minHeight: 58,
+                    resize: "vertical",
+                    lineHeight: 1.5,
+                  }}
+                  value={text}
+                  disabled={pendingAction !== null}
+                  onChange={(e) =>
+                    setMemoryDrafts((prev) => ({ ...prev, [item.id]: e.target.value }))
+                  }
+                />
+                <div style={{ display: "flex", gap: 8, marginTop: 6, justifyContent: "flex-end" }}>
+                  <button
+                    onClick={() => handleSaveMemory(item)}
+                    disabled={memoryPending !== null || !text.trim()}
+                    style={{
+                      ...inputStyle,
+                      width: "auto",
+                      padding: "6px 12px",
+                      cursor: "pointer",
+                      background: "rgba(167,139,250,0.22)",
+                      borderColor: "rgba(167,139,250,0.42)",
+                      color: "#eee",
+                    }}
+                  >
+                    {pendingAction === "save" ? "保存中..." : "保存"}
+                  </button>
+                  <button
+                    onClick={() => {if (window.confirm("删除这条偏好？")) handleDeleteMemory(item.id);}}
+                    disabled={memoryPending !== null}
+                    style={{
+                      ...inputStyle,
+                      width: "auto",
+                      padding: "6px 12px",
+                      cursor: "pointer",
+                      background: "transparent",
+                      color: "#f87171",
+                    }}
+                  >
+                    {pendingAction === "delete" ? "删除中..." : "删除"}
+                  </button>
+                </div>
+              </div>
+            );
+          })
+        )}
+        {memoryNotice && (
+          <div style={{ color: "#a78bfa", fontSize: 12, marginTop: 8 }}>{memoryNotice}</div>
+        )}
 
-        {/* select 下拉选项深色样式 */}
+            </div></>}
+            </>}
+            {errorMsg && <div className="settings-message error" role="alert">{errorMsg}</div>}
+            {notice && <div className="settings-message" role="status">{notice}</div>}
+          </div>
+        </div>
         <style>{SELECT_CSS}</style>
       </div>
     </div>

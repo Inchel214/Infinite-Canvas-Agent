@@ -827,9 +827,10 @@ export async function getLanInterfaces(): Promise<LanInterface[]> {
 }
 
 export async function testSettings(
-  payload: SettingsPayload
+  payload: SettingsPayload,
+  kind?: "llm" | "image"
 ): Promise<{ llm: TestResult; image: TestResult }> {
-  const res = await fetch(`${API_BASE}/settings/test`, {
+  const res = await fetch(`${API_BASE}/settings/test${kind ? `?kind=${kind}` : ""}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -957,10 +958,10 @@ export async function addExperience(
   return data.experience;
 }
 
-// 编辑风格名称/描述（不改正文）
+// 编辑技能名称、描述及可选正文
 export async function updateExperience(
   id: string,
-  patch: { name?: string; description?: string }
+  patch: { name?: string; description?: string; content?: string }
 ): Promise<ExperienceMeta> {
   const res = await fetch(`${API_BASE}/experiences/${id}`, {
     method: "PUT",
