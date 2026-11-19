@@ -109,7 +109,9 @@ html[data-input] [data-mask-editor] [data-mask-panel] {
 .agent-copy-reply { align-self:flex-start; display:inline-flex; align-items:center; justify-content:center; width:28px; height:28px; border:0; border-radius:5px; padding:5px; background:transparent; color:#999; cursor:pointer; transition:color .15s, background .15s; }
 .agent-action-status { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip-path:inset(50%); white-space:nowrap; }
 .agent-copy-reply:hover, .agent-copy-reply:focus-visible { color:#e8e8f0; background:rgba(255,255,255,.08); }
-.agent-text-menu { position:fixed; z-index:10000; width:212px; padding:5px; border:1px solid rgba(255,255,255,.14); border-radius:9px; background:#24242c; box-shadow:0 8px 28px rgba(0,0,0,.4); }
-.agent-text-menu button { width:100%; border:0; border-radius:5px; padding:9px 10px; background:transparent; color:#eee; text-align:left; cursor:pointer; font:inherit; font-size:13px; }
+.agent-text-menu { position:fixed; z-index:10000; width:274px; padding:6px; border:1px solid #4f46a5; border-radius:12px; background:#1a1a2e; box-shadow:0 8px 28px rgba(0,0,0,.4); }
+.agent-text-menu-heading { padding:6px 12px 9px; margin-bottom:4px; border-bottom:1px solid rgba(255,255,255,.1); color:#888899; font-size:12px; }
+.agent-text-menu-hint { font-size:11px; color:#aaa; }
+.agent-text-menu button { display:flex; align-items:center; justify-content:space-between; gap:10px; width:100%; border:0; border-radius:5px; padding:10px 12px; background:transparent; color:#eee; text-align:left; cursor:pointer; font:inherit; font-size:13px; }
 .agent-text-menu button:hover, .agent-text-menu button:focus-visible { background:rgba(167,139,250,.18); }
 .agent-text-menu button:disabled { opacity:.5; cursor:wait; }

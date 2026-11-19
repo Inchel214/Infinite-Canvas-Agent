@@ -988,7 +988,7 @@ export async function createTextNode(canvasId: string, content: string, x: numbe
   const res = await fetch(`${API_BASE}/canvas/${canvasId}/nodes/text`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ nodes: [{ content, x, y, width: 280, height: 180 }] }),
+    body: JSON.stringify({ nodes: [{ content, x, y, width: 480, height: 480 }] }),
   });
   if (!res.ok) throw new Error("文字保存失败，请重试");
   return getCanvas(canvasId);

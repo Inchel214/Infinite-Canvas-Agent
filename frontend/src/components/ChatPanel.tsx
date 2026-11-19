@@ -431,6 +431,8 @@ interface ChatPanelProps {
   onCanvasUpdate: (canvas: CanvasState) => void;
   // 点击工具卡片"定位"：把对应新节点移到视野中央并短暂高亮
   onLocateNode?: (nodeId: string) => void;
+  onCreateImageContainer?: (prompt: string) => void;
+  onStatus?: (message: string) => void;
   // 外部（另一端设备）写入画布时递增的同步信号：用于拉取最新对话历史
   syncToken?: number;
   // 该画布当前生成中的任务数（含另一端发起的）；本端未流式时用于提示
@@ -928,6 +930,8 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
   onClearRefs,
   onCanvasUpdate,
   onLocateNode,
+  onCreateImageContainer,
+  onStatus,
   syncToken = 0,
   remoteGenerating = 0,
 }: ChatPanelProps, ref) {
@@ -962,6 +966,7 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
       const node = Object.values(canvas.nodes).find((node) => !canvasNodes.some((existing) => existing.id === node.id)
         && node.type === "text" && node.content === textMenu.text);
       if (node) onLocateNode?.(node.id);
+      onStatus?.(`已创建文字节点${node?.index != null ? ` #${node.index}` : ""} · 已定位到画布中央`);
       setTextMenu(null);
     } catch (error) {
       setTextNodeError(error instanceof Error ? error.message : "创建失败，请重试");
@@ -1681,8 +1686,8 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
           event.preventDefault();
           event.stopPropagation();
           setTextNodeError("");
-          setTextMenu({ x: Math.max(8, Math.min(event.clientX, window.innerWidth - 228)),
-            y: Math.max(8, Math.min(event.clientY, window.innerHeight - 110)), text });
+          setTextMenu({ x: Math.max(8, Math.min(event.clientX, window.innerWidth - 290)),
+            y: Math.max(8, Math.min(event.clientY, window.innerHeight - 160)), text });
         }}
         style={{
           flex: 1,
@@ -2434,9 +2439,14 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
       {textMenu && createPortal(<div role="menu" aria-label="选中文字操作" className="agent-text-menu"
         style={{ left: textMenu.x, top: textMenu.y }} onPointerDown={(event) => event.stopPropagation()}
         onMouseDown={(event) => event.preventDefault()}>
+        <div className="agent-text-menu-heading">选中文字</div>
         <button type="button" role="menuitem" disabled={creatingText} onClick={() => void createSelectedText()}>
-          {creatingText ? "正在创建…" : "创建文字节点"}
+          <span>{creatingText ? "正在创建…" : "✎ 新建文字节点"}</span><span className="agent-text-menu-hint">提示词 / 备注</span>
         </button>
+        {onCreateImageContainer && <button type="button" role="menuitem" disabled={creatingText}
+          onClick={() => { onCreateImageContainer(textMenu.text); setTextMenu(null); }}>
+          <span>📦 新建图片容器</span><span className="agent-text-menu-hint">选中文字作提示词</span>
+        </button>}
         {textNodeError && <div role="alert" style={{ color: "#f87171", padding: "6px 10px", fontSize: 12 }}>{textNodeError}</div>}
       </div>, document.body)}
     </div>

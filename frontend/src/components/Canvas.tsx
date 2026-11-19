@@ -469,6 +469,8 @@ interface CanvasProps {
   onNewCanvas?: () => void;
   // 对话卡片"定位"请求：token 变化时把指定节点移到视野中央并短暂高亮
   focusRequest?: { nodeId: string; token: number } | null;
+  chatImageRequest?: { canvasId: string; prompt: string; token: number } | null;
+  onStatus?: (message: string) => void;
 }
 
 /**
@@ -477,7 +479,7 @@ interface CanvasProps {
  * 多选：单击/Ctrl+Shift+点选、空白直接拖动框选、右键菜单直接生成
  * 平移：空格+拖动 / Shift+拖动 / 鼠标中键拖动
  */
-export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved, onAction, onCanvasUpdate, onAddToChat, chatDockWidth = 0, onNewCanvas, focusRequest }: CanvasProps) {
+export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved, onAction, onCanvasUpdate, onAddToChat, chatDockWidth = 0, onNewCanvas, focusRequest, chatImageRequest, onStatus }: CanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   // 相机视角存档：每个画布记住用户上次停留的视角（localStorage），切回/刷新时还原。
   // 否则切画布时组件重挂载、视角重置到世界原点——内容不在原点附近时就表现为"画布空白不显示"
@@ -1040,7 +1042,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
 
   // 创建待生成容器（居中于世界坐标 wx/wy 处，可带初始参考图）：
   // 尺寸以编辑态屏幕像素保存，锚点保存在画布世界坐标中；生成后尺寸按世界单位解释。
-  const createContainer = useCallback((wx: number, wy: number, refId?: string) => {
+  const createContainer = useCallback((wx: number, wy: number, refId?: string, prompt = "") => {
     containerSeqRef.current += 1;
     const w = CONTAINER_BASE_W;
     const h = CONTAINER_BASE_H;
@@ -1055,11 +1057,30 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       h,
       aspect: refNode?.image_url ? closestPresetAspectKey(refNode.width, refNode.height) : "1:1",
       resolution: "2K",
-      prompt: "",
+      prompt,
       refIds: refId ? [refId] : [],
     };
     setContainers((prev) => [...prev, c]);
+    return c;
   }, [nodes, zoom, setContainers]);
+
+  const appliedChatImageTokenRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!chatImageRequest || chatImageRequest.canvasId !== canvasId
+      || appliedChatImageTokenRef.current === chatImageRequest.token || !containerRef.current) return;
+    appliedChatImageTokenRef.current = chatImageRequest.token;
+    const right = Math.max(100, ...nodes.map((node) => node.x + node.width + 40),
+      ...containers.map((container) => container.x + container.w / zoom + 40));
+    const top = nodes.length ? Math.min(...nodes.map((node) => node.y)) : 100;
+    const container = createContainer(right + CONTAINER_BASE_W / (2 * zoom),
+      top + CONTAINER_BASE_H / (2 * zoom), undefined, chatImageRequest.prompt);
+    const availW = Math.max(240, containerRef.current.clientWidth - chatDockWidth - 24);
+    setPan({ x: (availW - container.w) / 2 - container.x * zoom,
+      y: (containerRef.current.clientHeight - container.h) / 2 - container.y * zoom });
+    userPannedRef.current = true;
+    activeContainerIdRef.current = container.id;
+    onStatus?.("已创建图片容器 · 已定位到画布中央，选中文字已填入提示词");
+  }, [chatImageRequest, canvasId, nodes, containers, zoom, chatDockWidth, createContainer, onStatus]);
 
   const updateContainer = useCallback((id: string, patch: Partial<PendingContainer>) => {
     setContainers((prev) => prev.map((c) => (c.id === id ? { ...c, ...patch } : c)));

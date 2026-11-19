@@ -84,6 +84,16 @@ function App() {
   const chatPanelRef = useRef<ChatPanelRef>(null);
   // 对话卡片"定位"：token 递增触发画布把新生成节点移到视野中央
   const [focusRequest, setFocusRequest] = useState<{ nodeId: string; token: number } | null>(null);
+  const [chatImageRequest, setChatImageRequest] = useState<{ canvasId: string; prompt: string; token: number } | null>(null);
+  const chatImageSequence = useRef(0);
+  const handleChatImage = useCallback((prompt: string) => {
+    if (!canvasId) return;
+    setChatImageRequest({ canvasId, prompt, token: ++chatImageSequence.current });
+  }, [canvasId]);
+  const handleChatImageCreated = useCallback((message: string) => {
+    setStatusMsg(message);
+    setChatImageRequest(null);
+  }, []);
   const handleLocateNode = useCallback((nodeId: string) => {
     setFocusRequest((prev) => ({ nodeId, token: (prev?.token ?? 0) + 1 }));
   }, []);
@@ -405,6 +415,8 @@ function App() {
         }}
         chatDockWidth={chatOpen ? chatWidth : 0}
         focusRequest={focusRequest}
+        chatImageRequest={chatImageRequest}
+        onStatus={handleChatImageCreated}
       />
 
       {/* 右上角入口：画布管理 + 大模型设置 */}
@@ -559,6 +571,8 @@ function App() {
         onClearRefs={() => setChatRefIds([])}
         onCanvasUpdate={applyCanvasState}
         onLocateNode={handleLocateNode}
+        onCreateImageContainer={handleChatImage}
+        onStatus={setStatusMsg}
         syncToken={remoteSyncToken}
         remoteGenerating={canvasId ? badges[canvasId]?.generating ?? 0 : 0}
       />
