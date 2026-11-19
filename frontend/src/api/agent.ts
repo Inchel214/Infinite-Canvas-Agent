@@ -682,6 +682,9 @@ export interface LLMSettings {
 }
 
 export interface ImageSettings {
+  secret_key?: string;
+  liblib_reference_mode?: "subject" | "img2img";
+  liblib_steps?: 20 | 30;
   source?: "api" | "openart";
   openart_model?: string;
   provider: string;
@@ -712,7 +715,7 @@ export interface SettingsPayload {
 export interface ProviderPreset {
   name: string;
   base_url: string;
-  llm_api: string;
+  llm_api: string | null;
   llm_model: string;
   image_api: string | null;
   image_model: string;
@@ -726,6 +729,9 @@ export interface TestResult {
 
 // 已保存的配置历史（成功保存后自动归档，key 脱敏回显，点击可回填）
 export interface SavedProfile {
+  secret_key?: string;
+  liblib_reference_mode?: "subject" | "img2img";
+  liblib_steps?: 20 | 30;
   id: string;
   provider: string;
   provider_name: string;

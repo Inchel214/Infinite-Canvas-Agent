@@ -44,6 +44,15 @@ PROVIDER_PRESETS: dict[str, dict] = {
         "image_model": "Kwai-Kolors/Kolors",
         "stream_model": "",
     },
+    "liblib": {
+        "name": "Liblib 星流",
+        "base_url": "https://openapi.liblibai.cloud",
+        "llm_api": None,
+        "llm_model": "",
+        "image_api": "liblib",
+        "image_model": "star-3-alpha",
+        "stream_model": "",
+    },
     "custom": {
         "name": "自定义（OpenAI 兼容）",
         "base_url": "",
@@ -75,6 +84,9 @@ class ImageConfig:
     stream_model: str = ""            # 流式生成（图片容器），留空则回退非流式
     source: str = "api"                # 独立选择来源，保留原有 API 配置
     openart_model: str = "nano-banana-2"
+    secret_key: str = ""              # Liblib SecretKey; api_key stores AccessKey
+    liblib_reference_mode: str = "subject"
+    liblib_steps: int = 30
 
 
 @dataclass

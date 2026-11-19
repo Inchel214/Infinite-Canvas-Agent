@@ -765,6 +765,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   // 对话卡片"定位"：镜头跳转时读最新节点与面板宽度，避免它们变化导致重复触发
   const nodesRef = useRef(nodes);
   nodesRef.current = nodes;
+  const collectionsRef = useRef(collections);
+  collectionsRef.current = collections;
   const chatDockWidthRef = useRef(chatDockWidth);
   chatDockWidthRef.current = chatDockWidth;
   const [highlightNodeId, setHighlightNodeId] = useState<string | null>(null);
@@ -1051,7 +1053,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       y: Math.round(y),
       w,
       h,
-      aspect: refNode ? closestPresetAspectKey(refNode.width, refNode.height) : "1:1",
+      aspect: refNode?.image_url ? closestPresetAspectKey(refNode.width, refNode.height) : "1:1",
       resolution: "2K",
       prompt: "",
       refIds: refId ? [refId] : [],
@@ -1244,11 +1246,15 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
   }, [canvasState, fitAllNodes]);
 
   // 对话卡片"定位"：把指定节点平稳移到可视区中央（避开右侧对话面板），并高亮提示位置
+  const appliedFocusTokenRef = useRef<number | null>(null);
   useEffect(() => {
-    if (!focusRequest) return;
+    if (!focusRequest || appliedFocusTokenRef.current === focusRequest.token) return;
     const node = nodesRef.current.find((n) => n.id === focusRequest.nodeId);
     const container = containerRef.current;
     if (!node || !container) return;
+    appliedFocusTokenRef.current = focusRequest.token;
+    const group = collectionsRef.current.collapsedByNode.get(node.id);
+    if (group) collectionsRef.current.update(group.id, { collapsed: false });
     const cw = container.clientWidth;
     const ch = container.clientHeight;
     const availW = Math.max(240, cw - chatDockWidthRef.current);
@@ -1275,7 +1281,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       cameraAnimTimerRef.current = null;
       setCameraAnimating(false);
     }, 420);
-  }, [focusRequest?.token]);
+  }, [focusRequest, canvasState?.version]);
 
   // 卸载时清理高亮/动画定时器
   useEffect(() => () => {
@@ -2064,7 +2070,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       const source = menu.pendingContainer;
       const next = duplicateGenerationRecipe(
         source, `pending-${crypto.randomUUID()}`,
-        Math.round(source.x + Math.max(400, source.w) + 48 / zoom), Math.round(source.y),
+        Math.round(source.x + Math.max(400, source.w) + 40), Math.round(source.y),
       );
       setContainers((previous) => [...previous, next]);
       activeContainerIdRef.current = next.id;
@@ -2095,7 +2101,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
     const id = `pending-${Date.now()}-${containerSeqRef.current}`;
     const next: PendingContainer = {
       id,
-      x: Math.round(node.x + node.width + 48 / zoom),
+      x: Math.round(node.x + node.width + 40),
       y: Math.round(node.y),
       w: CONTAINER_BASE_W,
       h: CONTAINER_BASE_H,
@@ -2119,7 +2125,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       }
     };
     image.src = node.image_url;
-  }, [selectedIds, nodes, zoom, resolution, updateContainer, setContainers, menu]);
+  }, [selectedIds, nodes, resolution, updateContainer, setContainers, menu]);
 
   // 更新节点内容（文本卡双击编辑后保存）
   const handleUpdateNodeContent = useCallback(
@@ -2336,10 +2342,21 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       if (!canvasId) return;
       // 防重入：仅拦截本容器（textarea Enter 直触）；其它容器不受影响，可并发生成
       if (generatingIdsRef.current.has(c.id)) return;
-      const prompt = c.prompt.trim();
+      const imageRefIds = c.refIds.filter((id) => nodes.find((node) => node.id === id)?.image_url);
+      const textRefs = c.refIds.map((id) => nodes.find((node) => node.id === id))
+        .filter((node): node is CanvasNode => !!node && node.type === "text");
+      const referencedPrompt = c.prompt.trim().replace(IMAGE_MENTION_RE, (mention, rawIndex: string) => {
+        const refId = c.refIds[Number(rawIndex) - 1];
+        const text = textRefs.find((node) => node.id === refId);
+        if (text) return `文字参考 #${text.index ?? text.id}`;
+        const imageIndex = imageRefIds.indexOf(refId);
+        return imageIndex >= 0 ? `@图片${imageIndex + 1}` : mention;
+      });
+      const prompt = [referencedPrompt, ...textRefs.map((node) => `文字参考 #${node.index ?? node.id}：\n${node.content}`)]
+        .filter(Boolean).join("\n\n");
       const size = calcSize(c.aspect, c.resolution);
 
-      if (c.refIds.length === 0 && !prompt) {
+      if (imageRefIds.length === 0 && !prompt) {
         updateContainer(c.id, { error: "请输入描述，或从图片拖连线进来" });
         return;
       }
@@ -2348,7 +2365,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
       if (count > 1) {
         const batch = Array.from({ length: count }, (_, i): PendingContainer => ({
           ...c, id: i === 0 ? c.id : `pending-${crypto.randomUUID()}`,
-          x: c.x + i * (Math.max(400, c.w / zoom) + 60), count: 1, error: undefined,
+          x: c.x + i * (Math.max(400, c.w) + 40), count: 1, error: undefined,
           previewUrl: undefined, exiting: false,
         }));
         setContainers((prev) => [...prev.map((item) => item.id === c.id ? batch[0] : item), ...batch.slice(1)]);
@@ -2356,7 +2373,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         return;
       }
       const op =
-        c.refIds.length === 0 ? "generate" : c.refIds.length === 1 ? "variate" : "compose";
+        imageRefIds.length === 0 ? "generate" : imageRefIds.length === 1 ? "variate" : "compose";
 
       recordExperienceUsage(c.experienceIds);
       setGeneratingIds((prev) => new Set(prev).add(c.id));
@@ -2394,8 +2411,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
             size,
             x: c.x,
             y: c.y,
-            node_id: op === "variate" ? c.refIds[0] : undefined,
-            node_ids: op === "compose" ? c.refIds : undefined,
+            node_id: op === "variate" ? imageRefIds[0] : undefined,
+            node_ids: op === "compose" ? imageRefIds : undefined,
             experience_ids: c.experienceIds?.length ? c.experienceIds : undefined,
           },
           {
@@ -2466,7 +2483,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
         });
       }
     },
-    [canvasId, updateContainer, removeContainer, onCanvasUpdate, zoom,
+    [canvasId, nodes, updateContainer, removeContainer, onCanvasUpdate,
       setContainers, setGeneratingIds, setGenProgressMap, generatingIdsRef, generatingPositionsRef]
   );
 
@@ -2561,8 +2578,9 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
           50%      { box-shadow: 0 0 0 5px rgba(196,181,253,0.55), 0 0 42px rgba(167,139,250,0.9); }
         }
         @keyframes ica-focus-pulse {
-          0%, 100% { opacity: 1; }
-          50%      { opacity: 0.45; }
+          0%, 100% { opacity: 0; }
+          10%, 55% { opacity: 1; }
+          35%, 75% { opacity: 0.45; }
         }
         @keyframes ica-dot-bounce {
           0%, 80%, 100% { transform: translateY(0); opacity: 0.4; }
@@ -2797,10 +2815,17 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
               const startY = event.clientY;
               let dimensions = { width: node.width, height: node.height };
               const move = (next: PointerEvent) => {
-                const delta = ((next.clientX - startX) * node.width + (next.clientY - startY) * node.height)
-                  / (zoom * (node.width * node.width + node.height * node.height));
-                const scale = Math.max(64 / Math.min(node.width, node.height), Math.min(4096 / Math.max(node.width, node.height), 1 + delta));
-                dimensions = { width: node.width * scale, height: node.height * scale };
+                if (node.type === "text") {
+                  dimensions = {
+                    width: Math.max(120, Math.min(4096, node.width + (next.clientX - startX) / zoom)),
+                    height: Math.max(80, Math.min(4096, node.height + (next.clientY - startY) / zoom)),
+                  };
+                } else {
+                  const delta = ((next.clientX - startX) * node.width + (next.clientY - startY) * node.height)
+                    / (zoom * (node.width * node.width + node.height * node.height));
+                  const scale = Math.max(64 / Math.min(node.width, node.height), Math.min(4096 / Math.max(node.width, node.height), 1 + delta));
+                  dimensions = { width: node.width * scale, height: node.height * scale };
+                }
                 setSizeOverrides((previous) => ({ ...previous, [node.id]: dimensions }));
               };
               const finish = () => {
@@ -2940,6 +2965,8 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
           if (!node) return null;
           return (
             <div
+              key={focusRequest?.token}
+              data-role="node-focus-highlight"
               style={{
                 position: "absolute",
                 left: node.x - 6,
@@ -2951,7 +2978,7 @@ export function Canvas({ canvasState, canvasId, busy, onNodeMoved, onNodesMoved,
                 boxShadow: "0 0 0 4px rgba(99,102,241,0.22), 0 0 28px rgba(99,102,241,0.55)",
                 pointerEvents: "none",
                 zIndex: 30,
-                animation: "ica-focus-pulse 1.2s ease-in-out 2",
+                animation: "ica-focus-pulse 2.4s ease-in-out both",
               }}
             />
           );
@@ -5345,9 +5372,10 @@ const ImageNode = memo(function ImageNode({
               boxSizing: "border-box",
               border: "2px solid #6366f1",
               borderRadius: 8,
-              fontSize: 14,
+              fontSize: 19,
               color: "#333",
-              background: "rgba(255,255,255,0.98)",
+              background: "#fff5c4",
+              lineHeight: "28px",
               resize: "none",
               outline: "none",
               fontFamily: "inherit",
@@ -5364,6 +5392,7 @@ const ImageNode = memo(function ImageNode({
       <div
         style={{
           position: "absolute",
+          zIndex: isSelected || isHovered ? 5 : 1,
           left: node.x,
           top: node.y,
           width: node.width,
@@ -5373,10 +5402,12 @@ const ImageNode = memo(function ImageNode({
           padding: "12px 16px",
           boxSizing: "border-box",
           display: "flex",
-          alignItems: "center",
-          background: "rgba(255,255,255,0.95)",
+          alignItems: "flex-start",
+          background: "#fff5c4",
+          backgroundImage: "repeating-linear-gradient(0deg, transparent, transparent 27px, rgba(139,111,40,.10) 28px)",
           borderRadius: 8,
-          fontSize: 14,
+          fontSize: 19,
+          lineHeight: "28px",
           color: "#333",
           // 选中态样式：与图片节点一致的 outline + boxShadow
           boxShadow: isSelected
@@ -5410,7 +5441,15 @@ const ImageNode = memo(function ImageNode({
           setIsEditing(true);
         }}
       >
-        <span style={{ display: "block", width: "100%", maxHeight: "100%", overflow: "hidden" }}>{node.content}</span>
+        <span style={{ display: "block", width: "100%", maxHeight: "100%", overflow: "auto", userSelect: "text" }}>{node.content}</span>
+        {isSelected && <div role="button" aria-label="缩放文字节点" title="调整文字节点大小（字号不变）"
+          onMouseDown={(event) => event.stopPropagation()} onPointerDown={onResizeStart}
+          style={{ position: "absolute", right: -6, bottom: -6, width: 14, height: 14,
+            background: "#a78bfa", border: "2px solid #fff", borderRadius: 3,
+            cursor: "nwse-resize", touchAction: "none", zIndex: 20 }} />}
+        {showPorts && <div onPointerDown={(event) => onPortPointerDown(event, 1)}
+          title="拖到图片容器，引用这段文字" style={{ position: "absolute", right: -8, top: "50%", width: 16, height: 16,
+            borderRadius: "50%", background: "#a78bfa", border: "2px solid white", cursor: "crosshair", touchAction: "none" }} />}
         {/* 编号标签：与图片节点一致，放在卡片上方 */}
         {node.index != null && (
           <div
@@ -5546,12 +5585,13 @@ function ImageMentionPrompt({
     });
 
     const label = document.createElement("span");
-    label.textContent = `@图片${index + 1}`;
+    label.textContent = node.type === "text" ? `@文字${index + 1}` : `@图片${index + 1}`;
     Object.assign(label.style, {
       color: "#c4b5fd",
       fontWeight: "650",
     });
-    mention.append(image, label);
+    if (node.image_url) mention.append(image);
+    mention.append(label);
     return mention;
   }, []);
 
@@ -5959,12 +5999,10 @@ function PendingContainerNode({
   const refNodes = container.refIds
     .map((rid) => nodes.find((n) => n.id === rid))
     .filter((n): n is CanvasNode => !!n);
-  const modeLabel =
-    refNodes.length === 0
-      ? "文生图"
-      : refNodes.length === 1
-        ? "图生图 · 1 参考图"
-        : `多图组合 · ${refNodes.length} 参考图`;
+  const imageRefCount = refNodes.filter((node) => !!node.image_url).length;
+  const textRefCount = refNodes.length - imageRefCount;
+  const modeLabel = (imageRefCount === 0 ? "文生图" : imageRefCount === 1 ? "图生图 · 1 参考图" : `多图组合 · ${imageRefCount} 参考图`)
+    + (textRefCount ? ` · ${textRefCount} 文字参考` : "");
   // 当前宽高比（迷你形状预览用）
   const aspectRatio =
     ASPECT_RATIOS.find((r) => r.key === container.aspect) ?? ASPECT_RATIOS[0];
@@ -5981,11 +6019,10 @@ function PendingContainerNode({
     fontWeight: active ? 600 : 400,
   });
 
-  // 内容统一缩放系数：取两轴换算比的较小者。字体与纵向间距只随 s 缩放（字形不变形），
-  // 较长的一轴由 width:100%/flex 控件自然重排补足——逐轴拉伸时描述框变宽/变高而文字不变形
-  const s = Math.min(container.w / CONTAINER_BASE_W, container.h / CONTAINER_BASE_H);
+  // 固定控件字号与间距，所有边和角均只改变容器宽高。
+  const s = 1; // 固定字号，容器尺寸变化只触发布局重排。
 
-  // ===== 拉伸：边柄逐轴拉伸（重排不变形），角柄整体等比缩放 =====
+  // ===== 拉伸：各方向自由调整宽高，内容自适应 =====
   const [resizeDir, setResizeDir] = useState<string | null>(null);
   const resizeStartRef = useRef<{ mx: number; my: number; x: number; y: number; w: number; h: number } | null>(null);
 
@@ -6009,7 +6046,7 @@ function PendingContainerNode({
       onChange({
         refIds: nextOrder,
         prompt: nextPrompt,
-        ...(firstNode ? { aspect: closestPresetAspectKey(firstNode.width, firstNode.height) } : {}),
+        ...(firstNode?.image_url ? { aspect: closestPresetAspectKey(firstNode.width, firstNode.height) } : {}),
         error: undefined,
       });
       return nextPrompt;
@@ -6066,18 +6103,10 @@ function PendingContainerNode({
       const dy = e.clientY - s0.my;
       let w = s0.w;
       let h = s0.h;
-      if (resizeDir === "e") w = s0.w + dx;
-      else if (resizeDir === "w") w = s0.w - dx;
-      else if (resizeDir === "s") h = s0.h + dy;
-      else if (resizeDir === "n") h = s0.h - dy;
-      else {
-        // 角柄：等比缩放（内容整体缩放保持比例），取两轴中变化较大者保证跟手
-        const fx = (s0.w + (resizeDir.includes("e") ? dx : -dx)) / s0.w;
-        const fy = (s0.h + (resizeDir.includes("s") ? dy : -dy)) / s0.h;
-        const f = Math.max(fx, fy);
-        w = s0.w * f;
-        h = s0.h * f;
-      }
+      if (resizeDir.includes("e")) w = s0.w + dx;
+      if (resizeDir.includes("w")) w = s0.w - dx;
+      if (resizeDir.includes("s")) h = s0.h + dy;
+      if (resizeDir.includes("n")) h = s0.h - dy;
       if (w < MIN_W) w = MIN_W;
       if (h < MIN_H) h = MIN_H;
       let { x, y } = s0;
@@ -6265,7 +6294,7 @@ function PendingContainerNode({
               }}
               title="拖到另一张参考图上交换槽位"
             >
-              <img
+              {n.image_url ? <img
                 src={n.image_url}
                 alt={n.content || "ref"}
                 draggable={false}
@@ -6279,6 +6308,7 @@ function PendingContainerNode({
                   display: "block",
                 }}
               />
+              : <div title={n.content} style={{ width: 40, height: 40, overflow: "hidden", padding: 3, boxSizing: "border-box", borderRadius: 8, background: "#fff5c4", color: "#554922", fontSize: 8 }}>{n.content}</div>}
               {referenceDropTargetId === n.id && <span style={{ position: "absolute", inset: 0, height: 40, display: "grid", placeItems: "center",
                 borderRadius: 8, background: "rgba(76,29,149,.72)", color: "white", fontSize: 9, fontWeight: 700, pointerEvents: "none", zIndex: 2 }}>交换</span>}
               <span
@@ -6294,7 +6324,7 @@ function PendingContainerNode({
                   whiteSpace: "nowrap",
                 }}
               >
-                图片{index + 1}
+                {n.type === "text" ? "文字" : "图片"}{index + 1}
               </span>
               <button
                 onClick={(e) => {
@@ -6473,7 +6503,7 @@ function PendingContainerNode({
         {isGenerating ? `生成中 ${Math.round(progress)}%` : `⚡ 生成 ${container.count ?? 1} 张`}
       </button>
 
-      {/* 左右上下 + 四角拉伸柄：隐形热区（仅光标反馈），拖动整体等比缩放面板 */}
+      {/* 左右上下 + 四角拉伸柄：隐形热区（仅光标反馈），拖动调整宽高并重排内容 */}
       {!container.exiting &&
         (["n", "s", "e", "w", "ne", "nw", "se", "sw"] as const).map((dir) => (
           <ContainerResizeHandle key={dir} dir={dir} thickness={handleT} onDown={onHandleDown} />

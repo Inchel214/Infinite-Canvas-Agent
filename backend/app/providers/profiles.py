@@ -48,7 +48,8 @@ class ProfileHistory:
         if (image.source != "openart" and image.provider not in ("", "mock")
                 and image.api_key and image.provider != "openart"):
             self._upsert("image", image.provider, image.api_key, image.base_url,
-                         image.model, image.stream_model)
+                         image.model, image.stream_model,
+                         image.secret_key, image.liblib_reference_mode, image.liblib_steps)
         self._store.save(self._data)
 
     def find_key(self, kind: str, provider: str, masked_key: str) -> str:
@@ -58,6 +59,13 @@ class ProfileHistory:
                 continue
             if mask_key(entry.get("api_key", "")) == masked_key:
                 return entry.get("api_key", "")
+        return ""
+
+    def find_secret(self, api_key: str, masked_secret: str) -> str:
+        for entry in self._data.get("image", []):
+            if (entry.get("provider") == "liblib" and entry.get("api_key") == api_key
+                    and mask_key(entry.get("secret_key", "")) == masked_secret):
+                return entry.get("secret_key", "")
         return ""
 
     def delete(self, kind: str, profile_id: str) -> bool:
@@ -83,6 +91,9 @@ class ProfileHistory:
             "provider_name": _provider_name(provider),
             "label": label,
             "api_key": mask_key(api_key),
+            "secret_key": mask_key(entry.get("secret_key", "")),
+            "liblib_reference_mode": entry.get("liblib_reference_mode", "subject"),
+            "liblib_steps": entry.get("liblib_steps", 30),
             "base_url": entry.get("base_url", ""),
             "model": model,
             "stream_model": entry.get("stream_model", ""),
@@ -90,7 +101,8 @@ class ProfileHistory:
         }
 
     def _upsert(self, kind: str, provider: str, api_key: str, base_url: str,
-                model: str, stream_model: str) -> None:
+                model: str, stream_model: str, secret_key: str = "",
+                reference_mode: str = "subject", steps: int = 30) -> None:
         entries = self._data.setdefault(kind, [])
         pid = _entry_id(kind, provider, base_url, api_key)
         entry = next((e for e in entries if e.get("id") == pid), None)
@@ -107,6 +119,7 @@ class ProfileHistory:
         else:
             entry.update({"base_url": base_url, "model": model,
                           "stream_model": stream_model})
+        entry.update(secret_key=secret_key, liblib_reference_mode=reference_mode, liblib_steps=steps)
         entry["updated_at"] = int(time.time())
         entries.sort(key=lambda e: e.get("updated_at", 0), reverse=True)
         self._data[kind] = entries[:MAX_PER_KIND]

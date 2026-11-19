@@ -1330,6 +1330,9 @@ class LLMConfigRequest(BaseModel):
 
 
 class ImageConfigRequest(BaseModel):
+    secret_key: str = ""
+    liblib_reference_mode: Literal["subject", "img2img"] = "subject"
+    liblib_steps: Literal[20, 30] = 30
     source: Literal["api", "openart"] = "api"
     openart_model: str = "nano-banana-2"
     provider: str = ""
@@ -1355,6 +1358,9 @@ def _masked_settings() -> dict:
             "model": s.llm.model,
         },
         "image": {
+            "secret_key": mask_key(s.image.secret_key),
+            "liblib_reference_mode": s.image.liblib_reference_mode,
+            "liblib_steps": s.image.liblib_steps,
             "source": s.image.source,
             "openart_model": s.image.openart_model,
             "provider": s.image.provider,
@@ -1382,6 +1388,20 @@ def _resolve_placeholder_key(kind: str, provider: str, api_key: str, saved) -> s
     )
 
 
+def _resolve_liblib_secret(api_key: str, secret_key: str) -> str:
+    saved = deps.manager.settings.image
+    if secret_key and "*" not in secret_key:
+        return secret_key
+    if secret_key:
+        restored = deps.manager.profiles.find_secret(api_key, secret_key)
+        if restored:
+            return restored
+    if saved.provider == "liblib" and saved.api_key == api_key:
+        if not secret_key or mask_key(saved.secret_key) == secret_key:
+            return saved.secret_key
+    return ""
+
+
 def _parse_settings(req: SettingsRequest) -> AppSettings:
     """请求数据 → AppSettings：校验 provider、补预设默认值、脱敏占位符保留原 key"""
     if req.llm.provider not in PROVIDER_PRESETS and req.llm.provider not in ("", "mock"):
@@ -1389,6 +1409,8 @@ def _parse_settings(req: SettingsRequest) -> AppSettings:
     if req.image.provider not in PROVIDER_PRESETS and req.image.provider not in ("", "mock"):
         raise HTTPException(status_code=400, detail=f"未知的图片服务商: {req.image.provider}")
 
+    if req.llm.provider == "liblib":
+        raise HTTPException(status_code=400, detail="Liblib 仅支持图片生成，不能用作对话模型")
     old = deps.manager.settings
     llm = LLMConfig(
         provider=req.llm.provider,
@@ -1397,6 +1419,9 @@ def _parse_settings(req: SettingsRequest) -> AppSettings:
         model=req.llm.model,
     )
     image = ImageConfig(
+        secret_key=req.image.secret_key,
+        liblib_reference_mode=req.image.liblib_reference_mode,
+        liblib_steps=req.image.liblib_steps,
         source=req.image.source,
         openart_model=req.image.openart_model.strip() or "nano-banana-2",
         provider=req.image.provider,
@@ -1424,9 +1449,25 @@ def _parse_settings(req: SettingsRequest) -> AppSettings:
         )
         if not image.api_key and image.source == "api":
             raise HTTPException(status_code=400, detail="图片服务商已选择，请填写 API Key")
+        if image.provider == "liblib":
+            image.secret_key = _resolve_liblib_secret(image.api_key, image.secret_key)
+            if not image.secret_key and image.source == "api":
+                raise HTTPException(status_code=400, detail="Liblib 请同时填写 AccessKey 和 SecretKey")
+            if image.model not in ("", "star-3-alpha"):
+                raise HTTPException(status_code=400, detail="Liblib 当前仅支持 star-3-alpha")
+            if image.source == "api":
+                from app.image.liblib_generator import LiblibImageGenerator
+                try:
+                    LiblibImageGenerator(image.api_key, image.secret_key,
+                                         image.base_url or PROVIDER_PRESETS["liblib"]["base_url"])
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+        else:
+            image.secret_key = ""
         resolve_preset(image, is_image=True)
     else:
         image.api_key = ""
+        image.secret_key = ""
     return AppSettings(llm=llm, image=image)
 
 
@@ -1701,6 +1742,20 @@ def test_settings(req: SettingsRequest):
             result["image"] = {"ok": True, "message": "OpenArt 已登录，连接成功（未消耗生图点数）"}
         except (ValueError, OSError) as e:
             result["image"] = {"ok": False, "message": str(e)}
+    elif req.image.provider == "liblib":
+        from app.image.liblib_generator import LiblibImageGenerator
+
+        try:
+            key = _resolve_placeholder_key("image", "liblib", req.image.api_key, deps.manager.settings.image)
+            secret = _resolve_liblib_secret(key, req.image.secret_key)
+            generator = LiblibImageGenerator(
+                key, secret, req.image.base_url or PROVIDER_PRESETS["liblib"]["base_url"],
+                model=req.image.model or "star-3-alpha",
+            )
+            generator.check_connection()
+            result["image"] = {"ok": True, "message": "Liblib 双密钥验证成功（上传签名接口；未提交生图任务）"}
+        except (ValueError, KeyError, OSError):
+            result["image"] = {"ok": False, "message": "Liblib 验证失败，请检查双密钥、地址及网络"}
     elif req.image.provider in ("", "mock"):
         result["image"] = {
             "ok": True,
@@ -1812,6 +1867,11 @@ def list_models(req: ModelsQueryRequest):
             return {"models": OpenArtImageGenerator.list_models(), "source": "api"}
         except (ValueError, OSError) as e:
             raise HTTPException(status_code=502, detail=str(e)) from e
+    if req.provider == "liblib":
+        if req.kind != "image":
+            raise HTTPException(status_code=400, detail="Liblib 仅支持图片生成")
+        return {"models": ["star-3-alpha"], "source": "preset",
+                "message": "当前接入星流 Star-3 Alpha"}
     if req.provider in ("", "mock"):
         raise HTTPException(status_code=400, detail="请先选择服务商")
     if req.provider not in PROVIDER_PRESETS:

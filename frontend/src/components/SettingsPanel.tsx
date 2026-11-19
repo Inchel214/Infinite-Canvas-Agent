@@ -482,6 +482,9 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
         ...image,
         provider,
         api_key: "",
+        secret_key: "",
+        liblib_reference_mode: "subject",
+        liblib_steps: 30,
         base_url: isPreset ? preset?.base_url || "" : "",
         model: isPreset ? preset?.image_model || "" : "",
         stream_model: isPreset ? preset?.stream_model || "" : "",
@@ -505,6 +508,9 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
       setImage((prev) => ({
         ...prev,
         source: "api",
+        secret_key: p.secret_key || "",
+        liblib_reference_mode: p.liblib_reference_mode || "subject",
+        liblib_steps: p.liblib_steps || 30,
         provider: p.provider,
         api_key: p.api_key,
         base_url: p.base_url,
@@ -581,7 +587,7 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
   const providerOptions = (kind: "llm" | "image") => {
     const entries = Object.entries(providers).filter(
       ([key, preset]) =>
-        kind === "llm" || preset.image_api !== null || key === "custom"
+        kind === "llm" ? preset.llm_api !== null : preset.image_api !== null || key === "custom"
     );
     return entries;
   };
@@ -734,7 +740,7 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
             <div style={{ color: "#999", fontSize: 12, marginTop: 8, lineHeight: 1.6 }}>
               使用本机 OpenArt 登录账号，生图消耗该账号点数。原有 API 配置会保留，可随时切回。
               <br />
-              按模型默认尺寸生成，画布尺寸选项暂不生效；不支持蒙版局部编辑。
+              按所选比例与分辨率生成（以模型支持范围为准）；不支持蒙版局部编辑。
             </div>
             <label style={labelStyle}>OpenArt 模型</label>
             <ModelField
@@ -772,14 +778,38 @@ export function SettingsPanel({ onClose, onSaved }: SettingsPanelProps) {
 
         {image.provider !== "" && image.provider !== "mock" && (
           <>
-            <label style={labelStyle}>API Key</label>
+            <label style={labelStyle}>{image.provider === "liblib" ? "AccessKey" : "API Key"}</label>
             <input
               style={inputStyle}
               type="password"
-              placeholder="sk-..."
+              placeholder={image.provider === "liblib" ? "Liblib AccessKey" : "sk-..."}
               value={image.api_key}
               onChange={(e) => setImage({ ...image, api_key: e.target.value })}
             />
+            {image.provider === "liblib" && (
+              <>
+                <label style={labelStyle}>SecretKey</label>
+                <input style={inputStyle} type="password" autoComplete="off"
+                  placeholder="Liblib SecretKey" value={image.secret_key || ""}
+                  onChange={(e) => setImage({ ...image, secret_key: e.target.value })} />
+                <label style={labelStyle}>参考图用法</label>
+                <select style={inputStyle} value={image.liblib_reference_mode || "subject"}
+                  onChange={(e) => setImage({ ...image, liblib_reference_mode: e.target.value as "subject" | "img2img" })}>
+                  <option value="subject">主体参考（实验性，测试返回上游异常）</option>
+                  <option value="img2img">图生图（整体重绘，尚未实测）</option>
+                </select>
+                <label style={labelStyle}>采样步数</label>
+                <select style={inputStyle} value={image.liblib_steps || 30}
+                  onChange={(e) => setImage({ ...image, liblib_steps: Number(e.target.value) as 20 | 30 })}>
+                  <option value={30}>30 步（文档建议）</option>
+                  <option value={20}>20 步</option>
+                </select>
+                <div style={{ fontSize: 12, color: "#888", marginTop: 6 }}>
+                  请使用英文提示词。支持文生图和 1K / 2K。主体参考实测返回 Liblib 执行异常，暂未验证可用。
+                  图生图尺寸跟随参考图；暂不支持多图组合、蒙版和草图局部编辑。
+                </div>
+              </>
+            )}
             <label style={labelStyle}>
               Base URL{image.provider === "custom" ? "（必填）" : ""}
             </label>

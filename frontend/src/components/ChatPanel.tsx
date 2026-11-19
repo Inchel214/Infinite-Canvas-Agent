@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, forwardRef, useImperativeHandle, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
+import { createPortal } from "react-dom";
 import remarkGfm from "remark-gfm";
 import {
   chatWithAgentStream,
@@ -10,6 +11,7 @@ import {
   notifyAgentActivity,
   getStreamSnapshot,
   beginRound,
+  createTextNode,
   undoRound,
   type AgentStreamEvent,
 } from "../api/agent";
@@ -55,6 +57,57 @@ interface ChatEntry {
     answered?: boolean; // 用户是否已回复
     response?: string; // 用户的回复
   };
+}
+
+function ReplyCopyButton({ text }: { text: string }) {
+  const [status, setStatus] = useState("");
+  useEffect(() => {
+    if (!status) return;
+    const timer = window.setTimeout(() => setStatus(""), 2000);
+    return () => window.clearTimeout(timer);
+  }, [status]);
+  return <button type="button" className="agent-copy-reply" aria-label="复制回复" title={status || "复制回复"}
+    onClick={async () => {
+      try { await navigator.clipboard.writeText(text); setStatus("已复制"); }
+      catch { setStatus("复制失败，请重试"); }
+    }}>
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      {status === "已复制" ? <path d="m5 12 4 4L19 6" /> : <>
+        <rect x="3" y="8" width="13" height="13" rx="3" />
+        <path d="M8 5V4a1 1 0 0 1 1-1h11a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1h-1" />
+      </>}
+    </svg>
+    <span className="agent-action-status" role="status">{status}</span>
+  </button>;
+}
+
+function ResultImageStrip({ segments, nodes, onLocate }: {
+  segments: Segment[]; nodes: CanvasNode[]; onLocate?: (id: string) => void;
+}) {
+  const images = segments.flatMap((segment) => segment.kind === "tool" && segment.success !== false
+    && segment.data?.node_id && segment.data.image_url
+      ? [{ id: segment.data.node_id, url: segment.data.image_url }] : [])
+    .filter((image, index, all) => all.findIndex((item) => item.id === image.id) === index);
+  if (!images.length) return null;
+  return <div className="agent-result-strip" aria-label="本轮生成图片">
+    {images.map((image) => {
+      const node = nodes.find((item) => item.id === image.id);
+      const label = node?.index != null ? `#${node.index}` : node ? `#${node.id.slice(0, 8)}` : "节点已移除";
+      return <button key={image.id} type="button" className="agent-result-image"
+        aria-label={node ? `定位 ${label}` : "节点已移除，无法定位"}
+        aria-disabled={!node}
+        onClick={() => { if (node) onLocate?.(node.id); }}>
+        <img src={node?.image_url || image.url} alt={label} />
+        <span className="agent-result-number">{label}</span>
+        {node && <span className="agent-result-locate" aria-hidden="true">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+            <circle cx="12" cy="12" r="8" /><circle cx="12" cy="12" r="2" fill="currentColor" stroke="none" />
+            <path d="M12 1v5m0 12v5M1 12h5m12 0h5" />
+          </svg>
+        </span>}
+      </button>;
+    })}
+  </div>;
 }
 
 interface ChatReference {
@@ -359,26 +412,7 @@ function buildHistoryEntries(
  * 新图相对画布已有内容的方位描述：告诉用户"新图放在哪了"。
  * 以其余节点的包围盒中心为参照，只在偏移超过内容跨度 20% 时才标注方向。
  */
-function describeNodePlacement(nodeId: string, nodes: CanvasNode[]): string {
-  const target = nodes.find((n) => n.id === nodeId);
-  const others = nodes.filter((n) => n.id !== nodeId);
-  if (!target || others.length === 0) return "";
-  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-  for (const n of others) {
-    minX = Math.min(minX, n.x);
-    minY = Math.min(minY, n.y);
-    maxX = Math.max(maxX, n.x + n.width);
-    maxY = Math.max(maxY, n.y + n.height);
-  }
-  const dx = target.x + target.width / 2 - (minX + maxX) / 2;
-  const dy = target.y + target.height / 2 - (minY + maxY) / 2;
-  const left = Math.abs(dx) > (maxX - minX) * 0.2 ? (dx > 0 ? "右" : "左") : "";
-  const vertical = Math.abs(dy) > (maxY - minY) * 0.2 ? (dy > 0 ? "下" : "上") : "";
-  if (left && vertical) return `画布${left}${vertical}方`;
-  if (left) return dx > 0 ? "画布右侧" : "画布左侧";
-  if (vertical) return dy > 0 ? "画布下方" : "画布上方";
-  return "画布中央";
-}
+
 
 interface ChatPanelProps {
   canvasId: string | null;
@@ -766,7 +800,9 @@ function appendTextWithBreaks(root: HTMLElement, text: string) {
 function chipMarker(dataset: DOMStringMap): string {
   const label = dataset.label || "图";
   const desc = dataset.content ? `「${dataset.content.slice(0, 60)}」` : "";
-  return `[引用图片 ${label} ${desc}(node_id=${dataset.nodeId})]`;
+  return dataset.nodeType === "text"
+    ? `[引用文字 ${label}(node_id=${dataset.nodeId})]\n${dataset.content || ""}\n[/引用文字]`
+    : `[引用图片 ${label} ${desc}(node_id=${dataset.nodeId})]`;
 }
 
 /**
@@ -818,6 +854,7 @@ function buildRefChip(node: CanvasNode): HTMLElement {
   chip.className = "ref-chip";
   chip.contentEditable = "false"; // 作为原子单位参与编辑：Backspace 整体删除
   chip.dataset.nodeId = node.id;
+  chip.dataset.nodeType = node.type;
   chip.dataset.label = label;
   if (node.content) chip.dataset.content = node.content;
   if (node.image_url) chip.dataset.imageUrl = node.image_url; // 存储图片 URL 供 Vision 使用
@@ -895,6 +932,44 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
   remoteGenerating = 0,
 }: ChatPanelProps, ref) {
   const [entries, setEntries] = useState<ChatEntry[]>([]);
+  const [textMenu, setTextMenu] = useState<{ x: number; y: number; text: string } | null>(null);
+  const [creatingText, setCreatingText] = useState(false);
+  const [textNodeError, setTextNodeError] = useState("");
+  const creatingTextRef = useRef(false);
+  useEffect(() => {
+    if (!textMenu) return;
+    const dismiss = () => setTextMenu(null);
+    const keydown = (event: KeyboardEvent) => { if (event.key === "Escape") dismiss(); };
+    window.addEventListener("pointerdown", dismiss);
+    window.addEventListener("keydown", keydown);
+    window.addEventListener("resize", dismiss);
+    return () => {
+      window.removeEventListener("pointerdown", dismiss);
+      window.removeEventListener("keydown", keydown);
+      window.removeEventListener("resize", dismiss);
+    };
+  }, [textMenu]);
+  const createSelectedText = async () => {
+    if (!canvasId || !textMenu || creatingTextRef.current) return;
+    creatingTextRef.current = true;
+    setCreatingText(true);
+    setTextNodeError("");
+    try {
+      const right = canvasNodes.length ? Math.max(...canvasNodes.map((node) => node.x + node.width)) + 40 : 100;
+      const top = canvasNodes.length ? Math.min(...canvasNodes.map((node) => node.y)) : 100;
+      const canvas = await createTextNode(canvasId, textMenu.text, right, top);
+      onCanvasUpdate(canvas);
+      const node = Object.values(canvas.nodes).find((node) => !canvasNodes.some((existing) => existing.id === node.id)
+        && node.type === "text" && node.content === textMenu.text);
+      if (node) onLocateNode?.(node.id);
+      setTextMenu(null);
+    } catch (error) {
+      setTextNodeError(error instanceof Error ? error.message : "创建失败，请重试");
+    } finally {
+      creatingTextRef.current = false;
+      setCreatingText(false);
+    }
+  };
   // 输入区是否有内容（文本或引用芯片）：驱动发送按钮禁用态
   const [hasContent, setHasContent] = useState(false);
   // “@数字”引用菜单：null 表示关闭，空字符串表示刚输入 @、展示全部画布图片
@@ -1020,8 +1095,7 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
     return canvasNodes
       .filter(
         (node) =>
-          node.type === "image" &&
-          !!node.image_url &&
+          (node.type === "text" || (node.type === "image" && !!node.image_url)) &&
           node.index != null &&
           String(node.index).includes(mentionQuery)
       )
@@ -1133,6 +1207,7 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
 
   // 左边缘拖拽拉伸：往左拖变宽，往右拖变窄，clamp 到 [MIN, MAX]
   const startResize = (e: React.MouseEvent) => {
+    if (e.button !== 0) return;
     e.preventDefault();
     resizeRef.current = { startX: e.clientX, startWidth: width };
     setResizing(true);
@@ -1595,6 +1670,20 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
       {/* 消息列表 */}
       <div
         ref={listRef}
+        onScroll={() => setTextMenu(null)}
+        onContextMenu={(event) => {
+          const selection = window.getSelection();
+          if (!canvasId || !selection || selection.isCollapsed || !selection.rangeCount) return;
+          const range = selection.getRangeAt(0);
+          if (!event.currentTarget.contains(range.startContainer) || !event.currentTarget.contains(range.endContainer)) return;
+          const text = selection.toString();
+          if (!text.trim()) return;
+          event.preventDefault();
+          event.stopPropagation();
+          setTextNodeError("");
+          setTextMenu({ x: Math.max(8, Math.min(event.clientX, window.innerWidth - 228)),
+            y: Math.max(8, Math.min(event.clientY, window.innerHeight - 110)), text });
+        }}
         style={{
           flex: 1,
           overflowY: "auto",
@@ -1844,8 +1933,7 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
                       );
                     }
                     /* 工具调用卡片：按发生顺序穿插在文本流中；生图结果附缩略图与定位入口 */
-                    const imageUrl = seg.data?.image_url;
-                    const nodeId = seg.data?.node_id;
+                    if (seg.data?.image_url && seg.data?.node_id && seg.success !== false) return null;
                     return (
                       <div
                         key={j}
@@ -1897,54 +1985,7 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
                             {seg.pending ? "执行中..." : seg.result || ""}
                           </span>
                         </div>
-                        {imageUrl && (
-                          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                            <img
-                              src={imageUrl}
-                              alt=""
-                              style={{
-                                width: 48,
-                                height: 48,
-                                objectFit: "cover",
-                                borderRadius: 6,
-                                border: "1px solid rgba(255,255,255,0.12)",
-                                background: "rgba(255,255,255,0.04)",
-                                flexShrink: 0,
-                              }}
-                            />
-                            <span
-                              style={{
-                                flex: 1,
-                                minWidth: 0,
-                                fontSize: 11.5,
-                                color: "#9ca3af",
-                                overflow: "hidden",
-                                textOverflow: "ellipsis",
-                                whiteSpace: "nowrap",
-                              }}
-                            >
-                              {nodeId ? describeNodePlacement(nodeId, canvasNodes) || "已放到画布" : "已放到画布"}
-                            </span>
-                            {nodeId && onLocateNode && (
-                              <button
-                                onClick={() => onLocateNode(nodeId)}
-                                style={{
-                                  flexShrink: 0,
-                                  background: "rgba(99,102,241,0.2)",
-                                  border: "1px solid rgba(99,102,241,0.5)",
-                                  color: "#c7d2fe",
-                                  borderRadius: 6,
-                                  padding: "3px 9px",
-                                  fontSize: 11.5,
-                                  cursor: "pointer",
-                                  fontFamily: "inherit",
-                                }}
-                              >
-                                定位
-                              </button>
-                            )}
-                          </div>
-                        )}
+
                       </div>
                     );
                   })
@@ -1968,6 +2009,14 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
                       </ReactMarkdown>
                     </div>
                   )}
+
+              {entry.segments && <ResultImageStrip segments={entry.segments} nodes={canvasNodes} onLocate={onLocateNode} />}
+              {(() => {
+                const text = entry.segments
+                  ? entry.segments.filter((seg) => seg.kind === "text").map((seg) => seg.text).join("\n\n")
+                  : entry.content;
+                return text.trim() ? <ReplyCopyButton text={text} /> : null;
+              })()}
 
               {/* 人在回路：Agent 询问用户 */}
               {entry.askUser && (
@@ -2051,7 +2100,7 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
                       }}
                       onMouseEnter={() => setMentionIndex(index)}
                     >
-                      <img src={node.image_url} alt="" />
+                      {node.image_url ? <img src={node.image_url} alt="" /> : <span aria-hidden="true">▤</span>}
                       <span className="mention-option-label">#{node.index}</span>
                       <span className="mention-option-content">
                         {node.content || "画布图片"}
@@ -2381,6 +2430,15 @@ export const ChatPanel = forwardRef<ChatPanelRef, ChatPanelProps>(function ChatP
           border-radius: 3px;
         }
       `}</style>
+      {/* Portaled out of the backdrop-filter panel: fixed menu coordinates must be viewport-relative. */}
+      {textMenu && createPortal(<div role="menu" aria-label="选中文字操作" className="agent-text-menu"
+        style={{ left: textMenu.x, top: textMenu.y }} onPointerDown={(event) => event.stopPropagation()}
+        onMouseDown={(event) => event.preventDefault()}>
+        <button type="button" role="menuitem" disabled={creatingText} onClick={() => void createSelectedText()}>
+          {creatingText ? "正在创建…" : "创建文字节点"}
+        </button>
+        {textNodeError && <div role="alert" style={{ color: "#f87171", padding: "6px 10px", fontSize: 12 }}>{textNodeError}</div>}
+      </div>, document.body)}
     </div>
   );
 });

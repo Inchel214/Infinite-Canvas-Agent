@@ -172,6 +172,14 @@ class ProviderManager:
         from app.providers.schema import PROVIDER_PRESETS
 
         api_style = (PROVIDER_PRESETS.get(conf.provider) or {}).get("image_api", "openai")
+        if api_style == "liblib":
+            from app.image.liblib_generator import LiblibImageGenerator
+
+            return LiblibImageGenerator(
+                api_key=conf.api_key, secret_key=conf.secret_key,
+                base_url=conf.base_url, model=conf.model,
+                reference_mode=conf.liblib_reference_mode, steps=conf.liblib_steps,
+            )
         if api_style == "ark":
             from app.image.volc_generator import VolcEngineImageGenerator
 

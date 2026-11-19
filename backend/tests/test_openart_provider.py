@@ -61,6 +61,10 @@ class OpenArtTests(unittest.TestCase):
         self.addCleanup(self.images_dir_patch.stop)
         deps.manager.reset()
         self.client = TestClient(app)
+        self.submit_patch = patch.object(module, "_submit", side_effect=lambda args, width, height, size: module._run(*args, timeout=120))
+        self.submit_patch.start()
+        self.addCleanup(self.submit_patch.stop)
+
 
     def api_settings(self):
         return {"llm": {"provider": "mock"}, "image": {
@@ -71,8 +75,14 @@ class OpenArtTests(unittest.TestCase):
 
     def fake_generation(self, *args, **kwargs):
         if args[0:2] == ("generate", "image"):
-            Path(args[args.index("--output") + 1], "result.png").write_bytes(image_data())
-            return {"success": True}
+            self.assertIn("--async", args)
+            self.assertNotIn("--output", args)
+            return {"historyId": "test-history"}
+        if args[0:2] == ("creation", "get"):
+            return {"history": {"id": "test-history", "status": "completed"}, "resources": [{
+                "resourceType": "image", "status": "completed",
+                "url": "data:image/png;base64," + base64.b64encode(image_data()).decode(),
+            }]}
         raise AssertionError(args)
 
     def test_legacy_settings_and_roundtrip_preserve_api(self):
@@ -125,8 +135,8 @@ class OpenArtTests(unittest.TestCase):
         self.assertEqual(result.status_code, 200)
         events = [json.loads(line[6:]) for line in result.text.splitlines() if line.startswith("data: ")]
         self.assertTrue(events[-1]["success"], events)
-        self.assertEqual(run.call_count, 1)
-        args = run.call_args.args
+        self.assertEqual(run.call_count, 2)
+        args = run.call_args_list[0].args
         self.assertEqual(args[-2:], ("--", "--model literal prompt"))
         state = self.client.get(f"/api/canvas/{canvas_id}").json()
         node = state["nodes"][events[-1]["node_id"]]
@@ -143,9 +153,10 @@ class OpenArtTests(unittest.TestCase):
     def test_reference_upload_and_mask_rejection(self):
         ref = "data:image/png;base64," + base64.b64encode(image_data()).decode()
         def fake(*args, **kwargs):
-            paths = [Path(args[i+1]) for i, arg in enumerate(args) if arg == "--image"]
-            self.assertEqual(len(paths), 2)
-            self.assertEqual(paths[0].read_bytes(), image_data())
+            if args[:2] == ("generate", "image"):
+                paths = [Path(args[i+1]) for i, arg in enumerate(args) if arg == "--image"]
+                self.assertEqual(len(paths), 2)
+                self.assertEqual(paths[0].read_bytes(), image_data())
             return self.fake_generation(*args, **kwargs)
         with patch.object(module, "_run", side_effect=fake):
             result = OpenArtImageGenerator().compose([ref, ref], "combine")
@@ -154,6 +165,71 @@ class OpenArtTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "蒙版"):
                 OpenArtImageGenerator().edit(ref, "edit", mask=ref)
             run.assert_not_called()
+
+    def test_status_read_timeout_retries_without_resubmission(self):
+        calls = []
+        def fake(*args, **kwargs):
+            calls.append(args)
+            if args[:2] == ("creation", "get") and len(calls) == 2:
+                raise ValueError("OpenArt 请求超时")
+            return self.fake_generation(*args, **kwargs)
+        with patch.object(module, "_run", side_effect=fake), patch.object(module.time, "sleep"):
+            result = OpenArtImageGenerator().generate("recover after read timeout")
+        self.assertEqual((result.width, result.height), (400, 200))
+        self.assertEqual(sum(args[:2] == ("generate", "image") for args in calls), 1)
+        journals = list((Path(os.environ["CANVAS_DATA_DIR"]).parent / "openart_jobs").glob("*.json"))
+        self.assertEqual(json.loads(journals[0].read_text())["history_id"], "test-history")
+
+    def test_failed_collection_retains_id_and_can_be_recovered_without_generation(self):
+        with patch.object(module, "_run", return_value={"history": {"id": "saved-job"}}), \
+                patch.object(OpenArtImageGenerator, "collect", side_effect=ValueError("download failed")):
+            with self.assertRaisesRegex(ValueError, "saved-job"):
+                OpenArtImageGenerator().generate("original prompt")
+        journals = list((Path(os.environ["CANVAS_DATA_DIR"]).parent / "openart_jobs").glob("*.json"))
+        self.assertEqual(json.loads(journals[0].read_text())["status"], "collection_failed")
+        with patch.object(module, "_run", side_effect=self.fake_generation) as run:
+            OpenArtImageGenerator().collect("saved-job")
+        self.assertEqual(run.call_args.args[:3], ("creation", "get", "saved-job"))
+
+    def test_explicit_ratio_and_resolution_reach_platform_once(self):
+        self.submit_patch.stop()
+        calls = []
+        def fake(*args, **kwargs):
+            calls.append(args)
+            if args[:2] == ("model", "form"):
+                return {"jsonSchema": {"properties": {
+                    "aspectRatio": {"enum": ["1:1", "3:4", "16:9", "21:9"]},
+                    "resolution": {"enum": ["1K", "2K", "4K"]},
+                }}}
+            if args[:2] == ("generate", "image"):
+                self.assertIn("--dry-run", args)
+                return {"endpoint": "POST /api/cli/v1/generate", "body": {
+                    "model": "nano-banana-2", "mode": "text2image", "media": "image", "params": {"prompt": "portrait"}}}
+            raise AssertionError(args)
+        with patch.object(module, "_run", side_effect=fake), patch.object(module, "_credentials", return_value=("https://openart.ai/suite", "test-token")), patch.object(module.requests, "post") as post:
+            post.return_value.status_code = 200
+            post.return_value.json.return_value = {"historyId": "portrait-job"}
+            result = module._submit(["generate", "image", "--model", "nano-banana-2", "--async", "--", "portrait"], 300, 300, "1536x2048")
+            self.assertEqual(result["historyId"], "portrait-job")
+            self.assertEqual(post.call_count, 1)
+            self.assertEqual(post.call_args.kwargs["json"]["params"]["aspectRatio"], "3:4")
+            self.assertEqual(post.call_args.kwargs["json"]["params"]["resolution"], "2K")
+            post.side_effect = module.requests.Timeout()
+            with self.assertRaisesRegex(ValueError, "勿重复生图"):
+                module._submit(["generate", "image", "--model", "nano-banana-2", "--async", "--", "portrait"], 300, 300, "1536x2048")
+            self.assertEqual(post.call_count, 2)
+
+    def test_transient_image_download_is_retried_without_submission(self):
+        from app.image.openai_generator import _fetch_image
+        with patch.object(module, "_run", side_effect=self.fake_generation), patch.object(module, "_fetch_image", side_effect=[ValueError("temporary CDN error"), _fetch_image("data:image/png;base64," + base64.b64encode(image_data()).decode())]), patch.object(module.time, "sleep"):
+            result = OpenArtImageGenerator().collect("completed-job", timeout=10)
+        self.assertEqual((result.width, result.height), (400, 200))
+
+    def test_terminal_failure_is_not_retried(self):
+        with patch.object(module, "_run", return_value={"history": {"status": "failed"}}) as run:
+            with self.assertRaisesRegex(ValueError, "failed"):
+                OpenArtImageGenerator().collect("failed-job")
+        self.assertEqual(run.call_count, 1)
 
     def test_generation_error_reaches_canvas_without_retry(self):
         self.client.put("/api/settings", json={"llm": {"provider": "mock"}, "image": {"source": "openart"}})
